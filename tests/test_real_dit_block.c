@@ -254,7 +254,8 @@ static void run_refiner_block(test_context *test,
                                         TEXT_ROWS, HIDDEN, 1e-5f), label);
     gpu_call(test, h3_gpu_linear_bf16(test->gpu, qkv, norm, weight->qkv, NULL,
                                       TEXT_ROWS, HIDDEN, INNER * 3), label);
-    gpu_call(test, h3_gpu_qkv_rope_bf16(test->gpu, query, key, value, qkv,
+    gpu_call(test, h3_gpu_grouped_qkv_rope_bf16(
+                                        test->gpu, query, key, value, qkv,
                                         weight->q_norm, weight->k_norm,
                                         dummy_rope, dummy_rope, TEXT_ROWS,
                                         HEADS, HEAD_DIM, 0, 1e-5f), label);
@@ -309,7 +310,7 @@ static void run_dit_block_inplace(test_context *test,
     gpu_call(test, h3_gpu_linear_bf16(test->gpu, qkv, mod_attention,
                                       weight->qkv, NULL, SEQUENCE, HIDDEN,
                                       INNER * 3), label);
-    gpu_call(test, h3_gpu_qkv_rope_bf16(
+    gpu_call(test, h3_gpu_grouped_qkv_rope_bf16(
         test->gpu, query, key, value, qkv, weight->q_norm, weight->k_norm,
         rope_cos, rope_sin, SEQUENCE, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f), label);
     gpu_call(test, h3_gpu_sdpa_bf16(
@@ -506,7 +507,7 @@ int main(int argc, char **argv) {
     gpu_call(&test, h3_gpu_linear_bf16(test.gpu, qkv, mod_attention, block0.qkv,
                                         NULL, SEQUENCE, HIDDEN, INNER * 3),
              "block-0 QKV");
-    gpu_call(&test, h3_gpu_qkv_rope_bf16(
+    gpu_call(&test, h3_gpu_grouped_qkv_rope_bf16(
         test.gpu, query, key, value, qkv, block0.q_norm, block0.k_norm,
         rope_cos, rope_sin, SEQUENCE, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
         "block-0 QK norm/RoPE");

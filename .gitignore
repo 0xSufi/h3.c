@@ -12,5 +12,10 @@ h3_tokenizer_tests
 h3_text_tests
 h3_real_prompt_test
 h3_real_dit_block_test
+h3_real_dit_schedule_test
+h3_real_dit_test
+h3_semantic_dit_test
+h3_real_video_vae_test
+h3_semantic_vae_test
 libh3.a
 .DS_Store

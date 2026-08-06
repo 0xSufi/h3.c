@@ -13,7 +13,7 @@ extern "C" {
 #define H3_DEFAULT_WIDTH 864
 #define H3_DEFAULT_HEIGHT 480
 #define H3_DEFAULT_FRAMES 56
-#define H3_DEFAULT_STEPS 20
+#define H3_DEFAULT_STEPS 50
 
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
@@ -51,6 +51,7 @@ typedef struct {
     int frames;
     int steps;
     uint64_t seed;
+    const char *output_path;
     const char *first_frame;
     const char *last_frame;
     const h3_reference *references;
@@ -62,7 +63,7 @@ typedef struct {
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, 0, NULL, NULL, NULL \
+    UINT64_C(42), NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL \
 }
 
 typedef struct {
@@ -108,7 +109,7 @@ const char *h3_last_error(const h3_ctx *ctx);
 const h3_device_info *h3_device(const h3_ctx *ctx);
 const h3_model_info *h3_model(const h3_ctx *ctx);
 
-/* Incrementally filled by later milestones; returns NULL with an error for now. */
+/* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);
 void h3_result_free(h3_result *result);

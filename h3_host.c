@@ -96,6 +96,23 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_serving_schedule_build(int points, h3_sigma_schedule *schedule) {
+    if (!schedule || points < 2 || points > H3_MAX_STEPS) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = points - 1;
+    float denominator = (float)(points - 1);
+    for (int index = 0; index < points; index++) {
+        float base = 1.0f - (float)index / denominator;
+        schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
+            (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
+        schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
+            (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
+    }
+    schedule->video[points - 1] = 0.0f;
+    schedule->audio[points - 1] = 0.0f;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;
@@ -494,5 +511,15 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
         output[index] = (float)(decay * sample[index] + h *
             (b1 * denoised[index] + b2 * old_denoised[index]));
     }
+    return 1;
+}
+
+int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
+                           float sigma, float sigma_next) {
+    if (!sample || !velocity || !isfinite(sigma) || !isfinite(sigma_next) ||
+        !(sigma > sigma_next) || sigma_next < 0.0f) return 0;
+    float delta = sigma - sigma_next;
+    for (size_t index = 0; index < count; index++)
+        sample[index] += delta * velocity[index];
     return 1;
 }

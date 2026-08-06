@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
            embedding.gpu_stats.gpu_seconds);
     if (embedding.tokens != token_count ||
         embedding.width != H3_TEXT_HIDDEN_SIZE ||
-        embedding.gpu_stats.submissions != 1) {
+        embedding.gpu_stats.submissions != 51) {
         fail("invalid released Qwen execution metadata");
     }
     if (golden) compare_golden(golden, ids, token_count, &embedding);

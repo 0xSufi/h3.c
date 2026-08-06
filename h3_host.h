@@ -101,6 +101,8 @@ int h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h);
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
+/* Current SGLang contract: endpoint-inclusive points, hence points-1 forwards. */
+int h3_serving_schedule_build(int points, h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);
@@ -115,5 +117,7 @@ void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count);
 int h3_res_step(float *output, const float *sample, const float *denoised,
                 const float *old_denoised, size_t count,
                 const float *sigmas, int step, int total_steps);
+int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
+                           float sigma, float sigma_next);
 
 #endif

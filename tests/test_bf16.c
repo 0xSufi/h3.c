@@ -109,6 +109,20 @@ static double compare(test_context *test, const char *name,
     return error / (scale > 1e-12 ? scale : 1e-12);
 }
 
+static void require_same_bf16(h3_gpu_tensor *left, h3_gpu_tensor *right,
+                              size_t elements, const char *message) {
+    uint16_t *a = malloc(elements * sizeof(*a));
+    uint16_t *b = malloc(elements * sizeof(*b));
+    require(a != NULL && b != NULL, "comparison allocation failed");
+    require(h3_gpu_tensor_read_bf16(left, a, elements),
+            "cannot read first BF16 tensor");
+    require(h3_gpu_tensor_read_bf16(right, b, elements),
+            "cannot read second BF16 tensor");
+    require(memcmp(a, b, elements * sizeof(*a)) == 0, message);
+    free(a);
+    free(b);
+}
+
 static void cleanup(test_context *test) {
     for (size_t index = 0; index < test->owned_count; index++) {
         h3_gpu_tensor_free(test->owned[index]);
@@ -271,6 +285,50 @@ int main(int argc, char **argv) {
                                          MODULATION_SLOTS, 5), "MLP gate");
     require_gpu(&test, h3_gpu_submit(test.gpu), "submit command stream");
 
+    h3_gpu_stats stats;
+    require(h3_gpu_get_stats(test.gpu, &stats), "cannot read Metal counters");
+
+    /* The released H3 checkpoint emits QKV interleaved per head. Verify the
+     * production deinterleaver against the conventional fixture layout. */
+    size_t qkv_elements = SEQUENCE * INNER * 3;
+    uint16_t *plain_qkv_host = malloc(qkv_elements * sizeof(*plain_qkv_host));
+    uint16_t *grouped_qkv_host = malloc(qkv_elements * sizeof(*grouped_qkv_host));
+    require(plain_qkv_host != NULL && grouped_qkv_host != NULL,
+            "grouped QKV allocation failed");
+    require(h3_gpu_tensor_read_bf16(plain_qkv, plain_qkv_host, qkv_elements),
+            "cannot read conventional QKV");
+    for (size_t row = 0; row < SEQUENCE; row++) {
+        size_t row_base = row * INNER * 3;
+        for (size_t head = 0; head < HEADS; head++) {
+            for (size_t kind = 0; kind < 3; kind++) {
+                memcpy(grouped_qkv_host + row_base +
+                           (head * 3 + kind) * HEAD_DIM,
+                       plain_qkv_host + row_base + kind * INNER +
+                           head * HEAD_DIM,
+                       HEAD_DIM * sizeof(*plain_qkv_host));
+            }
+        }
+    }
+    h3_gpu_tensor *grouped_qkv = own(
+        &test, h3_gpu_tensor_from_bf16(test.gpu, grouped_qkv_host, qkv_elements));
+    h3_gpu_tensor *grouped_q = fresh(&test, SEQUENCE * INNER);
+    h3_gpu_tensor *grouped_k = fresh(&test, SEQUENCE * INNER);
+    h3_gpu_tensor *grouped_v = fresh(&test, SEQUENCE * INNER);
+    free(plain_qkv_host);
+    free(grouped_qkv_host);
+    require_gpu(&test, h3_gpu_begin(test.gpu), "begin grouped QKV stream");
+    require_gpu(&test, h3_gpu_grouped_qkv_rope_bf16(
+        test.gpu, grouped_q, grouped_k, grouped_v, grouped_qkv, q_norm, k_norm,
+        rope_cos, rope_sin, SEQUENCE, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+        "grouped QKV RoPE");
+    require_gpu(&test, h3_gpu_submit(test.gpu), "submit grouped QKV stream");
+    require_same_bf16(plain_q, grouped_q, SEQUENCE * INNER,
+                      "grouped query deinterleave mismatch");
+    require_same_bf16(plain_k, grouped_k, SEQUENCE * INNER,
+                      "grouped key deinterleave mismatch");
+    require_same_bf16(plain_v, grouped_v, SEQUENCE * INNER,
+                      "grouped value deinterleave mismatch");
+
     double attn_abs, mlp_abs, block_abs;
     double attn_rel = compare(&test, "x.attn_out", plain_attn,
                               SEQUENCE * HIDDEN, &attn_abs);
@@ -284,8 +342,6 @@ int main(int argc, char **argv) {
     require(attn_rel < 1e-2, "BF16 attention exceeds MLX error bound");
     require(mlp_rel < 1e-2, "BF16 MLP exceeds MLX error bound");
     require(block_rel < 1e-2, "BF16 block exceeds MLX error bound");
-    h3_gpu_stats stats;
-    require(h3_gpu_get_stats(test.gpu, &stats), "cannot read Metal counters");
     printf("BF16 dispatches: %llu MPS linear, %llu MPS SDPA, %llu direct; "
            "%.2f MiB allocated\n",
            (unsigned long long)stats.mps_linear_dispatches,

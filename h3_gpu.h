@@ -48,6 +48,10 @@ int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
+                            size_t elements);
+int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
+                             size_t elements);
 
 int h3_gpu_begin(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
@@ -68,6 +72,10 @@ int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
                      size_t elements);
+int h3_gpu_copy_f32(h3_gpu *gpu, h3_gpu_tensor *destination,
+                    size_t destination_offset,
+                    const h3_gpu_tensor *source, size_t source_offset,
+                    size_t elements);
 int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *input,
                         const h3_gpu_tensor *weight, uint32_t rows,
@@ -101,6 +109,24 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *fused, uint32_t rows,
                       uint32_t width);
+int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *residual,
+                         const h3_gpu_tensor *branch,
+                         const h3_gpu_tensor *scale, uint32_t rows,
+                         uint32_t width);
+int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t rows,
+                          uint32_t width, float epsilon);
+int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
+                              h3_gpu_tensor *key, h3_gpu_tensor *value,
+                              const h3_gpu_tensor *qkv,
+                              const h3_gpu_tensor *rope_cos,
+                              const h3_gpu_tensor *rope_sin,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, uint32_t rope_half,
+                              float epsilon);
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */
@@ -137,6 +163,18 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          const h3_gpu_tensor *rope_sin, uint32_t sequence,
                          uint32_t heads, uint32_t head_dim,
                          uint32_t rope_half, float epsilon);
+/* H3 checkpoint QKV rows are [head, q/k/v, dimension], unlike the
+ * conventional [q/k/v, head, dimension] layout accepted above. */
+int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                 const h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t sequence, uint32_t heads,
+                                 uint32_t head_dim, uint32_t rope_half,
+                                 float epsilon);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

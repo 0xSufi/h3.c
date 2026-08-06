@@ -67,6 +67,12 @@ static h3_gpu_tensor *defer(load_context *load, h3_gpu_tensor *tensor) {
     return tensor;
 }
 
+static void retire_deferred(load_context *load) {
+    for (size_t index = 0; index < load->deferred_count; index++)
+        h3_gpu_tensor_free(load->deferred[index]);
+    load->deferred_count = 0;
+}
+
 static h3_gpu_tensor *load_1d(load_context *load, const char *name,
                               uint64_t width) {
     uint64_t shape[] = {width};
@@ -300,25 +306,29 @@ int h3_text_encode_bf16(const char *weight_directory,
         !gpu_operation(gpu, h3_gpu_embedding_bf16(
                                  gpu, hidden, embedding_weight, ids, tokens,
                                  TEXT_VOCAB, TEXT_HIDDEN),
-                       error, error_size, "embedding lookup", -1)) {
+                       error, error_size, "embedding lookup", -1) ||
+        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                       "embedding stream submit", -1)) {
         goto cleanup;
     }
+    retire_deferred(&load);
 
     for (int layer = 0; layer < TEXT_LAYERS; layer++) {
         text_layer_weights weights;
         memset(&weights, 0, sizeof(weights));
         if (!layer_weights_load(&load, layer, &weights) ||
+            !gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                           "layer stream begin", layer) ||
             !encode_layer(gpu, &weights, tokens, hidden, norm, query, key,
                           value, attention_heads, attention_output, gate, up,
                           mlp_output, rope_cos, rope_sin, layer,
-                          error, error_size)) {
+                          error, error_size) ||
+            !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                           "layer stream submit", layer)) {
             goto cleanup;
         }
+        retire_deferred(&load);
         if (progress) progress(layer + 1, TEXT_LAYERS, progress_opaque);
-    }
-    if (!gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                       "command stream submit", -1)) {
-        goto cleanup;
     }
 
     output->values = malloc(hidden_count * sizeof(*output->values));
@@ -340,9 +350,7 @@ int h3_text_encode_bf16(const char *weight_directory,
 cleanup:
     ok = 0;
 finished:
-    for (size_t index = 0; index < load.deferred_count; index++) {
-        h3_gpu_tensor_free(load.deferred[index]);
-    }
+    retire_deferred(&load);
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
         h3_gpu_tensor_free(activations[index]);

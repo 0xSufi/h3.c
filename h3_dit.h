@@ -1,0 +1,64 @@
+#ifndef H3_DIT_H
+#define H3_DIT_H
+
+#include "h3_gpu.h"
+#include "h3_host.h"
+#include "h3_text_encoder.h"
+
+#include <stddef.h>
+
+typedef struct h3_dit h3_dit;
+
+typedef void (*h3_dit_progress)(const char *phase, int completed, int total,
+                                void *opaque);
+
+/* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
+ * happen before the persistent 37 GiB core is mapped, keeping phase residency
+ * bounded on 128 GiB machines. */
+h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+void h3_dit_free(h3_dit *dit);
+
+size_t h3_dit_video_elements(const h3_dit *dit);
+size_t h3_dit_audio_elements(const h3_dit *dit);
+
+/* One raw data-ward velocity evaluation. Input/output video layout is
+ * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
+int h3_dit_forward(h3_dit *dit, int step,
+                   const float *video_latent, const float *audio_latent,
+                   float *video_velocity, float *audio_velocity,
+                   char *error, size_t error_size);
+
+/* Run every configured RES multistep update in place. Solver state remains
+ * F32 between transformer evaluations, matching the released MLX path. */
+int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
+                   h3_dit_progress progress, void *progress_opaque,
+                   char *error, size_t error_size);
+
+/* Current serving sampler: independent video/audio shifted Euler grids. */
+int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
+                         float *audio_latent, h3_dit_progress progress,
+                         void *progress_opaque, char *error,
+                         size_t error_size);
+
+int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
+
+/* Exact row-order conversions, public internally so they can be pinned by
+ * cheap tests independently of the 62 GiB checkpoint. */
+int h3_dit_patchify_video(const float *latent, int channels, int time,
+                          int height, int width, float *rows,
+                          size_t row_elements);
+int h3_dit_unpatchify_video(const float *rows, int channels, int time,
+                            int height, int width, float *latent,
+                            size_t latent_elements);
+int h3_dit_pack_audio(const float *latent, int channels, int time,
+                      float *rows, size_t row_elements);
+int h3_dit_unpack_audio(const float *rows, int channels, int time,
+                        float *latent, size_t latent_elements);
+
+#endif

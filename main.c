@@ -1,4 +1,5 @@
 #include "h3.h"
+#include "h3_terminal.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -18,7 +19,7 @@ static void usage(const char *program) {
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
         "      --frames N         Requested frames (default: 56)\n"
-        "      --steps N          Sampling steps (default: 20)\n"
+        "      --steps N          Sigma points (default: 50; 49 forwards)\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
@@ -78,6 +79,48 @@ static void print_info(const h3_ctx *ctx) {
     print_component("audio VAE", &model->audio_vae);
 }
 
+typedef struct {
+    char phase[64];
+    int active;
+    int completed;
+    int total;
+    h3_terminal_protocol terminal;
+    int display_failed;
+} cli_state;
+
+static int cli_progress(const char *phase, int completed, int total,
+                        void *opaque) {
+    cli_state *state = opaque;
+    if (!strcmp(state->phase, phase) && state->completed == completed &&
+        state->total == total) return 0;
+    if (strcmp(state->phase, phase)) {
+        if (state->active) fputc('\n', stderr);
+        snprintf(state->phase, sizeof(state->phase), "%s", phase);
+    }
+    state->completed = completed;
+    state->total = total;
+    state->active = completed < total;
+    fprintf(stderr, "\r%-25s %4d/%-4d", phase, completed, total);
+    if (!state->active) fputc('\n', stderr);
+    fflush(stderr);
+    return 0;
+}
+
+static int cli_frame(const h3_frame *frame, void *opaque) {
+    cli_state *state = opaque;
+    if (state->display_failed || state->terminal == H3_TERM_NONE) return 0;
+    fprintf(stderr, "h3: frame %d/%d via %s\n", frame->frame_index + 1,
+            frame->frame_count, h3_terminal_protocol_name(state->terminal));
+    char error[256];
+    if (!h3_terminal_display_rgb24(state->terminal, frame->rgb,
+                                   frame->width, frame->height, frame->stride,
+                                   error, sizeof(error))) {
+        fprintf(stderr, "h3: terminal display disabled: %s\n", error);
+        state->display_failed = 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_FRAMES, OPT_STEPS, OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_SHOW, OPT_INFO };
@@ -101,6 +144,7 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
+    cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0};
     int show = 0;
     int info = 0;
     int option;
@@ -133,15 +177,29 @@ int main(int argc, char **argv) {
     }
     if (info) print_info(ctx);
     if (prompt) {
-        (void)output;
-        (void)show;
+        params.output_path = output;
+        params.on_progress = cli_progress;
+        params.callback_opaque = &cli;
+        if (show) {
+            cli.terminal = h3_terminal_detect();
+            if (cli.terminal == H3_TERM_NONE) {
+                fprintf(stderr, "h3: warning: --show needs Kitty, Ghostty, "
+                        "iTerm2, WezTerm, or Konsole\n");
+            } else {
+                fprintf(stderr, "h3: graphical output uses %s\n",
+                        h3_terminal_protocol_name(cli.terminal));
+                params.on_frame = cli_frame;
+            }
+        }
         h3_result *result = h3_generate(ctx, prompt, &params);
         if (!result) {
+            if (cli.active) fputc('\n', stderr);
             fprintf(stderr, "h3: %s\n", h3_last_error(ctx));
             h3_free(ctx);
             return 1;
         }
         h3_result_free(result);
+        fprintf(stderr, "h3: wrote %s\n", output);
     }
     h3_free(ctx);
     return 0;

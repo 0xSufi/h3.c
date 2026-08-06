@@ -1,4 +1,5 @@
 #include "h3_host.h"
+#include "h3_dit.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 
@@ -64,6 +65,20 @@ static void test_schedule(void) {
     double back = h3_time_shift_sigma(shifted, 3.0, 12.0);
     CHECK(close_enough(back, 0.5, 1e-12));
     CHECK(h3_time_shift_slope(0.5, 12.0, 3.0) > 0.0);
+
+    CHECK(h3_serving_schedule_build(50, &schedule));
+    CHECK(schedule.steps == 49);
+    CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
+    CHECK(schedule.video[49] == 0.0f && schedule.audio[49] == 0.0f);
+    float base = 24.0f / 49.0f;
+    CHECK(close_enough(schedule.video[25],
+        12.0f * base / (1.0f + 11.0f * base), 1e-7));
+    CHECK(close_enough(schedule.audio[25],
+        3.0f * base / (1.0f + 2.0f * base), 1e-7));
+    for (int index = 0; index < schedule.steps; index++) {
+        CHECK(schedule.video[index] > schedule.video[index + 1]);
+        CHECK(schedule.audio[index] > schedule.audio[index + 1]);
+    }
 }
 
 static void check_segments(const h3_layout *layout,
@@ -244,6 +259,36 @@ static void test_rng_and_solver(void) {
     CHECK(close_enough(output[0], 0.25, 1e-7));
     CHECK(h3_res_step(output, sample, denoised, old, 1, sigmas, 1, 3));
     CHECK(isfinite(output[0]));
+    float velocity[] = {2.0f, -4.0f};
+    float euler[] = {1.0f, 3.0f};
+    CHECK(h3_euler_velocity_step(euler, velocity, 2, 0.75f, 0.25f));
+    CHECK(euler[0] == 2.0f && euler[1] == 1.0f);
+    CHECK(!h3_euler_velocity_step(euler, velocity, 2, 0.25f, 0.25f));
+}
+
+static void test_dit_row_conversions(void) {
+    enum { C = 3, T = 2, H = 4, W = 6, VIDEO = C * T * H * W };
+    float latent[VIDEO], rows[VIDEO], roundtrip[VIDEO];
+    for (size_t index = 0; index < VIDEO; index++) latent[index] = (float)index;
+    CHECK(h3_dit_patchify_video(latent, C, T, H, W, rows, VIDEO));
+    /* First row is pixel patch (h=0..1,w=0..1), channel-major inside it. */
+    const float first[] = {0, 1, 6, 7, 48, 49, 54, 55, 96, 97, 102, 103};
+    for (size_t index = 0; index < sizeof(first) / sizeof(*first); index++)
+        CHECK(rows[index] == first[index]);
+    CHECK(h3_dit_unpatchify_video(rows, C, T, H, W, roundtrip, VIDEO));
+    CHECK(memcmp(latent, roundtrip, sizeof(latent)) == 0);
+    CHECK(!h3_dit_patchify_video(latent, C, T, H, W, rows, VIDEO - 1));
+
+    enum { AC = 4, AT = 3, AUDIO = AC * 2 * AT };
+    float audio[AUDIO], packed[AUDIO], unpacked[AUDIO];
+    for (size_t index = 0; index < AUDIO; index++) audio[index] = (float)index;
+    CHECK(h3_dit_pack_audio(audio, AC, AT, packed, AUDIO));
+    const float expected[] = {0, 6, 12, 18, 1, 7, 13, 19,
+                              2, 8, 14, 20, 3, 9, 15, 21,
+                              4, 10, 16, 22, 5, 11, 17, 23};
+    CHECK(memcmp(packed, expected, sizeof(expected)) == 0);
+    CHECK(h3_dit_unpack_audio(packed, AC, AT, unpacked, AUDIO));
+    CHECK(memcmp(audio, unpacked, sizeof(audio)) == 0);
 }
 
 static void test_metal_probe(void) {
@@ -264,6 +309,7 @@ int main(void) {
     test_layout_ref2va();
     test_safetensors();
     test_rng_and_solver();
+    test_dit_row_conversions();
     test_metal_probe();
     printf("ok: %d checks\n", tests_run);
     return 0;

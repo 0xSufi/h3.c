@@ -7,7 +7,10 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+	h3_dit_schedule.c h3_dit.c
+
+LIB_C += h3_video_vae.c h3_ffmpeg.c h3_terminal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 
@@ -40,6 +43,21 @@ h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_dit_block_test: tests/test_real_dit_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_dit_schedule_test: tests/test_real_dit_schedule.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests
@@ -83,4 +101,6 @@ tests/%.o: tests/%.c
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
+		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
+		h3_real_video_vae_test h3_semantic_vae_test \
 		libh3.a *.o tests/*.o
