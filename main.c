@@ -23,6 +23,12 @@ static void usage(const char *program) {
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
+        "      --ref-image PATH    Append an ordered Ref2VA image\n"
+        "      --ref-image-size S  Image sizing: match (default) or max\n"
+        "      --ref-video PATH    Append video, including embedded audio\n"
+        "      --ref-silent-video PATH  Append video without its audio\n"
+        "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
+        "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --show             Graphical-terminal frame display (M5)\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
@@ -49,6 +55,17 @@ static uint64_t parse_u64(const char *value, const char *label) {
         exit(2);
     }
     return (uint64_t)parsed;
+}
+
+static h3_reference *append_reference(h3_reference references[12],
+                                      size_t *count) {
+    if (*count >= 12) {
+        fprintf(stderr, "h3: Ref2VA supports at most 12 references\n");
+        exit(2);
+    }
+    h3_reference *reference = &references[(*count)++];
+    memset(reference, 0, sizeof(*reference));
+    return reference;
 }
 
 static double gib(uint64_t bytes) {
@@ -123,7 +140,9 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_FRAMES, OPT_STEPS, OPT_SEED,
-           OPT_FIRST, OPT_LAST, OPT_SHOW, OPT_INFO };
+           OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
+           OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
+           OPT_REF_AUDIO, OPT_SHOW, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -135,6 +154,12 @@ int main(int argc, char **argv) {
         {"seed", required_argument, NULL, OPT_SEED},
         {"first-frame", required_argument, NULL, OPT_FIRST},
         {"last-frame", required_argument, NULL, OPT_LAST},
+        {"ref-image", required_argument, NULL, OPT_REF_IMAGE},
+        {"ref-image-size", required_argument, NULL, OPT_REF_IMAGE_SIZE},
+        {"ref-video", required_argument, NULL, OPT_REF_VIDEO},
+        {"ref-silent-video", required_argument, NULL, OPT_REF_SILENT_VIDEO},
+        {"ref-video-audio", required_argument, NULL, OPT_REF_VIDEO_AUDIO},
+        {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
         {"show", no_argument, NULL, OPT_SHOW},
         {"info", no_argument, NULL, OPT_INFO},
         {"help", no_argument, NULL, 'h'},
@@ -144,6 +169,8 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
+    h3_reference references[12];
+    size_t reference_count = 0;
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0};
     int show = 0;
     int info = 0;
@@ -161,6 +188,60 @@ int main(int argc, char **argv) {
             case OPT_SEED: params.seed = parse_u64(optarg, "seed"); break;
             case OPT_FIRST: params.first_frame = optarg; break;
             case OPT_LAST: params.last_frame = optarg; break;
+            case OPT_REF_IMAGE: {
+                h3_reference *reference = append_reference(
+                    references, &reference_count);
+                reference->kind = H3_REFERENCE_IMAGE;
+                reference->path = optarg;
+                break;
+            }
+            case OPT_REF_IMAGE_SIZE:
+                if (!strcmp(optarg, "match"))
+                    params.reference_image_size = H3_REFERENCE_IMAGE_MATCH;
+                else if (!strcmp(optarg, "max"))
+                    params.reference_image_size = H3_REFERENCE_IMAGE_MAX;
+                else {
+                    fprintf(stderr,
+                        "h3: --ref-image-size must be match or max\n");
+                    return 2;
+                }
+                break;
+            case OPT_REF_VIDEO: {
+                h3_reference *reference = append_reference(
+                    references, &reference_count);
+                reference->kind = H3_REFERENCE_VIDEO;
+                reference->path = optarg;
+                reference->include_embedded_audio = 1;
+                break;
+            }
+            case OPT_REF_SILENT_VIDEO: {
+                h3_reference *reference = append_reference(
+                    references, &reference_count);
+                reference->kind = H3_REFERENCE_VIDEO;
+                reference->path = optarg;
+                reference->include_embedded_audio = 0;
+                break;
+            }
+            case OPT_REF_VIDEO_AUDIO: {
+                if (optind >= argc) {
+                    fprintf(stderr,
+                        "h3: --ref-video-audio requires VIDEO and AUDIO\n");
+                    return 2;
+                }
+                h3_reference *reference = append_reference(
+                    references, &reference_count);
+                reference->kind = H3_REFERENCE_VIDEO_AUDIO;
+                reference->path = optarg;
+                reference->audio_path = argv[optind++];
+                break;
+            }
+            case OPT_REF_AUDIO: {
+                h3_reference *reference = append_reference(
+                    references, &reference_count);
+                reference->kind = H3_REFERENCE_AUDIO;
+                reference->path = optarg;
+                break;
+            }
             case OPT_SHOW: show = 1; break;
             case OPT_INFO: info = 1; break;
             default: usage(argv[0]); return 2;
@@ -170,6 +251,8 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    params.references = references;
+    params.reference_count = reference_count;
     h3_ctx *ctx = h3_load_dir(model_dir);
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));

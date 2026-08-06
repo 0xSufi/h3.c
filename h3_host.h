@@ -97,6 +97,12 @@ int h3_video_latent_t(int frame_count);
 h3_temporal_shape h3_temporal(int requested_frames);
 void h3_latent_canvas(int width, int height, int *latent_w, int *latent_h);
 int h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h);
+/* Ref2VA image sizing is down-only and aspect preserving. max_short_edge=0
+ * matches the output pixel area; a positive value selects a short-edge cap. */
+int h3_reference_image_canvas(int width, int height,
+                              int target_width, int target_height,
+                              int max_short_edge,
+                              int *adapted_w, int *adapted_h);
 
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);

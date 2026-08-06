@@ -19,6 +19,11 @@ static const char *ffmpeg_program(void) {
     return override && *override ? override : "ffmpeg";
 }
 
+static const char *ffprobe_program(void) {
+    const char *override = getenv("H3_FFPROBE");
+    return override && *override ? override : "ffprobe";
+}
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -63,6 +68,85 @@ static int write_all(int descriptor, const uint8_t *data, size_t bytes,
         data += (size_t)written;
         bytes -= (size_t)written;
     }
+    return 1;
+}
+
+int h3_ffprobe_visual_size(const char *path, int *width, int *height,
+                           char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (width) *width = 0;
+    if (height) *height = 0;
+    if (!path || !*path || !width || !height) {
+        fail(error, error_size, "invalid FFprobe visual-size arguments");
+        return 0;
+    }
+    int stream[2];
+    if (pipe(stream) != 0) {
+        fail(error, error_size, "cannot create FFprobe pipe: %s",
+             strerror(errno));
+        return 0;
+    }
+    char *arguments[] = {
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+        (char *)path, NULL
+    };
+    posix_spawn_file_actions_t actions;
+    int code = posix_spawn_file_actions_init(&actions);
+    if (!code) code = posix_spawn_file_actions_adddup2(
+        &actions, stream[1], STDOUT_FILENO);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[0]);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[1]);
+    pid_t child = -1;
+    if (!code) code = posix_spawnp(&child, ffprobe_program(), &actions, NULL,
+                                    arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stream[1]);
+    if (code) {
+        close(stream[0]);
+        fail(error, error_size, "cannot start FFprobe: %s", strerror(code));
+        return 0;
+    }
+    char output[128];
+    size_t received = 0;
+    int overflow = 0;
+    while (1) {
+        char byte;
+        ssize_t amount = read(stream[0], &byte, 1);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) break;
+        if (received + 1 < sizeof(output)) output[received++] = byte;
+        else overflow = 1;
+    }
+    close(stream[0]);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fail(error, error_size, "cannot wait for FFprobe: %s", strerror(errno));
+        return 0;
+    }
+    output[received] = '\0';
+    int parsed_width = 0, parsed_height = 0, consumed = 0;
+    if (overflow || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        sscanf(output, "%dx%d%n", &parsed_width, &parsed_height, &consumed) != 2) {
+        fail(error, error_size, "FFprobe could not inspect visual stream %s",
+             path);
+        return 0;
+    }
+    for (char *cursor = output + consumed; *cursor; cursor++) {
+        if (*cursor != ' ' && *cursor != '\t' && *cursor != '\r' &&
+            *cursor != '\n') {
+            fail(error, error_size, "FFprobe returned an invalid visual size");
+            return 0;
+        }
+    }
+    if (parsed_width < 1 || parsed_height < 1) {
+        fail(error, error_size, "visual stream has invalid dimensions %dx%d",
+             parsed_width, parsed_height);
+        return 0;
+    }
+    *width = parsed_width;
+    *height = parsed_height;
     return 1;
 }
 

@@ -3,11 +3,10 @@
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
 sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
-first/last-frame conditioning before full ordered references are added.
+first/last-frame conditioning and then ordered references.
 
-Current milestone: M7 FL2VA prompt/first/last-frame generation is working;
-ordered Ref2VA image/video/audio references and H3-specific performance work
-follow incrementally.
+Current milestone: M8 Ref2VA ordered image references are working; ordered
+video/audio references and H3-specific performance work follow incrementally.
 
 ```sh
 make
@@ -18,6 +17,9 @@ make test
 ./h3 -d MiniMax-H3 -p "The fox keeps walking" \
   --width 512 --height 512 --frames 22 --first-frame fox.png \
   --last-frame fox-later.png -o outputs/fox-anchored.mp4
+./h3 -d MiniMax-H3 -p "Use the animal and setting in the reference" \
+  --width 512 --height 512 --frames 22 --ref-image fox.png \
+  -o outputs/fox-reference.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -29,8 +31,8 @@ storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, wit
 direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
 checks.
 
-FFmpeg must be available on `PATH` for image inputs and when writing an MP4
-(`H3_FFMPEG` may select an explicit executable). Generated RGB24 and
+FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
+(`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate
 uncompressed media file is created.
 
@@ -55,8 +57,10 @@ waveform agrees with the corrected MLX oracle to relative L2 `6.94e-5`.
 VAE encoder, Qwen3-VL vision tower and three-deepstack multimodal presentation,
 0.999 condition augmentation, and fixed condition rows in the native DiT. The
 first image is stretched to the target canvas; the last image is aspect-cover
-scaled and center cropped, matching the reference implementation. Full ordered
-image/video/audio references remain the next incremental milestone.
+scaled and center cropped, matching the reference implementation. `--ref-image`
+selects the distinct Ref2VA transformer, preserves ordered `<Picture N>`
+presentation, and uses the released down-only aspect-preserving reference canvas.
+Ordered video and audio preparation remain the active incremental work.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

@@ -45,6 +45,17 @@ static void test_temporal_and_canvas(void) {
     CHECK(width == 1376 && height == 768);
     CHECK(h3_adapt_canvas(32, 32, &width, &height));
     CHECK(width == 768 && height == 768);
+    CHECK(h3_reference_image_canvas(1920, 1080, 512, 512, 0,
+                                    &width, &height));
+    CHECK(width == 672 && height == 384);
+    CHECK(h3_reference_image_canvas(640, 480, 1024, 1024, 0,
+                                    &width, &height));
+    CHECK(width == 640 && height == 480);
+    CHECK(h3_reference_image_canvas(4096, 2160, 512, 512, 2048,
+                                    &width, &height));
+    CHECK(width == 3872 && height == 2048);
+    CHECK(!h3_reference_image_canvas(0, 480, 512, 512, 0,
+                                     &width, &height));
 }
 
 static void test_schedule(void) {

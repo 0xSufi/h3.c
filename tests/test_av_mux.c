@@ -39,6 +39,11 @@ int main(int argc, char **argv) {
     struct stat status;
     if (stat(path, &status) != 0 || status.st_size < 1000)
         die("FFmpeg did not create a nonempty A/V container");
+    int probed_width = 0, probed_height = 0;
+    if (!h3_ffprobe_visual_size(path, &probed_width, &probed_height,
+                                error, sizeof(error))) die(error);
+    if (probed_width != WIDTH || probed_height != HEIGHT)
+        die("FFprobe returned unexpected visual dimensions");
     float *decoded = NULL;
     if (!h3_ffmpeg_read_image_f32(path, WIDTH, HEIGHT,
                                   H3_IMAGE_FIT_STRETCH, &decoded,

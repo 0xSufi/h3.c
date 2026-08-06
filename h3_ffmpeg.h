@@ -9,6 +9,11 @@ typedef enum {
     H3_IMAGE_FIT_COVER = 1
 } h3_image_fit;
 
+/* Inspect the first visual stream without decoding it. H3_FFPROBE may select
+ * an explicit ffprobe-compatible executable. */
+int h3_ffprobe_visual_size(const char *path, int *width, int *height,
+                           char *error, size_t error_size);
+
 /* Decode one visual stream through FFmpeg. The caller owns channel-major F32
  * [3,height,width] RGB in [0,1]. */
 int h3_ffmpeg_read_image_f32(const char *path, int width, int height,

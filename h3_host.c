@@ -1,6 +1,7 @@
 #include "h3_host.h"
 
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,33 @@ int h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h) {
                       H3_CANVAS_MULTIPLE);
     *adapted_w = out_w < H3_CANVAS_MULTIPLE ? H3_CANVAS_MULTIPLE : out_w;
     *adapted_h = out_h < H3_CANVAS_MULTIPLE ? H3_CANVAS_MULTIPLE : out_h;
+    return 1;
+}
+
+int h3_reference_image_canvas(int width, int height,
+                              int target_width, int target_height,
+                              int max_short_edge,
+                              int *adapted_w, int *adapted_h) {
+    if (width < 1 || height < 1 || target_width < 1 || target_height < 1 ||
+        max_short_edge < 0 || !adapted_w || !adapted_h) return 0;
+    double scale;
+    if (max_short_edge) {
+        int short_edge = width < height ? width : height;
+        scale = fmin(1.0, (double)max_short_edge / (double)short_edge);
+    } else {
+        double target_area = (double)target_width * (double)target_height;
+        double source_area = (double)width * (double)height;
+        scale = fmin(1.0, sqrt(target_area / source_area));
+    }
+    double out_w = nearbyint((double)width * scale / H3_CANVAS_MULTIPLE) *
+                   H3_CANVAS_MULTIPLE;
+    double out_h = nearbyint((double)height * scale / H3_CANVAS_MULTIPLE) *
+                   H3_CANVAS_MULTIPLE;
+    if (out_w < H3_CANVAS_MULTIPLE) out_w = H3_CANVAS_MULTIPLE;
+    if (out_h < H3_CANVAS_MULTIPLE) out_h = H3_CANVAS_MULTIPLE;
+    if (out_w > INT_MAX || out_h > INT_MAX) return 0;
+    *adapted_w = (int)out_w;
+    *adapted_h = (int)out_h;
     return 1;
 }
 

@@ -7,10 +7,11 @@
 
 #include <stddef.h>
 
-/* Construct the released FL2VA `<Picture n>` presentation around already
- * encoded Qwen vision outputs, then run the language decoder. Keeping the
- * presentation builder separate lets the vision and text phases release their
- * large temporary weights independently. */
+/* Construct the released `<Picture n>` presentation around already encoded
+ * Qwen vision outputs, then run the language decoder. FL2VA anchors and
+ * image-only Ref2VA entries intentionally share this exact presentation.
+ * Keeping the builder separate lets vision and text release their large
+ * temporary weights independently. */
 int h3_multimodal_encode_fl2va_bf16(
                         const h3_tokenizer *tokenizer,
                         const char *weight_directory,
