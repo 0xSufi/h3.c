@@ -37,6 +37,9 @@ make test
 ./h3 --profile -d MiniMax-H3 -p "A fox walks through snow" \
   --width 512 --height 512 --frames 22 --steps 20 \
   -o outputs/profile.mp4
+./h3 --profile -d MiniMax-H3 -p "A surfer riding a blue ocean wave" \
+  --width 512 --height 512 --frames 22 --steps 20 --reuse 3 \
+  -o outputs/fast-surfer.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -61,6 +64,11 @@ MLX render. The default sampler follows current SGLang serving: 50 shifted sigma
 points (49 Euler forwards) with independent video/audio schedules. `--steps 20`
 is useful for quicker development renders. The full native 768x768, 50-point
 M5-Max validation also produces a clean photorealistic fox rather than noise.
+`--reuse 2` evaluates roughly half the denoiser forwards and is the validated
+fast-quality setting. `--reuse 3` is the aggressive setting; it evaluates
+roughly one third. Reuse extrapolates skipped video and audio velocities on
+their independent sigma grids. The default `--reuse 1` remains the close
+reference path.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

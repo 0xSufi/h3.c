@@ -164,6 +164,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "sigma points must be in [2, 1000]");
         return 0;
     }
+    if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
+        h3_set_error(ctx, "denoise reuse must be in [1, 3]");
+        return 0;
+    }
     if (params->reference_count && !params->references) {
         h3_set_error(ctx, "reference_count is nonzero but references is NULL");
         return 0;
@@ -880,8 +884,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
     if (!h3_dit_denoise_euler(
-            dit, video, audio, h3_dit_progress_bridge, &progress,
-            detail, sizeof(detail))) {
+            dit, video, audio, params->denoise_reuse,
+            h3_dit_progress_bridge, &progress, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }

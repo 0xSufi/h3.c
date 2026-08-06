@@ -62,6 +62,9 @@ typedef struct {
     const h3_reference *references;
     size_t reference_count;
     h3_reference_image_size reference_image_size;
+    /* Evaluate one of every N denoiser steps. 1 is the close-reference path,
+     * 2 is the validated fast path, and 3 is the aggressive fast path. */
+    int denoise_reuse;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
@@ -70,7 +73,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    NULL, NULL, NULL \
+    1, NULL, NULL, NULL \
 }
 
 typedef struct {

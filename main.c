@@ -20,6 +20,7 @@ static void usage(const char *program) {
         "      --height N         Output height (default: 480)\n"
         "      --frames N         Requested frames (default: 56)\n"
         "      --steps N          Sigma points (default: 50; 49 forwards)\n"
+        "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
@@ -140,7 +141,8 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 }
 
 int main(int argc, char **argv) {
-    enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_FRAMES, OPT_STEPS, OPT_SEED,
+    enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_FRAMES, OPT_STEPS, OPT_REUSE,
+           OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_SHOW, OPT_PROFILE, OPT_INFO };
@@ -152,6 +154,7 @@ int main(int argc, char **argv) {
         {"height", required_argument, NULL, OPT_HEIGHT},
         {"frames", required_argument, NULL, OPT_FRAMES},
         {"steps", required_argument, NULL, OPT_STEPS},
+        {"reuse", required_argument, NULL, OPT_REUSE},
         {"seed", required_argument, NULL, OPT_SEED},
         {"first-frame", required_argument, NULL, OPT_FIRST},
         {"last-frame", required_argument, NULL, OPT_LAST},
@@ -188,6 +191,9 @@ int main(int argc, char **argv) {
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
             case OPT_FRAMES: params.frames = parse_int(optarg, "frames"); break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_REUSE:
+                params.denoise_reuse = parse_int(optarg, "reuse");
+                break;
             case OPT_SEED: params.seed = parse_u64(optarg, "seed"); break;
             case OPT_FIRST: params.first_frame = optarg; break;
             case OPT_LAST: params.last_frame = optarg; break;

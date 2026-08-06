@@ -58,9 +58,9 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
 
 /* Current serving sampler: independent video/audio shifted Euler grids. */
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
-                         float *audio_latent, h3_dit_progress progress,
-                         void *progress_opaque, char *error,
-                         size_t error_size);
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
 
 int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
 

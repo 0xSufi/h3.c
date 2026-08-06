@@ -955,6 +955,26 @@ int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats) {
     return dit && h3_gpu_get_stats(dit->gpu, stats);
 }
 
+static void extrapolate_velocity(float *output, const float *last,
+                                 const float *previous, size_t count,
+                                 float current_sigma, float last_sigma,
+                                 float previous_sigma, int have_previous) {
+    if (!have_previous) {
+        memcpy(output, last, count * sizeof(*output));
+        return;
+    }
+    float denominator = last_sigma - previous_sigma;
+    float ratio = denominator != 0.0f
+        ? (current_sigma - last_sigma) / denominator : 0.0f;
+    /* Reuse intervals are deliberately small. This guard prevents malformed
+     * custom schedules from turning one cached evaluation into an explosion. */
+    if (ratio < -2.0f) ratio = -2.0f;
+    if (ratio > 2.0f) ratio = 2.0f;
+    for (size_t index = 0; index < count; index++)
+        output[index] = last[index] +
+                        ratio * (last[index] - previous[index]);
+}
+
 int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    h3_dit_progress progress, void *progress_opaque,
                    char *error, size_t error_size) {
@@ -1030,11 +1050,12 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
 }
 
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
-                         float *audio_latent, h3_dit_progress progress,
-                         void *progress_opaque, char *error,
-                         size_t error_size) {
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!dit || !video_latent || !audio_latent ||
+    if (!dit || !video_latent || !audio_latent || reuse_interval < 1 ||
+        reuse_interval > 32 ||
         dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule)) {
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
@@ -1043,18 +1064,66 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
     size_t audio_count = h3_dit_audio_elements(dit);
     float *video_velocity = malloc(video_count * sizeof(*video_velocity));
     float *audio_velocity = malloc(audio_count * sizeof(*audio_velocity));
-    if (!video_velocity || !audio_velocity) {
+    float *last_video = reuse_interval > 1
+        ? malloc(video_count * sizeof(*last_video)) : NULL;
+    float *previous_video = reuse_interval > 1
+        ? malloc(video_count * sizeof(*previous_video)) : NULL;
+    float *last_audio = reuse_interval > 1
+        ? malloc(audio_count * sizeof(*last_audio)) : NULL;
+    float *previous_audio = reuse_interval > 1
+        ? malloc(audio_count * sizeof(*previous_audio)) : NULL;
+    if (!video_velocity || !audio_velocity ||
+        (reuse_interval > 1 &&
+         (!last_video || !previous_video || !last_audio || !previous_audio))) {
         fail(error, error_size, "out of memory allocating Euler velocities");
         free(video_velocity);
         free(audio_velocity);
+        free(last_video);
+        free(previous_video);
+        free(last_audio);
+        free(previous_audio);
         return 0;
     }
     int ok = 1;
+    int last_evaluated = -1;
+    int previous_evaluated = -1;
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
-        ok = h3_dit_forward(dit, step, video_latent, audio_latent,
-                            video_velocity, audio_velocity,
-                            error, error_size);
+        int evaluate = reuse_interval == 1 || step == 0 ||
+                       step == dit->sigmas.steps - 1 ||
+                       step % reuse_interval == 0;
+        if (evaluate) {
+            ok = h3_dit_forward(dit, step, video_latent, audio_latent,
+                                video_velocity, audio_velocity,
+                                error, error_size);
+            if (ok && reuse_interval > 1) {
+                if (last_evaluated >= 0) {
+                    memcpy(previous_video, last_video,
+                           video_count * sizeof(*previous_video));
+                    memcpy(previous_audio, last_audio,
+                           audio_count * sizeof(*previous_audio));
+                    previous_evaluated = last_evaluated;
+                }
+                memcpy(last_video, video_velocity,
+                       video_count * sizeof(*last_video));
+                memcpy(last_audio, audio_velocity,
+                       audio_count * sizeof(*last_audio));
+                last_evaluated = step;
+            }
+        } else {
+            extrapolate_velocity(
+                video_velocity, last_video, previous_video, video_count,
+                dit->sigmas.video[step], dit->sigmas.video[last_evaluated],
+                previous_evaluated >= 0
+                    ? dit->sigmas.video[previous_evaluated] : 0.0f,
+                previous_evaluated >= 0);
+            extrapolate_velocity(
+                audio_velocity, last_audio, previous_audio, audio_count,
+                dit->sigmas.audio[step], dit->sigmas.audio[last_evaluated],
+                previous_evaluated >= 0
+                    ? dit->sigmas.audio[previous_evaluated] : 0.0f,
+                previous_evaluated >= 0);
+        }
         if (ok) {
             ok = h3_euler_velocity_step(
                      video_latent, video_velocity, video_count,
@@ -1070,6 +1139,10 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
     }
     free(video_velocity);
     free(audio_velocity);
+    free(last_video);
+    free(previous_video);
+    free(last_audio);
+    free(previous_audio);
     h3_gpu_profile_mark(dit->gpu, "Euler denoise");
     return ok;
 }
