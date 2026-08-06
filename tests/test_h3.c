@@ -101,6 +101,27 @@ static void test_schedule(void) {
     }
 }
 
+static void test_dit_reuse_schedule(void) {
+    uint8_t selected[49];
+    const int aggressive[] = {0, 3, 6, 10, 14, 18};
+    CHECK(h3_dit_reuse_schedule(19, 3, selected, sizeof(selected)) == 6);
+    for (int step = 0; step < 19; step++) {
+        int expected = 0;
+        for (size_t index = 0;
+             index < sizeof(aggressive) / sizeof(*aggressive); index++)
+            expected |= step == aggressive[index];
+        CHECK(selected[step] == expected);
+    }
+    CHECK(h3_dit_reuse_schedule(19, 2, selected, sizeof(selected)) == 10);
+    for (int step = 0; step < 19; step++)
+        CHECK(selected[step] == (step % 2 == 0));
+    CHECK(h3_dit_reuse_schedule(49, 3, selected, sizeof(selected)) == 17);
+    for (int step = 0; step < 49; step++)
+        CHECK(selected[step] == (step % 3 == 0 || step == 48));
+    CHECK(h3_dit_reuse_schedule(19, 1, selected, sizeof(selected)) == 19);
+    CHECK(h3_dit_reuse_schedule(19, 3, selected, 18) == -1);
+}
+
 static void check_segments(const h3_layout *layout,
                            const size_t (*bounds)[2],
                            const h3_segment_kind *kinds, size_t count) {
@@ -347,6 +368,7 @@ static void test_metal_probe(void) {
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
+    test_dit_reuse_schedule();
     test_layout_tiny();
     test_layout_fl2va();
     test_layout_ref2va();

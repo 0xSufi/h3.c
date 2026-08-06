@@ -69,8 +69,13 @@ is useful for quicker development renders. The full native 768x768, 50-point
 M5-Max validation also produces a clean photorealistic fox rather than noise.
 `--reuse 2` evaluates roughly half the denoiser forwards and is the validated
 fast-quality setting. `--reuse 3` is the aggressive setting; it evaluates
-roughly one third. Reuse extrapolates skipped video and audio velocities on
-their independent sigma grids. The default `--reuse 1` remains the close
+roughly one third. On the common 20-point serving grid, the aggressive path
+uses the quality-tuned six-forward placement `0,3,6,10,14,18` instead of the
+seven forwards selected by a uniform interval. Full 22-frame sweeps preserved
+clean prompt semantics on both surfer and fox prompts; the survivor was chosen
+from nine nearby schedules, including several that looked clean but changed
+the requested subject. Reuse extrapolates skipped video and audio velocities
+on their independent sigma grids. The default `--reuse 1` remains the close
 reference path. `--layers 45` independently drops the five least-active DiT
 residual blocks, selected from their actual AdaLN gates, and is the validated
 fast-quality setting; `--layers 40` is more aggressive. The exact default is

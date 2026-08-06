@@ -1156,6 +1156,56 @@ static void extrapolate_velocity(float *output, const float *last,
                         ratio * (last[index] - previous[index]);
 }
 
+int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
+                          size_t selected_count) {
+    if (steps < 1 || reuse_interval < 1 || reuse_interval > 32 || !selected ||
+        selected_count < (size_t)steps) return -1;
+    memset(selected, 0, (size_t)steps);
+
+    /* The serving 20-point grid has 19 Euler forwards. A uniform interval of
+     * three evaluates seven of them. This six-forward placement was selected
+     * after full-frame sweeps and validated on unrelated surfer/fox prompts. */
+    if (reuse_interval == 3 && steps == 19) {
+        static const uint8_t aggressive[] = {0, 3, 6, 10, 14, 18};
+        for (size_t index = 0;
+             index < sizeof(aggressive) / sizeof(*aggressive); index++)
+            selected[aggressive[index]] = 1;
+        return (int)(sizeof(aggressive) / sizeof(*aggressive));
+    }
+
+    int count = 0;
+    for (int step = 0; step < steps; step++) {
+        if (reuse_interval == 1 || step == 0 || step == steps - 1 ||
+            step % reuse_interval == 0) {
+            selected[step] = 1;
+            count++;
+        }
+    }
+    return count;
+}
+
+static int parse_reuse_steps(int steps, uint8_t *selected) {
+    const char *text = getenv("H3_REUSE_STEPS");
+    if (!text || !*text) return 0;
+    memset(selected, 0, (size_t)steps);
+    int count = 0;
+    int previous = -1;
+    while (*text) {
+        char *end = NULL;
+        long value = strtol(text, &end, 10);
+        if (end == text || value < 0 || value >= steps ||
+            value <= previous) return -1;
+        selected[value] = 1;
+        previous = (int)value;
+        count++;
+        if (!*end) break;
+        if (*end != ',') return -1;
+        text = end + 1;
+        if (!*text) return -1;
+    }
+    return selected[0] && selected[steps - 1] ? count : -1;
+}
+
 int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    h3_dit_progress progress, void *progress_opaque,
                    char *error, size_t error_size) {
@@ -1241,6 +1291,21 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
     }
+    uint8_t selected[H3_MAX_STEPS] = {0};
+    int selected_count = h3_dit_reuse_schedule(
+        dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
+    int custom_count = reuse_interval > 1 ?
+        parse_reuse_steps(dit->sigmas.steps, selected) : 0;
+    if (selected_count < 0 || custom_count < 0) {
+        fail(error, error_size,
+             "H3_REUSE_STEPS must be increasing and include 0 and %d",
+             dit->sigmas.steps - 1);
+        return 0;
+    }
+    if (custom_count > 0) selected_count = custom_count;
+    if (reuse_interval > 1 && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: %s reuse schedule has %d evaluations\n",
+                custom_count > 0 ? "custom" : "selected", selected_count);
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
     float *video_velocity = malloc(video_count * sizeof(*video_velocity));
@@ -1270,9 +1335,7 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
     int previous_evaluated = -1;
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
-        int evaluate = reuse_interval == 1 || step == 0 ||
-                       step == dit->sigmas.steps - 1 ||
-                       step % reuse_interval == 0;
+        int evaluate = selected[step];
         if (evaluate) {
             ok = h3_dit_forward(dit, step, video_latent, audio_latent,
                                 video_velocity, audio_velocity,

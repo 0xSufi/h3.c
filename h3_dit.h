@@ -6,6 +6,7 @@
 #include "h3_text_encoder.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct h3_dit h3_dit;
 
@@ -65,6 +66,12 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
+
+/* Build the velocity-evaluation mask used by the serving sampler. Returns the
+ * evaluation count, or -1 for invalid arguments. Public internally so the
+ * quality-tuned aggressive schedule remains pinned by cheap host tests. */
+int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
+                          size_t selected_count);
 
 int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
 
