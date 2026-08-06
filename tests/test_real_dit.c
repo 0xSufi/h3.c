@@ -57,6 +57,10 @@ static void compare(const char *label, const float *got, const uint16_t *want,
 }
 
 int main(int argc, char **argv) {
+    /* This is the close-reference integration test. The production fast path
+     * deliberately changes MLP operation boundaries and is covered by the
+     * fused-operation check in test_bf16 plus semantic video validation. */
+    setenv("H3_DISABLE_FUSED_MLP", "1", 1);
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *block_path = argc > 2 ? argv[2] :
         "misc/fixtures/h3_real_dit_block0_bf16.safetensors";

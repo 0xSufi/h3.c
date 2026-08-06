@@ -200,6 +200,7 @@ int main(int argc, char **argv) {
     h3_gpu_tensor *plain_fc1 = fresh(&test, SEQUENCE * FFN * 2);
     h3_gpu_tensor *plain_swiglu = fresh(&test, SEQUENCE * FFN);
     h3_gpu_tensor *plain_mlp = fresh(&test, SEQUENCE * HIDDEN);
+    h3_gpu_tensor *fused_mlp = fresh(&test, SEQUENCE * HIDDEN);
     h3_gpu_tensor *t_silu = fresh(&test, T_ROWS * T_DIM);
     h3_gpu_tensor *modulation = fresh(&test, T_ROWS * MODALITIES *
                                              MODULATION_SLOTS * HIDDEN);
@@ -240,6 +241,9 @@ int main(int argc, char **argv) {
     require_gpu(&test, h3_gpu_linear_bf16(test.gpu, plain_mlp, plain_swiglu,
                                            fc2_w, NULL, SEQUENCE, FFN, HIDDEN),
                 "plain MLP output");
+    require_gpu(&test, h3_gpu_mlp_bf16(test.gpu, fused_mlp, attn_in, fc1_w,
+                                        fc2_w, SEQUENCE, HIDDEN, FFN, HIDDEN),
+                "fused MLP");
 
     require_gpu(&test, h3_gpu_silu_bf16(test.gpu, t_silu, t_emb, T_ROWS * T_DIM),
                 "AdaLN SiLU");
@@ -334,13 +338,19 @@ int main(int argc, char **argv) {
                               SEQUENCE * HIDDEN, &attn_abs);
     double mlp_rel = compare(&test, "x.mlp_out", plain_mlp,
                              SEQUENCE * HIDDEN, &mlp_abs);
+    double fused_mlp_abs;
+    double fused_mlp_rel = compare(&test, "x.mlp_out", fused_mlp,
+                                   SEQUENCE * HIDDEN, &fused_mlp_abs);
     double block_rel = compare(&test, "x.h_out", h_out,
                                SEQUENCE * HIDDEN, &block_abs);
     printf("BF16 Metal/MLX parity: attention rel %.3g abs %.3g; "
-           "MLP rel %.3g abs %.3g; block rel %.3g abs %.3g\n",
-           attn_rel, attn_abs, mlp_rel, mlp_abs, block_rel, block_abs);
+           "MLP rel %.3g abs %.3g; fused MLP rel %.3g abs %.3g; "
+           "block rel %.3g abs %.3g\n", attn_rel, attn_abs, mlp_rel,
+           mlp_abs, fused_mlp_rel, fused_mlp_abs, block_rel, block_abs);
     require(attn_rel < 1e-2, "BF16 attention exceeds MLX error bound");
     require(mlp_rel < 1e-2, "BF16 MLP exceeds MLX error bound");
+    require(fused_mlp_rel < 1e-2,
+            "fused BF16 MLP exceeds MLX error bound");
     require(block_rel < 1e-2, "BF16 block exceeds MLX error bound");
     printf("BF16 dispatches: %llu MPS linear, %llu MPS SDPA, %llu direct; "
            "%.2f MiB allocated\n",
@@ -348,7 +358,7 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.mps_sdpa_dispatches,
            (unsigned long long)stats.direct_dispatches,
            (double)stats.allocated_bytes / (1024.0 * 1024.0));
-    require(stats.mps_linear_dispatches == 4,
+    require(stats.mps_linear_dispatches == 6,
             "wide BF16 linears did not use the cached MPSGraph path");
     require(stats.mps_sdpa_dispatches == 2, "BF16 SDPA counter mismatch");
     require(stats.submissions == 1, "block used more than one command submission");

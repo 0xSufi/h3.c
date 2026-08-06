@@ -42,6 +42,7 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    int fused_mlp;
     h3_layout layout;
     h3_sigma_schedule sigmas;
     int latent_t;
@@ -593,8 +594,6 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         BF(attention_heads, sequence * INNER),
         BF(attention_output, sequence * HIDDEN),
         BF(mod_mlp, sequence * HIDDEN),
-        BF(fc1, sequence * FFN * 2),
-        BF(activated, sequence * FFN),
         BF(mlp_output, sequence * HIDDEN),
         BF(final_audio_input, audio * HIDDEN),
         BF(final_video_input, video * HIDDEN),
@@ -612,6 +611,16 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
         if (!all[index]) {
             fail(error, error_size, "cannot allocate DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (!dit->fused_mlp) {
+        dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
+        dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
+        if (!dit->fc1 || !dit->activated) {
+            fail(error, error_size,
+                 "cannot allocate diagnostic DiT MLP tensors: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -650,6 +659,7 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "out of memory creating DiT model");
         return NULL;
     }
+    dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size)) goto failed;
     size_t wanted_video_condition =
@@ -759,12 +769,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
         modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
        "DiT MLP AdaLN");
-    OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
-        NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
-    OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
-       "DiT SwiGLU");
-    OP(h3_gpu_linear_bf16(dit->gpu, dit->mlp_output, dit->activated,
-        weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+    if (dit->fused_mlp) {
+        OP(h3_gpu_mlp_bf16(dit->gpu, dit->mlp_output, dit->mod_mlp,
+            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+           "DiT fused MLP");
+    } else {
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
+            NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT SwiGLU");
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->mlp_output, dit->activated,
+            weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+    }
     OP(h3_gpu_gate_bf16(dit->gpu, dit->hidden, dit->hidden, dit->mlp_output,
         modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
 #undef OP

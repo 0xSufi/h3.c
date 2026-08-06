@@ -104,6 +104,11 @@ measurement is the complete command turnaround; the root GPU timestamp alone
 can omit child buffers scheduled internally by MPSGraph and is labeled
 accordingly.
 
+The DiT fast path evaluates each BF16 `fc1 -> SwiGLU -> fc2` block as one cached
+graph, avoiding separate graph boundaries and persistent intermediate tensors.
+Set `H3_DISABLE_FUSED_MLP=1` to retain the close-reference operation boundaries
+for numerical diagnosis.
+
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
 Qwen encoder, and decoders never have to coexist in unified memory.
