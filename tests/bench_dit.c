@@ -106,6 +106,64 @@ static void run_command_ab(h3_dit *dit, int interval, float *video,
     free(audio_reference);
 }
 
+static void run_graph_data_ab(h3_dit *dit, float *video, float *audio,
+                              float *video_velocity, float *audio_velocity) {
+    char error[512];
+    setenv("H3_DISABLE_GRAPH_DATA_CACHE", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating graph-data AB references");
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    unsetenv("H3_DISABLE_GRAPH_DATA_CACHE");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int cache_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0;
+    double cached_seconds = 0.0;
+    int baseline_count = 0;
+    int cached_count = 0;
+    for (size_t index = 0;
+         index < sizeof(cache_pattern) / sizeof(*cache_pattern); index++) {
+        if (cache_pattern[index]) unsetenv("H3_DISABLE_GRAPH_DATA_CACHE");
+        else setenv("H3_DISABLE_GRAPH_DATA_CACHE", "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (memcmp(video_reference, video_velocity,
+                   VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+            memcmp(audio_reference, audio_velocity,
+                   AUDIO_ELEMENTS * sizeof(*audio_reference)))
+            die("graph-data cache changed DiT output bytes");
+        if (cache_pattern[index]) {
+            cached_seconds += elapsed;
+            cached_count++;
+            printf("  AB graph-data cached %.3fs\n", elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  AB graph-data baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_GRAPH_DATA_CACHE");
+    printf("DiT graph-data AB baseline %.4fs, cached-weights %.4fs, ratio %.4f, "
+           "outputs byte-identical\n", baseline_seconds / baseline_count,
+           cached_seconds / cached_count,
+           cached_seconds * baseline_count /
+               (baseline_seconds * cached_count));
+    free(video_reference);
+    free(audio_reference);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -161,6 +219,16 @@ int main(int argc, char **argv) {
         run_command_ab(dit, (int)interval, video, audio, video_velocity,
                        audio_velocity);
         printf("DiT 512/%u-layer load %.3fs before command AB\n",
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (getenv("H3_BENCH_GRAPH_DATA_AB")) {
+        run_graph_data_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT 512/%u-layer load %.3fs before graph-data AB\n",
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);

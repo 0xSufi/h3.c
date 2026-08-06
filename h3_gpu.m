@@ -24,6 +24,9 @@
 @property(nonatomic) size_t bytes;
 @property(nonatomic) h3_gpu_dtype dtype;
 @property(nonatomic, weak) H3GPU *owner;
+@property(nonatomic, strong) MPSGraphTensorData *graphData;
+@property(nonatomic, strong) NSArray<NSNumber *> *graphDataShape;
+@property(nonatomic) MPSDataType graphDataType;
 @end
 @implementation H3Tensor
 @end
@@ -125,6 +128,26 @@ static H3GPU *GPU(h3_gpu *gpu) {
 
 static H3Tensor *TENSOR(const h3_gpu_tensor *tensor) {
     return (__bridge H3Tensor *)(void *)tensor;
+}
+
+static MPSGraphTensorData *h3_gpu_graph_data(const h3_gpu_tensor *tensor,
+                                             NSArray<NSNumber *> *shape,
+                                             MPSDataType data_type,
+                                             int stable) {
+    H3Tensor *object = TENSOR(tensor);
+    if (!stable || getenv("H3_DISABLE_GRAPH_DATA_CACHE"))
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:object.buffer
+            shape:shape dataType:data_type];
+    if (object.graphData && object.graphDataShape == shape &&
+        object.graphDataType == data_type) return object.graphData;
+    MPSGraphTensorData *data = [[MPSGraphTensorData alloc]
+        initWithMTLBuffer:object.buffer shape:shape dataType:data_type];
+    if (!object.graphData) {
+        object.graphData = data;
+        object.graphDataShape = shape;
+        object.graphDataType = data_type;
+    }
+    return data;
 }
 
 static double h3_gpu_now(void) {
@@ -1233,10 +1256,7 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
             [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
         MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
             ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
-                return [[MPSGraphTensorData alloc]
-                    initWithMTLBuffer:TENSOR(tensor).buffer
-                                shape:cache.shape
-                             dataType:mps_dtype];
+                return h3_gpu_graph_data(tensor, cache.shape, mps_dtype, 0);
             };
         NSDictionary *feeds = @{
             cache.query: data(query), cache.key: data(key), cache.value: data(value)
@@ -2052,25 +2072,17 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     @autoreleasepool {
         MPSCommandBuffer *command =
             [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
-        MPSGraphTensorData *input_data =
-            [[MPSGraphTensorData alloc] initWithMTLBuffer:TENSOR(input).buffer
-                                                   shape:linear.inputShape
-                                                dataType:dataType];
-        MPSGraphTensorData *weight_data =
-            [[MPSGraphTensorData alloc] initWithMTLBuffer:TENSOR(weight).buffer
-                                                   shape:linear.weightShape
-                                                dataType:dataType];
-        MPSGraphTensorData *output_data =
-            [[MPSGraphTensorData alloc] initWithMTLBuffer:TENSOR(output).buffer
-                                                   shape:linear.outputShape
-                                                dataType:dataType];
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, linear.inputShape, dataType, 0);
+        MPSGraphTensorData *weight_data = h3_gpu_graph_data(
+            weight, linear.weightShape, dataType, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, linear.outputShape, dataType, 0);
         NSMutableDictionary *feeds = [@{linear.input: input_data,
                                          linear.weight: weight_data} mutableCopy];
         if (bias) {
-            MPSGraphTensorData *bias_data =
-                [[MPSGraphTensorData alloc] initWithMTLBuffer:TENSOR(bias).buffer
-                                                       shape:linear.biasShape
-                                                    dataType:dataType];
+            MPSGraphTensorData *bias_data = h3_gpu_graph_data(
+                bias, linear.biasShape, dataType, 1);
             feeds[linear.bias] = bias_data;
         }
         NSDictionary *results = @{linear.output: output_data};
@@ -2243,18 +2255,14 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     @autoreleasepool {
         MPSCommandBuffer *command =
             [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
-        MPSGraphTensorData *inputData = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:TENSOR(input).buffer shape:mlp.inputShape
-            dataType:MPSDataTypeBFloat16];
-        MPSGraphTensorData *fc1Data = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:TENSOR(fc1_weight).buffer shape:mlp.fc1Shape
-            dataType:MPSDataTypeBFloat16];
-        MPSGraphTensorData *fc2Data = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:TENSOR(fc2_weight).buffer shape:mlp.fc2Shape
-            dataType:MPSDataTypeBFloat16];
-        MPSGraphTensorData *outputData = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:TENSOR(output).buffer shape:mlp.outputShape
-            dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *inputData = h3_gpu_graph_data(
+            input, mlp.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
+            fc1_weight, mlp.fc1Shape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *fc2Data = h3_gpu_graph_data(
+            fc2_weight, mlp.fc2Shape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(
+            output, mlp.outputShape, MPSDataTypeBFloat16, 0);
         NSDictionary *feeds = @{mlp.input: inputData,
                                 mlp.fc1Weight: fc1Data,
                                 mlp.fc2Weight: fc2Data};
