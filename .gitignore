@@ -1,0 +1,6 @@
+misc/
+MiniMax-H3/
+outputs/
+*.o
+h3
+libh3.a
