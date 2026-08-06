@@ -385,6 +385,48 @@ const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
     return schedule && block < H3_DIT_BLOCKS ? schedule->blocks[block] : NULL;
 }
 
+double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
+                                  unsigned block) {
+    if (!schedule || block >= H3_DIT_BLOCKS || !schedule->blocks[block])
+        return -1.0;
+    size_t count = (size_t)schedule->time_rows * BLOCK_OUTPUT;
+    uint16_t *values = malloc(count * sizeof(*values));
+    if (!values || !h3_gpu_tensor_read_bf16(schedule->blocks[block], values,
+                                             count)) {
+        free(values);
+        return -1.0;
+    }
+    double total = 0.0;
+    size_t samples = 0;
+    for (uint32_t row = 0; row < schedule->time_rows; row++)
+        for (uint32_t modality = 0; modality < H3_DIT_MODALITIES; modality++)
+            for (uint32_t slot = 2; slot <= 5; slot += 3) {
+                size_t base = ((size_t)row * H3_DIT_MODALITIES *
+                               H3_DIT_ADALN_SLOTS +
+                               (size_t)modality * H3_DIT_ADALN_SLOTS + slot) *
+                              H3_DIT_HIDDEN;
+                for (uint32_t column = 0; column < H3_DIT_HIDDEN; column++) {
+                    uint32_t bits = (uint32_t)values[base + column] << 16;
+                    float value;
+                    memcpy(&value, &bits, sizeof(value));
+                    total += fabs((double)value);
+                }
+                samples += H3_DIT_HIDDEN;
+            }
+    free(values);
+    return samples ? total / (double)samples : -1.0;
+}
+
+void h3_dit_schedule_prune(h3_dit_schedule *schedule,
+                           const uint8_t *active_blocks, size_t count) {
+    if (!schedule || !active_blocks || count != H3_DIT_BLOCKS) return;
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        if (active_blocks[block]) continue;
+        h3_gpu_tensor_free(schedule->blocks[block]);
+        schedule->blocks[block] = NULL;
+    }
+}
+
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule) {
     return schedule ? schedule->final : NULL;
 }

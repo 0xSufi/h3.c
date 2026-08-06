@@ -40,6 +40,10 @@ uint32_t h3_dit_schedule_audio_condition_row(
     const h3_dit_schedule *schedule, int step);
 const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
                                            unsigned block);
+double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
+                                  unsigned block);
+void h3_dit_schedule_prune(h3_dit_schedule *schedule,
+                           const uint8_t *active_blocks, size_t count);
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
 
 /* Build the row map consumed by the fused AdaLN/gate kernels. text_tags may be

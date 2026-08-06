@@ -43,6 +43,8 @@ struct h3_dit {
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
     int fused_mlp;
+    unsigned active_block_count;
+    uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
     h3_sigma_schedule sigmas;
     int latent_t;
@@ -537,9 +539,62 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
     return 1;
 }
 
+static void configure_active_blocks(h3_dit *dit, unsigned active) {
+    memset(dit->block_active, 1, sizeof(dit->block_active));
+    dit->active_block_count = active;
+    unsigned skipped = H3_DIT_BLOCKS - active;
+    for (unsigned index = 0; index < skipped; index++) {
+        unsigned block = ((2 * index + 1) * H3_DIT_BLOCKS) / (2 * skipped);
+        if (block == 0) block = 1;
+        if (block >= H3_DIT_BLOCKS - 1) block = H3_DIT_BLOCKS - 2;
+        dit->block_active[block] = 0;
+    }
+}
+
+static void configure_gate_ranked_blocks(h3_dit *dit) {
+    const char *policy = getenv("H3_DIT_LAYER_POLICY");
+    if ((policy && !strcmp(policy, "uniform")) ||
+        dit->active_block_count == H3_DIT_BLOCKS) return;
+    typedef struct { unsigned block; double score; } block_score;
+    /* The first two and final blocks establish/close the residual stream.
+     * Block 1 has a small gate but proved structurally essential in decoded
+     * A/B renders, so magnitude ranking must not treat it as disposable. */
+    block_score scores[H3_DIT_BLOCKS - 3];
+    for (unsigned block = 2; block + 1 < H3_DIT_BLOCKS; block++) {
+        double score = h3_dit_schedule_gate_score(dit->schedule, block);
+        if (score < 0.0) return;
+        scores[block - 2] = (block_score){block, score};
+    }
+    unsigned count = H3_DIT_BLOCKS - 3;
+    for (unsigned left = 0; left < count; left++) {
+        unsigned least = left;
+        for (unsigned right = left + 1; right < count; right++)
+            if (scores[right].score < scores[least].score) least = right;
+        block_score temporary = scores[left];
+        scores[left] = scores[least];
+        scores[least] = temporary;
+    }
+    memset(dit->block_active, 1, sizeof(dit->block_active));
+    unsigned skipped = H3_DIT_BLOCKS - dit->active_block_count;
+    for (unsigned index = 0; index < skipped; index++)
+        dit->block_active[scores[index].block] = 0;
+    if (getenv("H3_PROFILE")) {
+        fprintf(stderr, "h3: gate-ranked DiT skips");
+        for (unsigned index = 0; index < skipped; index++)
+            fprintf(stderr, " %u(%.4g)", scores[index].block,
+                    scores[index].score);
+        fputc('\n', stderr);
+    }
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
+        if (!dit->block_active[index]) {
+            report(progress, opaque, "load transformer core", (int)index + 1,
+                   H3_DIT_BLOCKS);
+            continue;
+        }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
         if (!load_block(dit, &dit->blocks[index], prefix, error, error_size))
@@ -643,6 +698,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
+                        unsigned active_blocks,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -650,7 +706,9 @@ static h3_dit *load_dit(const char *weight_directory,
                         h3_dit_progress progress, void *progress_opaque,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!weight_directory || !shader_source_path || !layout || !sigmas) {
+    if (!weight_directory || !shader_source_path || !layout || !sigmas ||
+        active_blocks < H3_DIT_BLOCKS / 2 ||
+        active_blocks > H3_DIT_BLOCKS) {
         fail(error, error_size, "invalid DiT load arguments");
         return NULL;
     }
@@ -660,6 +718,7 @@ static h3_dit *load_dit(const char *weight_directory,
         return NULL;
     }
     dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
+    configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size)) goto failed;
     size_t wanted_video_condition =
@@ -688,6 +747,11 @@ static h3_dit *load_dit(const char *weight_directory,
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
         dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
+    if (dit->schedule) {
+        configure_gate_ranked_blocks(dit);
+        h3_dit_schedule_prune(dit->schedule, dit->block_active,
+                              H3_DIT_BLOCKS);
+    }
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
@@ -713,9 +777,11 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    active_blocks,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -726,6 +792,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -733,6 +800,7 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    active_blocks,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -836,6 +904,7 @@ static int encode_forward(h3_dit *dit, int step, char *error,
         return 0;
     }
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        if (!dit->block_active[block]) continue;
         if (!run_block(dit, block, step, error, error_size)) return 0;
     }
     OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,

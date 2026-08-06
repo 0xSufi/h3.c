@@ -168,6 +168,11 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
         return 0;
     }
+    if (params->dit_layers < H3_MIN_DIT_LAYERS ||
+        params->dit_layers > H3_DEFAULT_DIT_LAYERS) {
+        h3_set_error(ctx, "DiT layers must be in [35, 50]");
+        return 0;
+    }
     if (params->reference_count && !params->references) {
         h3_set_error(ctx, "reference_count is nonzero but references is NULL");
         return 0;
@@ -850,12 +855,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (visual_count) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            (unsigned)params->dit_layers,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            (unsigned)params->dit_layers,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {

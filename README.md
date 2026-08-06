@@ -38,7 +38,7 @@ make test
   --width 512 --height 512 --frames 22 --steps 20 \
   -o outputs/profile.mp4
 ./h3 --profile -d MiniMax-H3 -p "A surfer riding a blue ocean wave" \
-  --width 512 --height 512 --frames 22 --steps 20 --reuse 3 \
+  --width 512 --height 512 --frames 22 --steps 20 --reuse 3 --layers 45 \
   -o outputs/fast-surfer.mp4
 ```
 
@@ -68,7 +68,11 @@ M5-Max validation also produces a clean photorealistic fox rather than noise.
 fast-quality setting. `--reuse 3` is the aggressive setting; it evaluates
 roughly one third. Reuse extrapolates skipped video and audio velocities on
 their independent sigma grids. The default `--reuse 1` remains the close
-reference path.
+reference path. `--layers 45` independently drops the five least-active DiT
+residual blocks, selected from their actual AdaLN gates, and is the validated
+fast-quality setting; `--layers 40` is more aggressive. The exact default is
+`--layers 50`. Unused block weights and schedule tensors are not retained, so
+the setting reduces both transformer time and unified-memory use.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

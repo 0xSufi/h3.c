@@ -20,6 +20,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
@@ -32,6 +33,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
