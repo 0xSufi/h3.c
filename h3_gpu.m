@@ -341,7 +341,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16",
+            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+            @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
@@ -2565,6 +2566,23 @@ int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, right, elements, @"add right") ||
         !h3_gpu_require_bf16(gpu, output, elements, @"add output")) return 0;
     return h3_gpu_dispatch_1d(gpu, @"h3_add_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(left).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_sub_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                    uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, left, elements, @"subtract left") ||
+        !h3_gpu_require_bf16(gpu, right, elements, @"subtract right") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"subtract output"))
+        return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_sub_bf16", elements,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(left).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];

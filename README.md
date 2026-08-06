@@ -38,7 +38,7 @@ make test
   --width 512 --height 512 --frames 22 --steps 20 \
   -o outputs/profile.mp4
 ./h3 --profile -d MiniMax-H3 -p "A surfer riding a blue ocean wave" \
-  --width 512 --height 512 --frames 22 --steps 20 --reuse 3 --layers 45 \
+  --width 512 --height 512 --frames 22 --steps 20 --core-reuse 4 \
   -o outputs/fast-surfer.mp4
 ```
 
@@ -73,6 +73,11 @@ residual blocks, selected from their actual AdaLN gates, and is the validated
 fast-quality setting; `--layers 40` is more aggressive. The exact default is
 `--layers 50`. Unused block weights and schedule tensors are not retained, so
 the setting reduces both transformer time and unified-memory use.
+`--core-reuse 4` is a stronger fast-quality mode: it reuses the previous full
+transformer-core residual while still refreshing the patch projection and
+timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
+validated aggressive limit; values above 6 lose subject fidelity. Core reuse
+and whole-velocity `--reuse` are intentionally mutually exclusive.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

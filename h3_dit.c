@@ -43,6 +43,9 @@ struct h3_dit {
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
     int fused_mlp;
+    unsigned core_reuse_interval;
+    unsigned core_forward_count;
+    int core_residual_ready;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -84,6 +87,8 @@ struct h3_dit {
     h3_gpu_tensor *video_projected;
     h3_gpu_tensor *audio_projected;
     h3_gpu_tensor *hidden;
+    h3_gpu_tensor *core_input;
+    h3_gpu_tensor *core_residual;
     h3_gpu_tensor *mod_attention;
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *query;
@@ -680,6 +685,18 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
+    if (dit->core_reuse_interval > 1) {
+        dit->core_input = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+        dit->core_residual = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+        if (!dit->core_input || !dit->core_residual) {
+            fail(error, error_size,
+                 "cannot allocate DiT core residual cache: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -699,6 +716,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         const h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
                         unsigned active_blocks,
+                        unsigned core_reuse_interval,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -708,7 +726,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         active_blocks < H3_DIT_BLOCKS / 2 ||
-        active_blocks > H3_DIT_BLOCKS) {
+        active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
+        core_reuse_interval > 6) {
         fail(error, error_size, "invalid DiT load arguments");
         return NULL;
     }
@@ -718,6 +737,7 @@ static h3_dit *load_dit(const char *weight_directory,
         return NULL;
     }
     dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
+    dit->core_reuse_interval = core_reuse_interval;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size)) goto failed;
@@ -778,10 +798,11 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
+                         unsigned core_reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks,
+                    active_blocks, core_reuse_interval,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -793,6 +814,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
+                         unsigned core_reuse_interval,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -800,7 +822,7 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks,
+                    active_blocks, core_reuse_interval,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -903,10 +925,31 @@ static int encode_forward(h3_dit *dit, int step, char *error,
         fail(error, error_size, "DiT segment packing did not consume row sources");
         return 0;
     }
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
-        if (!dit->block_active[block]) continue;
-        if (!run_block(dit, block, step, error, error_size)) return 0;
+    int evaluate_core = dit->core_reuse_interval == 1 ||
+        !dit->core_residual_ready ||
+        dit->core_forward_count % dit->core_reuse_interval == 0 ||
+        step == h3_dit_schedule_steps(dit->schedule) - 1;
+    uint32_t hidden_elements = dit->sequence * HIDDEN;
+    if (evaluate_core && dit->core_reuse_interval > 1)
+        OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
+                            hidden_elements), "save DiT core input");
+    if (evaluate_core) {
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            if (!dit->block_active[block]) continue;
+            if (!run_block(dit, block, step, error, error_size)) return 0;
+        }
+        if (dit->core_reuse_interval > 1) {
+            OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
+                               dit->core_input, hidden_elements),
+               "cache DiT core residual");
+            dit->core_residual_ready = 1;
+        }
+    } else {
+        OP(h3_gpu_add_bf16(dit->gpu, dit->hidden, dit->hidden,
+                           dit->core_residual, hidden_elements),
+           "reuse DiT core residual");
     }
+    dit->core_forward_count++;
     OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
         (size_t)dit->audio_target_start * HIDDEN,
         (size_t)dit->audio_rows * HIDDEN),
@@ -1242,6 +1285,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_input); FREE(audio_input);
     FREE(video_projected_f32); FREE(audio_projected_f32);
     FREE(video_projected); FREE(audio_projected); FREE(hidden);
+    FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(final_audio_input);

@@ -1222,6 +1222,16 @@ kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
                                   h3_bf16_to_f32(right[gid]));
 }
 
+kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
+                         device const ushort *right [[buffer(1)]],
+                         device ushort *output [[buffer(2)]],
+                         constant uint &count [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(left[gid]) -
+                                  h3_bf16_to_f32(right[gid]));
+}
+
 kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
                               device const ushort *up [[buffer(1)]],
                               device ushort *output [[buffer(2)]],

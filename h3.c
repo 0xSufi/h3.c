@@ -173,6 +173,14 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "DiT layers must be in [35, 50]");
         return 0;
     }
+    if (params->core_reuse < 1 || params->core_reuse > 6) {
+        h3_set_error(ctx, "core reuse must be in [1, 6]");
+        return 0;
+    }
+    if (params->core_reuse > 1 && params->denoise_reuse > 1) {
+        h3_set_error(ctx, "core reuse and denoiser reuse cannot be combined");
+        return 0;
+    }
     if (params->reference_count && !params->references) {
         h3_set_error(ctx, "reference_count is nonzero but references is NULL");
         return 0;
@@ -855,14 +863,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (visual_count) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
-            (unsigned)params->dit_layers,
+            (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
-            (unsigned)params->dit_layers,
+            (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
