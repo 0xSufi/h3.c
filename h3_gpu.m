@@ -107,6 +107,8 @@
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic) h3_gpu_stats stats;
 @property(nonatomic, copy) NSString *profileLabel;
+@property(nonatomic) BOOL tensorOpsEnabled;
+@property(nonatomic) NSUInteger tensorOpsMode;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -316,9 +318,32 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         if (source) {
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
+            const char *nax = getenv("H3_NAX");
+            BOOL wantsTensorOps =
+                [gpu.device.name rangeOfString:@"M5"].location != NSNotFound &&
+                nax && *nax && strcmp(nax, "0");
+            if (wantsTensorOps)
+                options.preprocessorMacros = @{ @"H3_METAL_HAS_TENSOR": @"1" };
             gpu.library = [gpu.device newLibraryWithSource:source
                                                    options:options
                                                      error:&libraryError];
+            gpu.tensorOpsEnabled = gpu.library && wantsTensorOps;
+            if (gpu.tensorOpsEnabled) {
+                gpu.tensorOpsMode = !strcmp(nax, "attn") ? 2u :
+                                    !strcmp(nax, "qkv-attn") ? 3u :
+                                    !strcmp(nax, "qkv") ? 4u : 1u;
+            }
+            if (!gpu.library && wantsTensorOps) {
+                /* TensorOps is optional: an older runtime must retain the
+                 * ordinary MPSGraph/direct Metal implementation. */
+                options.preprocessorMacros = @{};
+                libraryError = nil;
+                gpu.library = [gpu.device newLibraryWithSource:source
+                                                       options:options
+                                                         error:&libraryError];
+                gpu.tensorOpsEnabled = NO;
+                gpu.tensorOpsMode = 0;
+            }
         }
         if (!gpu.library) {
             if (error && error_size) {
@@ -328,7 +353,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             }
             return NULL;
         }
-        NSArray<NSString *> *names = @[
+        NSMutableArray<NSString *> *names = [@[
             @"h3_linear_f32", @"h3_silu_f32", @"h3_cast_f32_to_bf16",
             @"h3_cast_bf16_to_f32",
             @"h3_rms_norm_f32",
@@ -350,7 +375,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
             @"h3_vae_encoder_group_norm_silu_f32"
-        ];
+        ] mutableCopy];
+        if (gpu.tensorOpsEnabled)
+            [names addObject:@"h3_linear_bf16_nax_r128"];
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
             id<MTLFunction> function = [gpu.library newFunctionWithName:name];
@@ -2011,6 +2038,40 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, weight, weight_count, @"linear weight") ||
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
+    BOOL naxShape = gpu.tensorOpsMode == 1 ||
+        (gpu.tensorOpsMode == 2 && input_dim == 7168 && output_dim == 5376) ||
+        (gpu.tensorOpsMode == 3 &&
+         ((input_dim == 7168 && output_dim == 5376) ||
+          (input_dim == 5376 && output_dim == 21504))) ||
+        (gpu.tensorOpsMode == 4 && input_dim == 5376 && output_dim == 21504);
+    if (gpu.tensorOpsEnabled && naxShape && !bias && rows >= 128 &&
+        (input_dim % 32) == 0 && (output_dim % 64) == 0) {
+        linear_args args = {rows, input_dim, output_dim, 0};
+        if (!h3_gpu_require_command(gpu)) return 0;
+        id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+            gpu, @"h3_linear_bf16_nax_r128");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+            h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps");
+            return 0;
+        }
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder =
+                [gpu.command computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((rows + 127) / 128, (output_dim + 63) / 64, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [encoder endEncoding];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+        return 1;
+    }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,

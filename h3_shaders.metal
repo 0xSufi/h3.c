@@ -1,5 +1,12 @@
 #include <metal_stdlib>
+#ifdef H3_METAL_HAS_TENSOR
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 using namespace metal;
+#ifdef H3_METAL_HAS_TENSOR
+using namespace mpp::tensor_ops;
+#endif
 
 inline float h3_bf16_to_f32(ushort value) {
     return as_type<float>(uint(value) << 16);
@@ -678,6 +685,38 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
         output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
     }
 }
+
+#ifdef H3_METAL_HAS_TENSOR
+/*
+ * M5 Metal 4/TensorOps path for the large H3 matrices.  This follows the
+ * retained direct-RHS design in ds4.c: the contiguous dimension comes first
+ * in Metal tensor extents, checkpoint weights are transposed logically rather
+ * than copied, and TensorOps handles the final partial row tile.  Native
+ * bfloat inputs avoid both a format conversion and a duplicate weight arena.
+ */
+kernel void h3_linear_bf16_nax_r128(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *output [[buffer(3)]],
+                           constant linear_args &args [[buffer(4)]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim, (int)args.output_dim));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        output,
+        dextents<int32_t, 2>((int)args.output_dim, (int)args.rows));
+    auto mx = x.slice(0, (int)group.x * 128);
+    auto mw = w.slice(0, (int)group.y * 64);
+    auto my = y.slice((int)group.y * 64, (int)group.x * 128);
+    matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    mm.run(mx, mw, my);
+}
+#endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],
                          device ushort *output [[buffer(1)]],

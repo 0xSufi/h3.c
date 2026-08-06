@@ -93,6 +93,13 @@ layer. The default ring depth is two layers on M3/older hardware and three on
 M5, where the target machine has 128 GiB. `H3_QWEN_PREFETCH=0` restores the
 single-layer synchronous reference path; values 1-8 select the worker count,
 and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
+An M5-only native BF16 Metal 4/TensorOps linear path is available with
+`H3_NAX=1`. It is guarded at runtime and falls back to the unchanged portable
+library if TensorOps compilation is unavailable. The path passes the complete
+50-block MLX fixture, but remains opt-in: exact-shape microbenchmarks favor its
+128-row tile while full DiT runs currently favor MPSGraph scheduling. This
+keeps a working NAX integration available for later quantized/fused kernels
+without making a benchmark regression the default.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE
