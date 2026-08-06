@@ -5,7 +5,7 @@ sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, one real denoising step, and
 finally prompt-to-video before the conditioning modes are added.
 
-Current milestone: M2 portable Metal block baseline.
+Current milestone: M3 prompt encoding.
 
 ```sh
 make
@@ -17,7 +17,10 @@ make test
 is installed under `misc/fixtures/`, compiles the Metal source at runtime and
 checks a complete toy H3 block against named MLX outputs. Runtime compilation is
 intentional: it follows Iris and does not require Xcode's optional offline Metal
-toolchain. `make parity` runs only that Metal/MLX check.
+toolchain. The test covers both an F32 diagnosis path and the production BF16
+storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, with
+direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
+checks.
 
 The eventual CLI follows Iris-style conventions:
 

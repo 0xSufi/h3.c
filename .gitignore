@@ -7,5 +7,6 @@ outputs/
 h3
 h3_tests
 h3_metal_tests
+h3_bf16_tests
 libh3.a
 .DS_Store

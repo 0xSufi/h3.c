@@ -27,16 +27,22 @@ h3_tests: tests/test_h3.o $(LIB_OBJ)
 h3_metal_tests: tests/test_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_tests h3_metal_tests
+h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+test: h3_tests h3_metal_tests h3_bf16_tests
 	./h3_tests
-	@if test -f misc/fixtures/h3_dit.safetensors; then \
+	@if test -f misc/fixtures/h3_dit.safetensors && \
+	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
+		./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors; \
 	else \
-		echo "skip: MLX toy-block fixture is not installed"; \
+		echo "skip: MLX toy-block fixtures are not installed"; \
 	fi
 
-parity: h3_metal_tests
+parity: h3_metal_tests h3_bf16_tests
 	./h3_metal_tests misc/fixtures/h3_dit.safetensors
+	./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
@@ -48,4 +54,4 @@ tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
 clean:
-	rm -f h3 h3_tests h3_metal_tests libh3.a *.o tests/*.o
+	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests libh3.a *.o tests/*.o
