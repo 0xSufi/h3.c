@@ -34,6 +34,7 @@ typedef struct {
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
+int h3_gpu_is_m5(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
@@ -48,6 +49,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+/* Fill an existing shared BF16 buffer from a file. The tensor and its
+ * accounting are unchanged, so this may run on an I/O thread while another
+ * tensor is in flight on the GPU. */
+int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);

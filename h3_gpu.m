@@ -396,6 +396,12 @@ void h3_gpu_free(h3_gpu *gpu) {
     }
 }
 
+int h3_gpu_is_m5(const h3_gpu *opaque) {
+    if (!opaque) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    return [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
                                         size_t elements, size_t item_size,
                                         h3_gpu_dtype dtype) {
@@ -563,6 +569,54 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                       uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
                                    sizeof(float), H3_GPU_F32, "F32");
+}
+
+int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!opaque || !path || !*path ||
+        TENSOR(opaque).dtype != H3_GPU_BF16 ||
+        elements != TENSOR(opaque).elements ||
+        elements > SIZE_MAX / sizeof(uint16_t) || file_offset > INT64_MAX) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid BF16 file read request");
+        return 0;
+    }
+    size_t bytes = elements * sizeof(uint16_t);
+    if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) {
+        if (error && error_size)
+            snprintf(error, error_size, "BF16 file read range overflows");
+        return 0;
+    }
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s: %s", path,
+                     strerror(errno));
+        return 0;
+    }
+    unsigned char *destination = TENSOR(opaque).buffer.contents;
+    size_t completed = 0;
+    while (completed < bytes) {
+        size_t request = MIN(bytes - completed, (size_t)SSIZE_MAX);
+        ssize_t count = pread(descriptor, destination + completed, request,
+                              (off_t)(file_offset + completed));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            int detail = count < 0 ? errno : 0;
+            if (error && error_size) {
+                snprintf(error, error_size, "cannot read BF16 payload from %s: %s",
+                         path, detail ? strerror(detail) :
+                                        "unexpected end of file");
+            }
+            close(descriptor);
+            return 0;
+        }
+        completed += (size_t)count;
+    }
+    close(descriptor);
+    return 1;
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {

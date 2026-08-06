@@ -87,6 +87,12 @@ safetensor shards instead of copied into anonymous shared buffers. This keeps
 the 37 GiB model file-backed/reclaimable and slightly improves total transformer
 time; M3 uses the faster copied-buffer path. `H3_ZERO_COPY_WEIGHTS=0` disables
 the M5 selection for diagnostics.
+The streamed Qwen text encoder preallocates a small ring of future layer
+buffers and fills them on eight I/O workers while Metal executes the current
+layer. The default ring depth is two layers on M3/older hardware and three on
+M5, where the target machine has 128 GiB. `H3_QWEN_PREFETCH=0` restores the
+single-layer synchronous reference path; values 1-8 select the worker count,
+and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

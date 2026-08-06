@@ -3,6 +3,7 @@
 #include "h3_weights.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,28 @@ typedef struct {
     size_t error_size;
 } load_context;
 
+typedef struct {
+    const h3_weight_store *store;
+    int layer;
+    text_layer_weights *weights;
+    int lane;
+    int lanes;
+    int ok;
+    char error[512];
+} text_layer_prefetch;
+
+typedef struct {
+    int occupied;
+    int active;
+    int layer;
+    int lanes;
+    load_context load;
+    text_layer_weights weights;
+    text_layer_prefetch prefetch[8];
+    pthread_t threads[8];
+    int started[8];
+} text_prefetch_slot;
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -98,6 +121,27 @@ static h3_gpu_tensor *load_2d(load_context *load, const char *name,
                                             load->error_size));
 }
 
+static int text_prefetch_threads(void) {
+    const char *value = getenv("H3_QWEN_PREFETCH");
+    if (!value || !*value) return 8;
+    if (!strcmp(value, "0")) return 0;
+    char *tail = NULL;
+    long threads = strtol(value, &tail, 10);
+    if (!tail || *tail || threads < 1) threads = 1;
+    if (threads > 8) threads = 8;
+    return (int)threads;
+}
+
+static int text_prefetch_depth(const h3_gpu *gpu) {
+    const char *value = getenv("H3_QWEN_PREFETCH_DEPTH");
+    if (!value || !*value) return h3_gpu_is_m5(gpu) ? 3 : 2;
+    char *tail = NULL;
+    long depth = strtol(value, &tail, 10);
+    if (!tail || *tail || depth < 1) depth = 1;
+    if (depth > 6) depth = 6;
+    return (int)depth;
+}
+
 static int layer_weights_load(load_context *load, int layer,
                               text_layer_weights *weights) {
     char prefix[96];
@@ -134,6 +178,219 @@ static int layer_weights_load(load_context *load, int layer,
 #undef LOAD_1D
 #undef LOAD_2D
     return 1;
+}
+
+static h3_gpu_tensor *allocate_bf16(load_context *load, size_t elements) {
+    h3_gpu_tensor *tensor = defer(
+        load, h3_gpu_tensor_new_bf16(load->gpu, elements));
+    if (!tensor) {
+        fail(load->error, load->error_size,
+             "cannot allocate prefetched Qwen weight: %s",
+             h3_gpu_error(load->gpu));
+    }
+    return tensor;
+}
+
+static int layer_weights_allocate(load_context *load,
+                                  text_layer_weights *weights) {
+#define ALLOCATE(field, elements) do {                                         \
+    weights->field = allocate_bf16(load, (elements));                          \
+    if (!weights->field) return 0;                                              \
+} while (0)
+    ALLOCATE(input_norm, TEXT_HIDDEN);
+    ALLOCATE(query, (size_t)TEXT_QUERY_DIM * TEXT_HIDDEN);
+    ALLOCATE(key, (size_t)TEXT_KV_DIM * TEXT_HIDDEN);
+    ALLOCATE(value, (size_t)TEXT_KV_DIM * TEXT_HIDDEN);
+    ALLOCATE(query_norm, TEXT_HEAD_DIM);
+    ALLOCATE(key_norm, TEXT_HEAD_DIM);
+    ALLOCATE(attention_output, (size_t)TEXT_HIDDEN * TEXT_QUERY_DIM);
+    ALLOCATE(post_norm, TEXT_HIDDEN);
+    ALLOCATE(gate, (size_t)TEXT_INTERMEDIATE * TEXT_HIDDEN);
+    ALLOCATE(up, (size_t)TEXT_INTERMEDIATE * TEXT_HIDDEN);
+    ALLOCATE(down, (size_t)TEXT_HIDDEN * TEXT_INTERMEDIATE);
+#undef ALLOCATE
+    return 1;
+}
+
+static int read_weight_bf16(const h3_weight_store *store, const char *name,
+                            int ndim, const uint64_t *shape,
+                            h3_gpu_tensor *destination,
+                            char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    if (tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != ndim) {
+        fail(error, error_size,
+             "weight %s has dtype/rank %s/%d, expected BF16/%d", name,
+             h3_dtype_name(tensor->dtype), tensor->ndim, ndim);
+        return 0;
+    }
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < ndim; dimension++) {
+        if (tensor->shape[dimension] != shape[dimension]) {
+            fail(error, error_size,
+                 "weight %s shape mismatch at dimension %d", name,
+                 dimension);
+            return 0;
+        }
+        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
+            fail(error, error_size, "weight %s shape overflows", name);
+            return 0;
+        }
+        elements *= shape[dimension];
+    }
+    if (elements > SIZE_MAX ||
+        !h3_gpu_tensor_read_file_bf16(destination, header->path,
+                                      tensor->file_offset, (size_t)elements,
+                                      error, error_size)) {
+        if (error && error_size && !error[0])
+            fail(error, error_size, "cannot prefetch %s", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int layer_weights_read_lane(const h3_weight_store *store, int layer,
+                                   text_layer_weights *weights,
+                                   int lane, int lanes,
+                                   char *error, size_t error_size) {
+    char prefix[96];
+    int length = snprintf(prefix, sizeof(prefix),
+                          "model.language_model.layers.%d.", layer);
+    if (length < 0 || (size_t)length >= sizeof(prefix)) {
+        fail(error, error_size, "cannot format Qwen layer name");
+        return 0;
+    }
+#define READ_1D(field, suffix, width) do {                                     \
+    int selected = item++ % lanes == lane;                                     \
+    char name[192];                                                             \
+    uint64_t shape[] = {width};                                                 \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    if (selected && !read_weight_bf16(                                         \
+                          store, name, 1, shape, weights->field,               \
+                          error, error_size)) return 0;                         \
+} while (0)
+#define READ_2D(field, suffix, rows, columns) do {                             \
+    int selected = item++ % lanes == lane;                                     \
+    char name[192];                                                             \
+    uint64_t shape[] = {rows, columns};                                         \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    if (selected && !read_weight_bf16(                                         \
+                          store, name, 2, shape, weights->field,               \
+                          error, error_size)) return 0;                         \
+} while (0)
+    int item = 0;
+    READ_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
+    READ_2D(query, "self_attn.q_proj.weight", TEXT_QUERY_DIM, TEXT_HIDDEN);
+    READ_2D(key, "self_attn.k_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
+    READ_2D(value, "self_attn.v_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
+    READ_1D(query_norm, "self_attn.q_norm.weight", TEXT_HEAD_DIM);
+    READ_1D(key_norm, "self_attn.k_norm.weight", TEXT_HEAD_DIM);
+    READ_2D(attention_output, "self_attn.o_proj.weight", TEXT_HIDDEN,
+            TEXT_QUERY_DIM);
+    READ_1D(post_norm, "post_attention_layernorm.weight", TEXT_HIDDEN);
+    READ_2D(gate, "mlp.gate_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
+    READ_2D(up, "mlp.up_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
+    READ_2D(down, "mlp.down_proj.weight", TEXT_HIDDEN, TEXT_INTERMEDIATE);
+#undef READ_1D
+#undef READ_2D
+    return 1;
+}
+
+static void *layer_prefetch_main(void *opaque) {
+    text_layer_prefetch *prefetch = opaque;
+    prefetch->ok = layer_weights_read_lane(
+        prefetch->store, prefetch->layer, prefetch->weights,
+        prefetch->lane, prefetch->lanes,
+        prefetch->error, sizeof(prefetch->error));
+    return NULL;
+}
+
+static void prefetch_slot_retire(text_prefetch_slot *slot) {
+    if (!slot || !slot->occupied) return;
+    if (slot->active) {
+        for (int lane = 0; lane < slot->lanes; lane++) {
+            if (slot->started[lane])
+                pthread_join(slot->threads[lane], NULL);
+        }
+    }
+    retire_deferred(&slot->load);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static int prefetch_slot_start(text_prefetch_slot *slot,
+                               const h3_weight_store *store, h3_gpu *gpu,
+                               int layer, int lanes,
+                               char *error, size_t error_size) {
+    if (!slot || slot->occupied || lanes < 1 || lanes > 8) return 0;
+    memset(slot, 0, sizeof(*slot));
+    slot->occupied = 1;
+    slot->active = 1;
+    slot->layer = layer;
+    slot->lanes = lanes;
+    slot->load.store = store;
+    slot->load.gpu = gpu;
+    slot->load.error = error;
+    slot->load.error_size = error_size;
+    if (!layer_weights_allocate(&slot->load, &slot->weights)) {
+        prefetch_slot_retire(slot);
+        return 0;
+    }
+    for (int lane = 0; lane < lanes; lane++) {
+        text_layer_prefetch *prefetch = &slot->prefetch[lane];
+        prefetch->store = store;
+        prefetch->layer = layer;
+        prefetch->weights = &slot->weights;
+        prefetch->lane = lane;
+        prefetch->lanes = lanes;
+        if (pthread_create(&slot->threads[lane], NULL,
+                           layer_prefetch_main, prefetch) == 0) {
+            slot->started[lane] = 1;
+        } else {
+            prefetch->ok = layer_weights_read_lane(
+                store, layer, &slot->weights, lane, lanes,
+                prefetch->error, sizeof(prefetch->error));
+        }
+    }
+    return 1;
+}
+
+static int prefetch_slot_take(text_prefetch_slot *slot,
+                              load_context *load,
+                              text_layer_weights *weights,
+                              char *error, size_t error_size) {
+    if (!slot || !slot->occupied || !load || !weights) return 0;
+    if (slot->active) {
+        for (int lane = 0; lane < slot->lanes; lane++) {
+            if (slot->started[lane])
+                pthread_join(slot->threads[lane], NULL);
+        }
+        slot->active = 0;
+    }
+    for (int lane = 0; lane < slot->lanes; lane++) {
+        if (!slot->prefetch[lane].ok) {
+            fail(error, error_size,
+                 "Qwen layer %d prefetch lane %d failed: %s",
+                 slot->layer, lane,
+                 slot->prefetch[lane].error[0] ?
+                     slot->prefetch[lane].error : "unknown error");
+            prefetch_slot_retire(slot);
+            return 0;
+        }
+    }
+    *load = slot->load;
+    *weights = slot->weights;
+    slot->load.deferred_count = 0;
+    memset(slot, 0, sizeof(*slot));
+    return 1;
+}
+
+static void prefetch_slots_retire(text_prefetch_slot *slots, int count) {
+    for (int index = 0; index < count; index++)
+        prefetch_slot_retire(&slots[index]);
 }
 
 static int gpu_operation(h3_gpu *gpu, int ok, char *error, size_t error_size,
@@ -388,27 +645,80 @@ static int text_encode_bf16_impl(
         }
     }
 
-    for (int layer = 0; layer < layer_count; layer++) {
-        text_layer_weights weights;
-        memset(&weights, 0, sizeof(weights));
-        if (!layer_weights_load(&load, layer, &weights) ||
-            !gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
-                           "layer stream begin", layer) ||
-            !encode_layer(gpu, &weights, tokens, hidden, norm, query, key,
-                          value, attention_heads, attention_output, gate, up,
-                          mlp_output, rope_cos, rope_sin, layer,
-                          error, error_size) ||
-            (layer < 3 && span_count &&
-             !gpu_operation(gpu, h3_gpu_add_bf16(
-                 gpu, hidden, hidden, deepstack[layer],
-                 tokens * TEXT_HIDDEN), error, error_size,
-                 "deepstack residual", layer)) ||
-            !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                           "layer stream submit", layer)) {
+    int prefetch_threads = text_prefetch_threads();
+    int prefetch_layers = prefetch_threads > 0 && layer_count > 1;
+    int prefetch_depth = prefetch_layers ? text_prefetch_depth(gpu) : 0;
+    text_prefetch_slot slots[6];
+    memset(slots, 0, sizeof(slots));
+    text_layer_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    if (!layer_weights_load(&load, 0, &weights)) goto cleanup;
+    int next_prefetch_layer = 1;
+    for (int index = 0;
+         index < prefetch_depth && next_prefetch_layer < layer_count;
+         index++, next_prefetch_layer++) {
+        if (!prefetch_slot_start(&slots[index], store, gpu,
+                                 next_prefetch_layer, prefetch_threads,
+                                 error, error_size)) {
+            prefetch_slots_retire(slots, prefetch_depth);
             goto cleanup;
         }
+    }
+    for (int layer = 0; layer < layer_count; layer++) {
+        int layer_ok =
+            gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                          "layer stream begin", layer) &&
+            encode_layer(gpu, &weights, tokens, hidden, norm, query, key,
+                         value, attention_heads, attention_output, gate, up,
+                         mlp_output, rope_cos, rope_sin, layer,
+                         error, error_size) &&
+            (!(layer < 3 && span_count) ||
+             gpu_operation(gpu, h3_gpu_add_bf16(
+                 gpu, hidden, hidden, deepstack[layer],
+                 tokens * TEXT_HIDDEN), error, error_size,
+                 "deepstack residual", layer)) &&
+            gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                          "layer stream submit", layer);
+
         retire_deferred(&load);
+        if (!layer_ok) {
+            prefetch_slots_retire(slots, prefetch_depth);
+            goto cleanup;
+        }
         if (progress) progress(layer + 1, TEXT_LAYERS, progress_opaque);
+        if (layer + 1 >= layer_count) continue;
+
+        memset(&weights, 0, sizeof(weights));
+        if (prefetch_layers) {
+            text_prefetch_slot *next = NULL;
+            for (int index = 0; index < prefetch_depth; index++) {
+                if (slots[index].occupied &&
+                    slots[index].layer == layer + 1) {
+                    next = &slots[index];
+                    break;
+                }
+            }
+            if (!next || !prefetch_slot_take(next, &load, &weights,
+                                              error, error_size)) {
+                if (!next)
+                    fail(error, error_size,
+                         "Qwen layer %d is absent from the prefetch ring",
+                         layer + 1);
+                prefetch_slots_retire(slots, prefetch_depth);
+                goto cleanup;
+            }
+            if (next_prefetch_layer < layer_count) {
+                if (!prefetch_slot_start(
+                        next, store, gpu, next_prefetch_layer,
+                        prefetch_threads, error, error_size)) {
+                    prefetch_slots_retire(slots, prefetch_depth);
+                    goto cleanup;
+                }
+                next_prefetch_layer++;
+            }
+        } else if (!layer_weights_load(&load, layer + 1, &weights)) {
+            goto cleanup;
+        }
     }
 
     output->values = malloc(hidden_count * sizeof(*output->values));
