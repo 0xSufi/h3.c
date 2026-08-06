@@ -5,13 +5,19 @@ sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, one real denoising step, and
 finally prompt-to-video before the conditioning modes are added.
 
-Current milestone: M1 host scaffold and model inspection.
+Current milestone: M2 portable Metal block baseline.
 
 ```sh
 make
 make test
 ./h3 --info -d MiniMax-H3
 ```
+
+`make test` runs the deterministic host suite and, when the ignored MLX fixture
+is installed under `misc/fixtures/`, compiles the Metal source at runtime and
+checks a complete toy H3 block against named MLX outputs. Runtime compilation is
+intentional: it follows Iris and does not require Xcode's optional offline Metal
+toolchain. `make parity` runs only that Metal/MLX check.
 
 The eventual CLI follows Iris-style conventions:
 

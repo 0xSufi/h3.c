@@ -2,7 +2,10 @@ misc/
 MiniMax-H3/
 outputs/
 *.o
+*.air
+*.metallib
 h3
 h3_tests
+h3_metal_tests
 libh3.a
 .DS_Store

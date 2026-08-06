@@ -477,6 +477,62 @@ const h3_st_tensor *h3_st_find(const h3_st_header *header, const char *name) {
     return NULL;
 }
 
+uint64_t h3_st_tensor_elements(const h3_st_tensor *tensor) {
+    if (!tensor) return 0;
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < tensor->ndim; dimension++) {
+        if (tensor->shape[dimension] != 0 &&
+            elements > UINT64_MAX / tensor->shape[dimension]) return 0;
+        elements *= tensor->shape[dimension];
+    }
+    return elements;
+}
+
+int h3_st_read_data(const h3_st_header *header, const h3_st_tensor *tensor,
+                    void *data, size_t bytes, char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!header || !header->path || !tensor || (!data && bytes != 0)) {
+        if (error && error_size) snprintf(error, error_size, "invalid tensor read request");
+        return 0;
+    }
+    uint64_t tensor_bytes = tensor->data_end - tensor->data_begin;
+    if (tensor_bytes != bytes) {
+        if (error && error_size) {
+            snprintf(error, error_size, "%s: expected %llu bytes, got %zu",
+                     tensor->name ? tensor->name : "tensor",
+                     (unsigned long long)tensor_bytes, bytes);
+        }
+        return 0;
+    }
+    int descriptor = open(header->path, O_RDONLY);
+    if (descriptor < 0) {
+        if (error && error_size) {
+            snprintf(error, error_size, "%s: %s", header->path, strerror(errno));
+        }
+        return 0;
+    }
+    size_t done = 0;
+    while (done < bytes) {
+        size_t remaining = bytes - done;
+        size_t chunk = remaining < (size_t)(1u << 30) ? remaining :
+                                                            (size_t)(1u << 30);
+        ssize_t count = pread(descriptor, (unsigned char *)data + done, chunk,
+                              (off_t)(tensor->file_offset + done));
+        if (count <= 0) {
+            if (error && error_size) {
+                snprintf(error, error_size, "%s: cannot read %s: %s", header->path,
+                         tensor->name ? tensor->name : "tensor",
+                         count < 0 ? strerror(errno) : "unexpected end of file");
+            }
+            close(descriptor);
+            return 0;
+        }
+        done += (size_t)count;
+    }
+    close(descriptor);
+    return 1;
+}
+
 static int h3_has_suffix(const char *value, const char *suffix) {
     size_t length = strlen(value);
     size_t suffix_length = strlen(suffix);

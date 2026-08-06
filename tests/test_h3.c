@@ -203,9 +203,19 @@ static void test_safetensors(void) {
     CHECK(x && x->dtype == H3_DTYPE_F32 && x->ndim == 2);
     CHECK(x->shape[0] == 2 && x->shape[1] == 3);
     CHECK(x->data_end - x->data_begin == 24);
+    CHECK(h3_st_tensor_elements(x) == 6);
+    unsigned char readback[24];
+    CHECK(h3_st_read_data(&header, x, readback, sizeof(readback), error,
+                          sizeof(error)));
+    for (size_t index = 0; index < sizeof(readback); index++) {
+        CHECK(readback[index] == 0);
+    }
+    CHECK(!h3_st_read_data(&header, x, readback, sizeof(readback) - 1, error,
+                           sizeof(error)));
     const h3_st_tensor *scalar = h3_st_find(&header, "scalar");
     CHECK(scalar && scalar->dtype == H3_DTYPE_BF16 && scalar->ndim == 0);
     CHECK(scalar->data_end - scalar->data_begin == 2);
+    CHECK(h3_st_tensor_elements(scalar) == 1);
     h3_st_free_header(&header);
     CHECK(unlink(path) == 0);
 }
