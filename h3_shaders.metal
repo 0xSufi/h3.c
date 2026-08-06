@@ -1303,6 +1303,27 @@ kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
                                   h3_bf16_to_f32(right[gid]));
 }
 
+struct h3_euler_args {
+    uint sample_offset;
+    uint elements;
+    float delta;
+    float ratio;
+};
+
+kernel void h3_euler_bf16(device float *sample [[buffer(0)]],
+                           device const ushort *last [[buffer(1)]],
+                           device const ushort *previous [[buffer(2)]],
+                           constant h3_euler_args &args [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.elements) return;
+    float last_value = h3_bf16_to_f32(last[gid]);
+    float velocity = fma(args.ratio,
+                         last_value - h3_bf16_to_f32(previous[gid]),
+                         last_value);
+    uint sample_index = args.sample_offset + gid;
+    sample[sample_index] = fma(args.delta, velocity, sample[sample_index]);
+}
+
 kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
                               device const ushort *up [[buffer(1)]],
                               device ushort *output [[buffer(2)]],

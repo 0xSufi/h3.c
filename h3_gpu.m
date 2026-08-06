@@ -410,7 +410,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
-            @"h3_silu_mul_bf16",
+            @"h3_euler_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
@@ -715,9 +715,18 @@ h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor) {
 
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements) {
+    return h3_gpu_tensor_read_f32_range(tensor, 0, values, elements);
+}
+
+int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
+                                 size_t source_offset, float *values,
+                                 size_t elements) {
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_F32 ||
-        elements > TENSOR(tensor).elements) return 0;
-    memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(float));
+        source_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - source_offset) return 0;
+    const unsigned char *source = TENSOR(tensor).buffer.contents;
+    memcpy(values, source + source_offset * sizeof(float),
+           elements * sizeof(float));
     return 1;
 }
 
@@ -905,6 +914,8 @@ typedef struct {
     uint32_t sequence, query_heads, kv_heads, head_dim;
     float scale;
 } gqa_args;
+typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
+    euler_args;
 
 static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
@@ -2850,6 +2861,28 @@ int h3_gpu_sub_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_euler_bf16(h3_gpu *opaque, h3_gpu_tensor *sample,
+                      size_t sample_offset, const h3_gpu_tensor *last,
+                      const h3_gpu_tensor *previous, uint32_t elements,
+                      float delta, float ratio) {
+    H3GPU *gpu = GPU(opaque);
+    if (!sample || TENSOR(sample).dtype != H3_GPU_F32 ||
+        sample_offset > TENSOR(sample).elements ||
+        elements > TENSOR(sample).elements - sample_offset ||
+        sample_offset > UINT32_MAX || elements > UINT32_MAX - sample_offset ||
+        !h3_gpu_require_bf16(gpu, last, elements, @"Euler last velocity") ||
+        !h3_gpu_require_bf16(gpu, previous, elements,
+                             @"Euler previous velocity")) return 0;
+    euler_args args = {(uint32_t)sample_offset, elements, delta, ratio};
+    return h3_gpu_dispatch_1d(gpu, @"h3_euler_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(sample).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(last).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(previous).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
 

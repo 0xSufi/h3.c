@@ -85,6 +85,48 @@ static float bf16_to_f32(uint16_t value) {
     return result;
 }
 
+static uint16_t f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static void test_euler_update(test_context *test) {
+    float sample_values[] = {-7.0f, -8.0f, 10.0f, 20.0f,
+                             30.0f, 40.0f, -9.0f};
+    const float last_values[] = {1.0f, -2.0f, 0.5f, 4.0f};
+    const float previous_values[] = {0.5f, -1.0f, 0.25f, 5.0f};
+    uint16_t last_bf16[4], previous_bf16[4];
+    for (size_t index = 0; index < 4; index++) {
+        last_bf16[index] = f32_to_bf16(last_values[index]);
+        previous_bf16[index] = f32_to_bf16(previous_values[index]);
+    }
+    h3_gpu_tensor *sample = own(test, h3_gpu_tensor_from_f32(
+        test->gpu, sample_values, sizeof(sample_values) / sizeof(*sample_values)));
+    h3_gpu_tensor *last = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, last_bf16, sizeof(last_bf16) / sizeof(*last_bf16)));
+    h3_gpu_tensor *previous = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, previous_bf16,
+        sizeof(previous_bf16) / sizeof(*previous_bf16)));
+    require_gpu(test, h3_gpu_begin(test->gpu), "begin Euler update");
+    require_gpu(test, h3_gpu_euler_bf16(test->gpu, sample, 2, last, previous,
+                                        4, 0.25f, 0.5f),
+                "encode Euler update");
+    require_gpu(test, h3_gpu_submit(test->gpu), "submit Euler update");
+    float got[7];
+    require(h3_gpu_tensor_read_f32(sample, got, 7),
+            "cannot read Euler-updated sample");
+    const float expected[] = {-7.0f, -8.0f, 10.3125f, 19.375f,
+                              30.15625f, 40.875f, -9.0f};
+    require(memcmp(got, expected, sizeof(expected)) == 0,
+            "fused Euler update differs from exact reference");
+    float range[4];
+    require(h3_gpu_tensor_read_f32_range(sample, 2, range, 4),
+            "cannot read Euler sample range");
+    require(memcmp(range, expected + 2, sizeof(range)) == 0,
+            "F32 range read returned the wrong offset");
+}
+
 static double compare(test_context *test, const char *name,
                       h3_gpu_tensor *got_tensor, size_t elements,
                       double *maximum_absolute) {
@@ -147,6 +189,7 @@ int main(int argc, char **argv) {
         h3_st_free_header(&test.fixture);
         return 1;
     }
+    test_euler_update(&test);
 
     {
         enum { PATCH_ROWS = 16, PATCH_IN = 32, PATCH_OUT = 5376 };

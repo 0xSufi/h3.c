@@ -60,6 +60,9 @@ size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements);
+int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
+                                 size_t source_offset, float *values,
+                                 size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
@@ -368,6 +371,12 @@ int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+/* Apply one Euler step to an F32 sample range from BF16 velocity caches:
+ * sample += delta * (last + ratio * (last - previous)). */
+int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
+                      size_t sample_offset, const h3_gpu_tensor *last,
+                      const h3_gpu_tensor *previous, uint32_t elements,
+                      float delta, float ratio);
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
