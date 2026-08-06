@@ -332,6 +332,134 @@ kernel void h3_swiglu_f32(device const float *fused [[buffer(0)]],
     output[row * args.width + column] = gate / (1.0f + exp(-gate)) * up;
 }
 
+struct vae_encoder_pad_args {
+    uint batch;
+    uint depth;
+    uint height;
+    uint width;
+    uint channels;
+    uint depth_front;
+    uint height_before;
+    uint height_after;
+    uint width_before;
+    uint width_after;
+};
+
+static int h3_reflect_coordinate(int coordinate, int length) {
+    if (coordinate < 0) return -coordinate;
+    if (coordinate >= length) return 2 * length - coordinate - 2;
+    return coordinate;
+}
+
+kernel void h3_vae_encoder_pad_f32(
+                            device const float *input [[buffer(0)]],
+                            device float *output [[buffer(1)]],
+                            constant vae_encoder_pad_args &args [[buffer(2)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint channel = gid.x;
+    uint out_x = gid.y;
+    uint out_height = args.height + args.height_before + args.height_after;
+    uint out_width = args.width + args.width_before + args.width_after;
+    uint out_depth = args.depth + args.depth_front;
+    uint plane = gid.z;
+    if (channel >= args.channels || out_x >= out_width ||
+        plane >= args.batch * out_depth * out_height) return;
+    uint out_y = plane % out_height;
+    uint temporal_plane = plane / out_height;
+    uint out_t = temporal_plane % out_depth;
+    uint batch = temporal_plane / out_depth;
+    size_t destination = ((((size_t)batch * out_depth + out_t) * out_height +
+                           out_y) * out_width + out_x) * args.channels +
+                         channel;
+    if (out_t < args.depth_front) {
+        output[destination] = 0.0f;
+        return;
+    }
+    int source_y = h3_reflect_coordinate(
+        int(out_y) - int(args.height_before), int(args.height));
+    int source_x = h3_reflect_coordinate(
+        int(out_x) - int(args.width_before), int(args.width));
+    uint source_t = out_t - args.depth_front;
+    size_t source = ((((size_t)batch * args.depth + source_t) * args.height +
+                      uint(source_y)) * args.width + uint(source_x)) *
+                    args.channels + channel;
+    output[destination] = input[source];
+}
+
+struct vae_encoder_norm_args {
+    uint batch;
+    uint depth;
+    uint height;
+    uint width;
+    uint channels;
+    uint groups;
+    float epsilon;
+};
+
+kernel void h3_vae_encoder_group_norm_silu_f32(
+                            device const float *input [[buffer(0)]],
+                            device const float *weight [[buffer(1)]],
+                            device const float *bias [[buffer(2)]],
+                            device float *output [[buffer(3)]],
+                            constant vae_encoder_norm_args &args [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint rows = args.batch * args.depth * args.groups;
+    if (row >= rows) return;
+    uint channels_per_group = args.channels / args.groups;
+    uint group_index = row % args.groups;
+    uint temporal_plane = row / args.groups;
+    uint elements = args.height * args.width * channels_per_group;
+    threadgroup float reductions[256];
+    float local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        local += input[source];
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(elements);
+    local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        float centered = input[source] - mean;
+        local = fma(centered, centered, local);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(elements) + args.epsilon);
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t destination =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+            args.channels + channel;
+        float value = (input[destination] - mean) * inverse * weight[channel] +
+                      bias[channel];
+        output[destination] = value / (1.0f + exp(-value));
+    }
+}
+
 struct weight_norm_args {
     uint outer;
     uint inner;
