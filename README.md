@@ -82,6 +82,11 @@ The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
 tile plan for close-reference diagnosis.
+On M5-class GPUs, persistent transformer weights are mapped directly from their
+safetensor shards instead of copied into anonymous shared buffers. This keeps
+the 37 GiB model file-backed/reclaimable and slightly improves total transformer
+time; M3 uses the faster copied-buffer path. `H3_ZERO_COPY_WEIGHTS=0` disables
+the M5 selection for diagnostics.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

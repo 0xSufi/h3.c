@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -457,6 +458,67 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
         elements > SIZE_MAX / item_size) return NULL;
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
+    const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
+    int transformer_weight = strstr(path, "/transformer/") != NULL;
+    int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+    int map_weight = bytes &&
+        ((zero_copy && !strcmp(zero_copy, "1")) ||
+         (transformer_weight &&
+          ((zero_copy && !strcmp(zero_copy, "transformer")) ||
+           (!zero_copy && m5))));
+    if (map_weight) {
+        int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+        if (descriptor < 0) {
+            h3_gpu_set_error(gpu, @"cannot open %s: %s", path,
+                             strerror(errno));
+            return NULL;
+        }
+        size_t page = (size_t)getpagesize();
+        uint64_t aligned_offset = file_offset - file_offset % page;
+        size_t delta = (size_t)(file_offset - aligned_offset);
+        if (bytes > SIZE_MAX - delta) {
+            close(descriptor);
+            return NULL;
+        }
+        size_t map_bytes = bytes + delta;
+        void *mapping = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE, descriptor, (off_t)aligned_offset);
+        int map_error = errno;
+        close(descriptor);
+        if (mapping == MAP_FAILED) {
+            h3_gpu_set_error(gpu, @"cannot map %s payload from %s: %s", label,
+                             path, strerror(map_error));
+            return NULL;
+        }
+        void *values = (unsigned char *)mapping + delta;
+        id<MTLBuffer> buffer = [gpu.device
+            newBufferWithBytesNoCopy:values length:MAX(bytes, (size_t)1)
+            options:MTLResourceStorageModeShared
+            deallocator:^(void *pointer, NSUInteger length) {
+                (void)pointer;
+                (void)length;
+                munmap(mapping, map_bytes);
+            }];
+        if (!buffer) {
+            munmap(mapping, map_bytes);
+            h3_gpu_set_error(gpu, @"cannot map %zu-byte Metal buffer", bytes);
+            return NULL;
+        }
+        H3Tensor *tensor = [[H3Tensor alloc] init];
+        tensor.elements = elements;
+        tensor.bytes = bytes;
+        tensor.dtype = dtype;
+        tensor.buffer = buffer;
+        tensor.owner = gpu;
+        h3_gpu_stats stats = gpu.stats;
+        stats.allocated_bytes += bytes;
+        stats.live_bytes += bytes;
+        if (stats.live_bytes > stats.peak_live_bytes)
+            stats.peak_live_bytes = stats.live_bytes;
+        stats.tensor_allocations++;
+        gpu.stats = stats;
+        return (__bridge_retained h3_gpu_tensor *)tensor;
+    }
     h3_gpu_tensor *opaque_tensor = h3_gpu_tensor_new(
         opaque, NULL, elements, item_size, dtype);
     if (!opaque_tensor) return NULL;
