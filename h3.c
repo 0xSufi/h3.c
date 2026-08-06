@@ -1,4 +1,5 @@
 #include "h3_internal.h"
+#include "h3_audio_vae.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
@@ -200,6 +201,11 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
 
+static void h3_audio_vae_progress_bridge(int completed, int total,
+                                         void *opaque) {
+    h3_progress_emit(opaque, "audio VAE", completed, total);
+}
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
@@ -232,6 +238,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     float *video = NULL, *audio = NULL;
     h3_video_frames frames;
     memset(&frames, 0, sizeof(frames));
+    h3_audio_waveform waveform;
+    memset(&waveform, 0, sizeof(waveform));
     uint8_t *rgb8 = NULL;
     h3_result *result = NULL;
     char *tokenizer_path = h3_path(ctx->model_dir,
@@ -239,7 +247,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *text_path = h3_path(ctx->model_dir, "FL2VA/text_encoder");
     char *dit_path = h3_path(ctx->model_dir, "FL2VA/transformer");
     char *vae_path = h3_path(ctx->model_dir, "FL2VA/video_vae/source");
-    if (!tokenizer_path || !text_path || !dit_path || !vae_path) {
+    char *audio_vae_path = h3_path(ctx->model_dir, "FL2VA/audio_vae");
+    if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
+        !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
@@ -310,6 +320,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     h3_dit_free(dit);
     dit = NULL;
+    if (progress.cancelled) goto cleanup;
+    h3_progress_emit(&progress, "audio VAE", 0, 7);
+    if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
+                             temporal.audio_t, h3_audio_vae_progress_bridge,
+                             &progress, &waveform, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
@@ -351,9 +369,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (params->output_path && *params->output_path) {
         h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_rgb24(params->output_path, rgb8, frames.frames,
-                                   frames.width, frames.height, H3_FPS,
-                                   detail, sizeof(detail))) {
+        if (!h3_ffmpeg_write_av_rgb24_f32(
+                params->output_path, rgb8, frames.frames, frames.width,
+                frames.height, H3_FPS, waveform.pcm, waveform.samples,
+                waveform.channels, waveform.sample_rate,
+                detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
@@ -368,11 +388,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->height = frames.height;
     result->frames = frames.frames;
     result->fps = H3_FPS;
-    result->sample_rate = 0;
+    result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
 
 cleanup:
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
+    free(audio_vae_path);
     h3_tokenizer_free(tokenizer);
     h3_tokenizer_ids_free(ids);
     h3_text_embedding_free(&text);
@@ -380,6 +401,7 @@ cleanup:
     h3_dit_free(dit);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
+    h3_audio_waveform_free(&waveform);
     return result;
 }
 
