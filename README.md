@@ -123,6 +123,11 @@ relative L2 `8.64e-4`; the absolute M5 saving is about 0.6 ms per evaluated
 step. Full fox and surfer sequences remained clean and measured 29.9/38.4 dB
 against the F32-head renders. `H3_DIT_F32_FINAL=1` restores the close-reference
 head and its extra activation buffers.
+The F32 `96->5376` video and `32->5376` audio patch projections use a dedicated
+16x16 cooperative tile, retaining F32 weights, activations and accumulation.
+Paired production-shape measurements are 1.77x faster on M3 and 1.62-1.78x
+on M5; the complete generated RGB stream is byte-identical to the scalar path.
+`H3_SCALAR_PATCH=1` selects that scalar diagnostic path.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

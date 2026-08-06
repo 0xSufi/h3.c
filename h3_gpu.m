@@ -354,7 +354,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             return NULL;
         }
         NSMutableArray<NSString *> *names = [@[
-            @"h3_linear_f32", @"h3_silu_f32", @"h3_cast_f32_to_bf16",
+            @"h3_linear_f32", @"h3_linear_f32_tiled", @"h3_silu_f32",
+            @"h3_cast_f32_to_bf16",
             @"h3_cast_bf16_to_f32",
             @"h3_rms_norm_f32",
             @"h3_scale_add_f32", @"h3_layer_norm_f32",
@@ -854,6 +855,37 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         TENSOR(output).dtype != H3_GPU_F32 ||
         (bias && (!h3_gpu_require_elements(gpu, bias, output_dim, @"linear bias") ||
                   TENSOR(bias).dtype != H3_GPU_F32))) return 0;
+    if (!getenv("H3_SCALAR_PATCH") && rows >= 16 && output_dim == 5376 &&
+        (input_dim == 32 || input_dim == 96)) {
+        linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+        const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+        if (!h3_gpu_require_command(gpu)) return 0;
+        id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+            gpu, @"h3_linear_f32_tiled");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+            h3_gpu_set_error(gpu,
+                             @"device cannot dispatch the F32 16x16 tile");
+            return 0;
+        }
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder =
+                [gpu.command computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                                      (rows + 15) / 16, 1)
+                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [encoder endEncoding];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+        return 1;
+    }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim, MPSDataTypeFloat32)) return 1;

@@ -11,7 +11,7 @@ enum {
     SEQUENCE = 32, HIDDEN = 256, HEADS = 4, HEAD_DIM = 32,
     INNER = HEADS * HEAD_DIM, FFN = 128, T_ROWS = 2, T_DIM = 32,
     MODALITIES = 3, MODULATION_SLOTS = 6, ROPE_HALF = 12,
-    MAX_TENSORS = 48
+    MAX_TENSORS = 64
 };
 
 typedef struct {
@@ -147,6 +147,62 @@ int main(int argc, char **argv) {
         h3_st_free_header(&test.fixture);
         return 1;
     }
+
+    {
+        enum { PATCH_ROWS = 16, PATCH_IN = 32, PATCH_OUT = 5376 };
+        size_t input_count = PATCH_ROWS * PATCH_IN;
+        size_t weight_count = PATCH_OUT * PATCH_IN;
+        size_t output_count = PATCH_ROWS * PATCH_OUT;
+        float *input = malloc(input_count * sizeof(*input));
+        float *weight = malloc(weight_count * sizeof(*weight));
+        float *bias = malloc(PATCH_OUT * sizeof(*bias));
+        float *scalar = malloc(output_count * sizeof(*scalar));
+        float *tiled = malloc(output_count * sizeof(*tiled));
+        require(input && weight && bias && scalar && tiled,
+                "patch tile host allocation failed");
+        for (size_t index = 0; index < input_count; index++)
+            input[index] = (float)((int)(index % 17) - 8) * 0.03125f;
+        for (size_t index = 0; index < weight_count; index++)
+            weight[index] = (float)((int)(index % 23) - 11) * 0.0078125f;
+        for (size_t index = 0; index < PATCH_OUT; index++)
+            bias[index] = (float)((int)(index % 7) - 3) * 0.015625f;
+        h3_gpu_tensor *gpu_input = own(
+            &test, h3_gpu_tensor_from_f32(test.gpu, input, input_count));
+        h3_gpu_tensor *gpu_weight = own(
+            &test, h3_gpu_tensor_from_f32(test.gpu, weight, weight_count));
+        h3_gpu_tensor *gpu_bias = own(
+            &test, h3_gpu_tensor_from_f32(test.gpu, bias, PATCH_OUT));
+        h3_gpu_tensor *scalar_output = own(
+            &test, h3_gpu_tensor_new_f32(test.gpu, output_count));
+        h3_gpu_tensor *tiled_output = own(
+            &test, h3_gpu_tensor_new_f32(test.gpu, output_count));
+        setenv("H3_SCALAR_PATCH", "1", 1);
+        require_gpu(&test, h3_gpu_begin(test.gpu),
+                    "begin scalar patch stream");
+        require_gpu(&test, h3_gpu_linear_f32(
+            test.gpu, scalar_output, gpu_input, gpu_weight, gpu_bias,
+            PATCH_ROWS, PATCH_IN, PATCH_OUT), "scalar patch linear");
+        require_gpu(&test, h3_gpu_submit(test.gpu),
+                    "submit scalar patch stream");
+        unsetenv("H3_SCALAR_PATCH");
+        require_gpu(&test, h3_gpu_begin(test.gpu),
+                    "begin tiled patch stream");
+        require_gpu(&test, h3_gpu_linear_f32(
+            test.gpu, tiled_output, gpu_input, gpu_weight, gpu_bias,
+            PATCH_ROWS, PATCH_IN, PATCH_OUT), "tiled patch linear");
+        require_gpu(&test, h3_gpu_submit(test.gpu),
+                    "submit tiled patch stream");
+        require(h3_gpu_tensor_read_f32(scalar_output, scalar, output_count),
+                "cannot read scalar patch output");
+        require(h3_gpu_tensor_read_f32(tiled_output, tiled, output_count),
+                "cannot read tiled patch output");
+        require(memcmp(scalar, tiled, output_count * sizeof(*scalar)) == 0,
+                "tiled patch output differs from scalar F32");
+        free(input); free(weight); free(bias); free(scalar); free(tiled);
+    }
+    h3_gpu_stats setup_stats;
+    require(h3_gpu_get_stats(test.gpu, &setup_stats),
+            "cannot read patch-tile counters");
 
     h3_gpu_tensor *h_in = upload(&test, "x.h_in", SEQUENCE * HIDDEN);
     h3_gpu_tensor *attn_in = upload(&test, "x.attn_in", SEQUENCE * HIDDEN);
@@ -361,7 +417,8 @@ int main(int argc, char **argv) {
     require(stats.mps_linear_dispatches == 6,
             "wide BF16 linears did not use the cached MPSGraph path");
     require(stats.mps_sdpa_dispatches == 2, "BF16 SDPA counter mismatch");
-    require(stats.submissions == 1, "block used more than one command submission");
+    require(stats.submissions == setup_stats.submissions + 1,
+            "block used more than one command submission");
     cleanup(&test);
     puts("ok: portable BF16 Metal block matches the MLX BF16 oracle");
     return 0;
