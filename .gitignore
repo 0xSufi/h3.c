@@ -2,9 +2,12 @@ misc/
 MiniMax-H3/
 outputs/
 *.o
+*.d
 *.air
 *.metallib
 h3
+h3_*test
+h3_*tests
 h3_tests
 h3_metal_tests
 h3_bf16_tests

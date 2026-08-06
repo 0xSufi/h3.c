@@ -14,6 +14,11 @@
 
 extern char **environ;
 
+static const char *ffmpeg_program(void) {
+    const char *override = getenv("H3_FFMPEG");
+    return override && *override ? override : "ffmpeg";
+}
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -61,6 +66,119 @@ static int write_all(int descriptor, const uint8_t *data, size_t bytes,
     return 1;
 }
 
+int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
+                             h3_image_fit fit, float **pixels,
+                             char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (pixels) *pixels = NULL;
+    if (!path || !*path || !pixels || width < 1 || height < 1 ||
+        (fit != H3_IMAGE_FIT_STRETCH && fit != H3_IMAGE_FIT_COVER)) {
+        fail(error, error_size, "invalid FFmpeg image input arguments");
+        return 0;
+    }
+    if ((size_t)width > SIZE_MAX / (size_t)height) {
+        fail(error, error_size, "decoded image size overflows");
+        return 0;
+    }
+    size_t area = (size_t)width * (size_t)height;
+    if (area > SIZE_MAX / 3 ||
+        area * 3 > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "decoded image size overflows");
+        return 0;
+    }
+    size_t bytes = area * 3;
+    uint8_t *rgb = malloc(bytes);
+    float *channel_major = malloc(bytes * sizeof(*channel_major));
+    if (!rgb || !channel_major) {
+        free(rgb);
+        free(channel_major);
+        fail(error, error_size, "out of memory decoding input image");
+        return 0;
+    }
+    char filter[256];
+    if (fit == H3_IMAGE_FIT_STRETCH) {
+        snprintf(filter, sizeof(filter), "scale=%d:%d:flags=lanczos",
+                 width, height);
+    } else {
+        snprintf(filter, sizeof(filter),
+                 "scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,"
+                 "crop=%d:%d", width, height, width, height);
+    }
+    int stream[2];
+    if (pipe(stream) != 0) {
+        free(rgb);
+        free(channel_major);
+        fail(error, error_size, "cannot create FFmpeg image pipe: %s",
+             strerror(errno));
+        return 0;
+    }
+    char *arguments[] = {
+        "ffmpeg", "-v", "error", "-i", (char *)path,
+        "-frames:v", "1", "-vf", filter,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL
+    };
+    posix_spawn_file_actions_t actions;
+    int code = posix_spawn_file_actions_init(&actions);
+    if (!code) code = posix_spawn_file_actions_adddup2(
+        &actions, stream[1], STDOUT_FILENO);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[0]);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[1]);
+    pid_t child = -1;
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
+                                    arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stream[1]);
+    if (code) {
+        close(stream[0]);
+        free(rgb);
+        free(channel_major);
+        fail(error, error_size, "cannot start FFmpeg: %s", strerror(code));
+        return 0;
+    }
+    size_t received = 0;
+    while (received < bytes) {
+        ssize_t amount = read(stream[0], rgb + received, bytes - received);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) break;
+        received += (size_t)amount;
+    }
+    uint8_t extra;
+    ssize_t trailing;
+    do trailing = read(stream[0], &extra, 1);
+    while (trailing < 0 && errno == EINTR);
+    close(stream[0]);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        free(rgb);
+        free(channel_major);
+        fail(error, error_size, "cannot wait for FFmpeg: %s", strerror(errno));
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        received != bytes || trailing != 0) {
+        free(rgb);
+        free(channel_major);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            fail(error, error_size, "FFmpeg could not decode image %s (status %d)",
+                 path, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        else
+            fail(error, error_size,
+                 "FFmpeg decoded %zu bytes for %dx%d image, expected %zu",
+                 received + (trailing > 0 ? 1u : 0u), width, height, bytes);
+        return 0;
+    }
+    const float scale = 1.0f / 255.0f;
+    for (size_t pixel = 0; pixel < area; pixel++) {
+        channel_major[pixel] = (float)rgb[3 * pixel] * scale;
+        channel_major[area + pixel] = (float)rgb[3 * pixel + 1] * scale;
+        channel_major[2 * area + pixel] = (float)rgb[3 * pixel + 2] * scale;
+    }
+    free(rgb);
+    *pixels = channel_major;
+    return 1;
+}
+
 int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
                           int frame_count, int width, int height, int fps,
                           char *error, size_t error_size) {
@@ -99,7 +217,7 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
     if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[0]);
     if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[1]);
     pid_t child = -1;
-    if (!code) code = posix_spawnp(&child, "ffmpeg", &actions, NULL,
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
                                     arguments, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(stream[0]);
@@ -246,7 +364,7 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         code = close_action(&actions, descriptors[index], STDIN_FILENO,
                             audio_target);
     pid_t child = -1;
-    if (!code) code = posix_spawnp(&child, "ffmpeg", &actions, NULL,
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
                                     arguments, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(video_pipe[0]);

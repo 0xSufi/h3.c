@@ -49,8 +49,14 @@ struct h3_dit {
     int latent_w;
     int audio_t;
     uint32_t text_rows;
+    uint32_t video_condition_rows;
+    uint32_t audio_condition_rows;
     uint32_t audio_rows;
     uint32_t video_rows;
+    uint32_t video_total_rows;
+    uint32_t audio_total_rows;
+    uint32_t audio_target_start;
+    uint32_t video_target_start;
     uint32_t sequence;
     h3_gpu_tensor *refined_text;
     h3_gpu_tensor *rope_cos;
@@ -177,33 +183,88 @@ oom:
     return 0;
 }
 
-static int validate_t2va(h3_dit *dit, const h3_text_embedding *text,
-                         char *error, size_t error_size) {
+static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
+                           char *error, size_t error_size) {
     const h3_layout *layout = &dit->layout;
     if (!text || !text->values || text->width != TEXT_DIM || !text->tokens ||
         layout->signature[0] != (int)text->tokens ||
-        layout->segment_count != 3 ||
+        !layout->segments || layout->segment_count < 3 ||
         layout->segments[0].kind != H3_SEG_TEXT ||
-        layout->segments[1].kind != H3_SEG_AUDIO ||
-        layout->segments[2].kind != H3_SEG_VIDEO ||
-        layout->img_cond_rows || layout->audio_cond_rows ||
+        layout->segments[layout->segment_count - 1].kind != H3_SEG_VIDEO ||
         layout->signature[1] < 1 || layout->signature[2] < 2 ||
         layout->signature[3] < 2 || layout->signature[4] < 1 ||
         layout->signature[2] % 2 || layout->signature[3] % 2 ||
         layout->seq_len > UINT32_MAX || text->tokens > UINT32_MAX ||
+        layout->img_cond_rows > UINT32_MAX ||
+        layout->audio_cond_rows > UINT32_MAX ||
         layout->audio_target_rows > UINT32_MAX ||
         layout->img_target_rows > UINT32_MAX) {
         fail(error, error_size,
-             "DiT T2VA requires a contiguous text/audio/video layout");
+             "DiT requires a valid contiguous H3 packed layout");
         return 0;
+    }
+    size_t cursor = 0, text_rows = 0, video_condition = 0;
+    size_t audio_condition = 0, video_target = 0, audio_target = 0;
+    unsigned target_video_segments = 0, target_audio_segments = 0;
+    for (size_t index = 0; index < layout->segment_count; index++) {
+        const h3_segment *segment = &layout->segments[index];
+        if (segment->start != cursor || segment->stop < segment->start ||
+            segment->stop > layout->seq_len) {
+            fail(error, error_size, "DiT layout segments are not contiguous");
+            return 0;
+        }
+        size_t rows = segment->stop - segment->start;
+        switch (segment->kind) {
+        case H3_SEG_TEXT: text_rows += rows; break;
+        case H3_SEG_COND:
+        case H3_SEG_REF_IMAGE: video_condition += rows; break;
+        case H3_SEG_REF_AUDIO: audio_condition += rows; break;
+        case H3_SEG_AUDIO:
+            audio_target += rows;
+            target_audio_segments++;
+            dit->audio_target_start = (uint32_t)segment->start;
+            break;
+        case H3_SEG_VIDEO:
+            video_target += rows;
+            target_video_segments++;
+            dit->video_target_start = (uint32_t)segment->start;
+            break;
+        default:
+            fail(error, error_size, "DiT layout contains an unknown segment");
+            return 0;
+        }
+        cursor = segment->stop;
+    }
+    if (cursor != layout->seq_len || text_rows != text->tokens ||
+        video_condition != layout->img_cond_rows ||
+        audio_condition != layout->audio_cond_rows ||
+        video_target != layout->img_target_rows ||
+        audio_target != layout->audio_target_rows ||
+        target_video_segments != 1 || target_audio_segments != 1 ||
+        video_condition > UINT32_MAX - video_target ||
+        audio_condition > UINT32_MAX - audio_target) {
+        fail(error, error_size, "DiT layout row-source counts are inconsistent");
+        return 0;
+    }
+    if (text->tags) {
+        for (size_t index = 0; index < text->tokens; index++) {
+            if (text->tags[index] >= H3_DIT_MODALITIES) {
+                fail(error, error_size, "DiT text presentation has an invalid tag");
+                return 0;
+            }
+        }
     }
     dit->latent_t = layout->signature[1];
     dit->latent_h = layout->signature[2];
     dit->latent_w = layout->signature[3];
     dit->audio_t = layout->signature[4];
     dit->text_rows = (uint32_t)text->tokens;
+    dit->video_condition_rows = (uint32_t)video_condition;
+    dit->audio_condition_rows = (uint32_t)audio_condition;
     dit->audio_rows = (uint32_t)layout->audio_target_rows;
     dit->video_rows = (uint32_t)layout->img_target_rows;
+    dit->video_total_rows = (uint32_t)(video_condition + video_target);
+    dit->audio_total_rows = (uint32_t)(audio_condition + audio_target);
     dit->sequence = (uint32_t)layout->seq_len;
     return 1;
 }
@@ -426,7 +487,8 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     return ok;
 }
 
-static int prepare_maps(h3_dit *dit, char *error, size_t error_size) {
+static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
+                        char *error, size_t error_size) {
     int steps = h3_dit_schedule_steps(dit->schedule);
     dit->row_maps = calloc((size_t)steps, sizeof(*dit->row_maps));
     dit->final_audio_maps = calloc((size_t)steps,
@@ -443,9 +505,9 @@ static int prepare_maps(h3_dit *dit, char *error, size_t error_size) {
         return 0;
     }
     for (int step = 0; step < steps; step++) {
-        if (!h3_dit_schedule_row_map(dit->schedule, step, dit->text_rows,
-                                     dit->audio_rows, dit->video_rows,
-                                     rows, dit->sequence)) {
+        if (!h3_dit_schedule_row_map(dit->schedule, step, &dit->layout,
+                                     text->tags, text->tokens, rows,
+                                     dit->sequence)) {
             fail(error, error_size, "cannot construct modulation row map");
             free(rows); free(audio); free(video);
             return 0;
@@ -511,15 +573,17 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t sequence = dit->sequence;
     size_t audio = dit->audio_rows;
     size_t video = dit->video_rows;
+    size_t audio_total = dit->audio_total_rows;
+    size_t video_total = dit->video_total_rows;
 #define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
 #define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
     h3_gpu_tensor *all[] = {
-        F32(video_input, video * VIDEO_PATCH),
-        F32(audio_input, audio * AUDIO_CHANNELS),
-        F32(video_projected_f32, video * HIDDEN),
-        F32(audio_projected_f32, audio * HIDDEN),
-        BF(video_projected, video * HIDDEN),
-        BF(audio_projected, audio * HIDDEN),
+        F32(video_input, video_total * VIDEO_PATCH),
+        F32(audio_input, audio_total * AUDIO_CHANNELS),
+        F32(video_projected_f32, video_total * HIDDEN),
+        F32(audio_projected_f32, audio_total * HIDDEN),
+        BF(video_projected, video_total * HIDDEN),
+        BF(audio_projected, audio_total * HIDDEN),
         BF(hidden, sequence * HIDDEN),
         BF(mod_attention, sequence * HIDDEN),
         BF(qkv, sequence * INNER * 3),
@@ -565,13 +629,17 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
-h3_dit *h3_dit_load_t2va(const char *weight_directory,
-                         const char *shader_source_path,
-                         const h3_text_embedding *text,
-                         const h3_layout *layout,
-                         const h3_sigma_schedule *sigmas,
-                         h3_dit_progress progress, void *progress_opaque,
-                         char *error, size_t error_size) {
+static h3_dit *load_dit(const char *weight_directory,
+                        const char *shader_source_path,
+                        const h3_text_embedding *text,
+                        const h3_layout *layout,
+                        const h3_sigma_schedule *sigmas,
+                        const float *condition_video_rows,
+                        size_t condition_video_elements,
+                        const float *condition_audio_rows,
+                        size_t condition_audio_elements,
+                        h3_dit_progress progress, void *progress_opaque,
+                        char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas) {
         fail(error, error_size, "invalid DiT load arguments");
@@ -583,7 +651,19 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
         return NULL;
     }
     if (!copy_layout(dit, layout, error, error_size) ||
-        !validate_t2va(dit, text, error, error_size)) goto failed;
+        !validate_layout(dit, text, error, error_size)) goto failed;
+    size_t wanted_video_condition =
+        (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio_condition =
+        (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video_condition ||
+        condition_audio_elements != wanted_audio_condition ||
+        (wanted_video_condition && !condition_video_rows) ||
+        (wanted_audio_condition && !condition_audio_rows)) {
+        fail(error, error_size,
+             "condition row elements do not match the packed DiT layout");
+        goto failed;
+    }
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
@@ -594,16 +674,56 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, schedule_report, &schedule_state,
+        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
-        !prepare_maps(dit, error, error_size) ||
+        !prepare_maps(dit, text, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
+    if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
+             dit->video_input, 0, condition_video_rows,
+             wanted_video_condition)) ||
+        (wanted_audio_condition && !h3_gpu_tensor_write_f32_range(
+             dit->audio_input, 0, condition_audio_rows,
+             wanted_audio_condition))) {
+        fail(error, error_size, "cannot write persistent DiT condition rows");
+        goto failed;
+    }
     return dit;
 failed:
     h3_dit_free(dit);
     return NULL;
+}
+
+h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
+    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    NULL, 0, NULL, 0, progress, progress_opaque,
+                    error, error_size);
+}
+
+h3_dit *h3_dit_load_conditioned(
+                         const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
+    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    condition_video_rows, condition_video_elements,
+                    condition_audio_rows, condition_audio_elements,
+                    progress, progress_opaque, error, error_size);
 }
 
 static int run_block(h3_dit *dit, unsigned index, int step,
@@ -656,32 +776,56 @@ static int encode_forward(h3_dit *dit, int step, char *error,
 } while (0)
     OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
     OP(h3_gpu_linear_f32(dit->gpu, dit->video_projected_f32, dit->video_input,
-        dit->video_patch_w, dit->video_patch_b, dit->video_rows, VIDEO_PATCH,
+        dit->video_patch_w, dit->video_patch_b, dit->video_total_rows,
+        VIDEO_PATCH,
         HIDDEN), "video patch projection");
     OP(h3_gpu_linear_f32(dit->gpu, dit->audio_projected_f32, dit->audio_input,
-        dit->audio_patch_w, dit->audio_patch_b, dit->audio_rows, AUDIO_CHANNELS,
-        HIDDEN), "audio patch projection");
+        dit->audio_patch_w, dit->audio_patch_b, dit->audio_total_rows,
+        AUDIO_CHANNELS, HIDDEN), "audio patch projection");
     OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->video_projected,
-        dit->video_projected_f32, dit->video_rows * HIDDEN), "video BF16 cast");
+        dit->video_projected_f32, dit->video_total_rows * HIDDEN),
+       "video BF16 cast");
     OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->audio_projected,
-        dit->audio_projected_f32, dit->audio_rows * HIDDEN), "audio BF16 cast");
-    OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, 0, dit->refined_text, 0,
-        (size_t)dit->text_rows * HIDDEN), "pack refined text");
-    OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden,
-        (size_t)dit->text_rows * HIDDEN, dit->audio_projected, 0,
-        (size_t)dit->audio_rows * HIDDEN), "pack audio");
-    OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden,
-        (size_t)(dit->text_rows + dit->audio_rows) * HIDDEN,
-        dit->video_projected, 0, (size_t)dit->video_rows * HIDDEN),
-       "pack video");
+        dit->audio_projected_f32, dit->audio_total_rows * HIDDEN),
+       "audio BF16 cast");
+    size_t video_offset = 0;
+    size_t audio_offset = 0;
+    for (size_t index = 0; index < dit->layout.segment_count; index++) {
+        const h3_segment *segment = &dit->layout.segments[index];
+        size_t segment_rows = segment->stop - segment->start;
+        size_t destination = segment->start * HIDDEN;
+        if (segment->kind == H3_SEG_TEXT) {
+            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
+                dit->refined_text, 0, segment_rows * HIDDEN),
+               "pack refined text");
+        } else if (segment->kind == H3_SEG_COND ||
+                   segment->kind == H3_SEG_REF_IMAGE ||
+                   segment->kind == H3_SEG_VIDEO) {
+            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
+                dit->video_projected, video_offset * HIDDEN,
+                segment_rows * HIDDEN), "pack video source");
+            video_offset += segment_rows;
+        } else {
+            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
+                dit->audio_projected, audio_offset * HIDDEN,
+                segment_rows * HIDDEN), "pack audio source");
+            audio_offset += segment_rows;
+        }
+    }
+    if (video_offset != dit->video_total_rows ||
+        audio_offset != dit->audio_total_rows) {
+        fail(error, error_size, "DiT segment packing did not consume row sources");
+        return 0;
+    }
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         if (!run_block(dit, block, step, error, error_size)) return 0;
     }
     OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
-        (size_t)dit->text_rows * HIDDEN, (size_t)dit->audio_rows * HIDDEN),
+        (size_t)dit->audio_target_start * HIDDEN,
+        (size_t)dit->audio_rows * HIDDEN),
        "slice final audio");
     OP(h3_gpu_copy_bf16(dit->gpu, dit->final_video_input, 0, dit->hidden,
-        (size_t)(dit->text_rows + dit->audio_rows) * HIDDEN,
+        (size_t)dit->video_target_start * HIDDEN,
         (size_t)dit->video_rows * HIDDEN), "slice final video");
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
     OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_audio_norm,
@@ -753,10 +897,14 @@ int h3_dit_forward(h3_dit *dit, int step,
         video_row_elements) &&
         h3_dit_pack_audio(audio_latent, AUDIO_CHANNELS, dit->audio_t,
                           audio_rows, audio_row_elements) &&
-        h3_gpu_tensor_write_f32(dit->video_input, video_rows,
-                                video_row_elements) &&
-        h3_gpu_tensor_write_f32(dit->audio_input, audio_rows,
-                                audio_row_elements);
+        h3_gpu_tensor_write_f32_range(
+            dit->video_input,
+            (size_t)dit->video_condition_rows * VIDEO_PATCH,
+            video_rows, video_row_elements) &&
+        h3_gpu_tensor_write_f32_range(
+            dit->audio_input,
+            (size_t)dit->audio_condition_rows * AUDIO_CHANNELS,
+            audio_rows, audio_row_elements);
     if (!ok) fail(error, error_size, "cannot pack/write DiT input latents");
     if (ok) ok = encode_forward(dit, step, error, error_size);
     if (ok) ok = h3_gpu_tensor_read_bf16(dit->video_output_bf16, video_out,

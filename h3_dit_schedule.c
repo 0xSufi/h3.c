@@ -19,6 +19,8 @@ struct h3_dit_schedule {
     uint32_t time_rows;
     uint32_t *video_rows;
     uint32_t *audio_rows;
+    uint32_t *visual_condition_rows;
+    uint32_t *audio_condition_rows;
     h3_gpu_tensor *blocks[H3_DIT_BLOCKS];
     h3_gpu_tensor *final;
 };
@@ -75,6 +77,7 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 
 static int prepare_rows(h3_dit_schedule *schedule,
                         const h3_sigma_schedule *sigmas,
+                        int visual_condition, int audio_condition,
                         float **features_out, char *error,
                         size_t error_size) {
     schedule->steps = sigmas->steps;
@@ -82,7 +85,15 @@ static int prepare_rows(h3_dit_schedule *schedule,
                                   sizeof(*schedule->video_rows));
     schedule->audio_rows = calloc((size_t)sigmas->steps,
                                   sizeof(*schedule->audio_rows));
-    if (!schedule->video_rows || !schedule->audio_rows) {
+    if (visual_condition)
+        schedule->visual_condition_rows = calloc(
+            (size_t)sigmas->steps, sizeof(*schedule->visual_condition_rows));
+    if (audio_condition)
+        schedule->audio_condition_rows = calloc(
+            (size_t)sigmas->steps, sizeof(*schedule->audio_condition_rows));
+    if (!schedule->video_rows || !schedule->audio_rows ||
+        (visual_condition && !schedule->visual_condition_rows) ||
+        (audio_condition && !schedule->audio_condition_rows)) {
         fail(error, error_size, "out of memory allocating timestep row maps");
         return 0;
     }
@@ -101,6 +112,20 @@ static int prepare_rows(h3_dit_schedule *schedule,
             schedule->video_rows[step] = count++;
         }
     }
+    uint32_t visual_condition_row = UINT32_MAX;
+    uint32_t audio_condition_row = UINT32_MAX;
+    if (visual_condition) visual_condition_row = count++;
+    if (audio_condition) audio_condition_row = count++;
+    for (int step = 0; step < sigmas->steps; step++) {
+        float video = 1.0f - sigmas->video[step];
+        float audio = 1.0f - sigmas->audio[step];
+        if (visual_condition)
+            schedule->visual_condition_rows[step] = video >= 0.999f ?
+                schedule->video_rows[step] : visual_condition_row;
+        if (audio_condition)
+            schedule->audio_condition_rows[step] = audio >= 1.0f ?
+                schedule->audio_rows[step] : audio_condition_row;
+    }
     schedule->time_rows = count;
     if (!count || count > UINT32_MAX / TIME_INPUT) {
         fail(error, error_size, "invalid number of timestep rows");
@@ -118,6 +143,8 @@ static int prepare_rows(h3_dit_schedule *schedule,
         times[schedule->video_rows[step]] = 1.0f - sigmas->video[step];
         times[schedule->audio_rows[step]] = 1.0f - sigmas->audio[step];
     }
+    if (visual_condition) times[visual_condition_row] = 0.999f;
+    if (audio_condition) times[audio_condition_row] = 1.0f;
     for (uint32_t row = 0; row < count; row++) {
         for (uint32_t index = 0; index < TIME_INPUT / 2; index++) {
             float frequency = expf(-logf(10000.0f) *
@@ -209,7 +236,8 @@ cleanup:
 
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
-    const h3_sigma_schedule *sigmas,
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -225,7 +253,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     schedule->gpu = gpu;
     float *features = NULL;
-    if (!prepare_rows(schedule, sigmas, &features, error, error_size)) goto failed;
+    if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
+                      &features, error, error_size)) goto failed;
     h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
                                            features, error, error_size);
     free(features);
@@ -314,6 +343,8 @@ void h3_dit_schedule_free(h3_dit_schedule *schedule) {
     h3_gpu_tensor_free(schedule->final);
     free(schedule->video_rows);
     free(schedule->audio_rows);
+    free(schedule->visual_condition_rows);
+    free(schedule->audio_condition_rows);
     free(schedule);
 }
 
@@ -335,6 +366,20 @@ uint32_t h3_dit_schedule_audio_row(const h3_dit_schedule *schedule, int step) {
         schedule->audio_rows[step] : UINT32_MAX;
 }
 
+uint32_t h3_dit_schedule_visual_condition_row(
+    const h3_dit_schedule *schedule, int step) {
+    return schedule && schedule->visual_condition_rows && step >= 0 &&
+        step < schedule->steps ? schedule->visual_condition_rows[step] :
+        UINT32_MAX;
+}
+
+uint32_t h3_dit_schedule_audio_condition_row(
+    const h3_dit_schedule *schedule, int step) {
+    return schedule && schedule->audio_condition_rows && step >= 0 &&
+        step < schedule->steps ? schedule->audio_condition_rows[step] :
+        UINT32_MAX;
+}
+
 const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
                                            unsigned block) {
     return schedule && block < H3_DIT_BLOCKS ? schedule->blocks[block] : NULL;
@@ -345,19 +390,54 @@ const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule) {
 }
 
 int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
-                            size_t text_rows, size_t audio_rows,
-                            size_t video_rows, uint32_t *rows,
-                            size_t row_count) {
-    if (!schedule || step < 0 || step >= schedule->steps || !rows ||
-        text_rows > SIZE_MAX - audio_rows ||
-        text_rows + audio_rows > SIZE_MAX - video_rows ||
-        row_count != text_rows + audio_rows + video_rows) return 0;
-    uint32_t text = schedule->video_rows[step] * H3_DIT_MODALITIES + 1;
-    uint32_t audio = schedule->audio_rows[step] * H3_DIT_MODALITIES + 2;
-    uint32_t video = schedule->video_rows[step] * H3_DIT_MODALITIES;
-    size_t index = 0;
-    while (index < text_rows) rows[index++] = text;
-    while (index < text_rows + audio_rows) rows[index++] = audio;
-    while (index < row_count) rows[index++] = video;
-    return 1;
+                            const h3_layout *layout,
+                            const uint8_t *text_tags, size_t text_tag_count,
+                            uint32_t *rows, size_t row_count) {
+    if (!schedule || step < 0 || step >= schedule->steps || !layout || !rows ||
+        row_count != layout->seq_len || !layout->segments ||
+        (text_tags && text_tag_count != (size_t)layout->signature[0])) return 0;
+    size_t text_index = 0;
+    for (size_t seg_index = 0; seg_index < layout->segment_count; seg_index++) {
+        const h3_segment *segment = &layout->segments[seg_index];
+        if (segment->start > segment->stop || segment->stop > row_count)
+            return 0;
+        uint32_t time_row;
+        uint32_t tag;
+        switch (segment->kind) {
+        case H3_SEG_TEXT:
+            time_row = schedule->video_rows[step];
+            for (size_t row = segment->start; row < segment->stop; row++) {
+                uint32_t text_tag = text_tags ? text_tags[text_index] : 1u;
+                if (text_tag >= H3_DIT_MODALITIES) return 0;
+                rows[row] = time_row * H3_DIT_MODALITIES + text_tag;
+                text_index++;
+            }
+            continue;
+        case H3_SEG_COND:
+        case H3_SEG_REF_IMAGE:
+            if (!schedule->visual_condition_rows) return 0;
+            time_row = schedule->visual_condition_rows[step];
+            tag = 0;
+            break;
+        case H3_SEG_REF_AUDIO:
+            if (!schedule->audio_condition_rows) return 0;
+            time_row = schedule->audio_condition_rows[step];
+            tag = 2;
+            break;
+        case H3_SEG_AUDIO:
+            time_row = schedule->audio_rows[step];
+            tag = 2;
+            break;
+        case H3_SEG_VIDEO:
+            time_row = schedule->video_rows[step];
+            tag = 0;
+            break;
+        default:
+            return 0;
+        }
+        uint32_t modulation = time_row * H3_DIT_MODALITIES + tag;
+        for (size_t row = segment->start; row < segment->stop; row++)
+            rows[row] = modulation;
+    }
+    return text_index == (size_t)layout->signature[0];
 }

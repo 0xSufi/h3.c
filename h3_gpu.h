@@ -51,8 +51,14 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
+int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
+                                  size_t destination_offset,
+                                  const float *values, size_t elements);
 int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
                              size_t elements);
+int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
+                                   size_t destination_offset,
+                                   const uint16_t *values, size_t elements);
 
 int h3_gpu_begin(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
@@ -206,6 +212,22 @@ int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight, uint32_t rows,
                          uint32_t width, float epsilon);
+int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t width, float epsilon);
+int h3_gpu_gelu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input, uint32_t elements,
+                     int approximate);
+int h3_gpu_vision_qkv_rope_bf16(
+                     h3_gpu *gpu, h3_gpu_tensor *query,
+                     h3_gpu_tensor *key, h3_gpu_tensor *value,
+                     const h3_gpu_tensor *qkv,
+                     const h3_gpu_tensor *rope_cos,
+                     const h3_gpu_tensor *rope_sin, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim,
+                     uint32_t rope_half);
 int h3_gpu_adaln_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *norm_weight,

@@ -44,24 +44,34 @@ int main(int argc, char **argv) {
     h3_sigma_schedule sigmas;
     if (!h3_schedule_build(20, &sigmas)) die("cannot build 20-step schedule");
     h3_dit_schedule *schedule = h3_dit_schedule_precompute(
-        weights, gpu, &sigmas, progress, NULL, error, sizeof(error));
+        weights, gpu, &sigmas, 1, 0, progress, NULL, error, sizeof(error));
     if (!schedule) die(error);
     if (h3_dit_schedule_steps(schedule) != 20 ||
-        h3_dit_schedule_time_rows(schedule) != 39 ||
+        h3_dit_schedule_time_rows(schedule) != 40 ||
         h3_dit_schedule_video_row(schedule, 0) != 0 ||
         h3_dit_schedule_audio_row(schedule, 0) != 0 ||
+        h3_dit_schedule_visual_condition_row(schedule, 0) != 39 ||
         h3_dit_schedule_video_row(schedule, 1) != 1 ||
         h3_dit_schedule_audio_row(schedule, 1) != 2)
         die("unexpected global timestep row layout");
-    uint32_t row_map[24];
-    if (!h3_dit_schedule_row_map(schedule, 0, 6, 16, 2,
-                                  row_map, 24))
+    int keyframes[] = {0};
+    h3_layout_spec spec = {6, 2, 2, 2, 8, 5,
+                           keyframes, 1, NULL, 0};
+    h3_layout layout;
+    if (!h3_layout_build(&spec, &layout, error, sizeof(error))) die(error);
+    uint8_t text_tags[] = {1, 0, 0, 1, 1, 1};
+    uint32_t row_map[25];
+    if (!h3_dit_schedule_row_map(schedule, 0, &layout, text_tags, 6,
+                                  row_map, 25))
         die("cannot build step-0 row map");
+    const uint32_t expected_text[] = {1, 0, 0, 1, 1, 1};
     for (size_t index = 0; index < 6; index++)
-        if (row_map[index] != 1) die("bad text modulation row");
-    for (size_t index = 6; index < 22; index++)
+        if (row_map[index] != expected_text[index])
+            die("bad multimodal text modulation row");
+    if (row_map[6] != 117) die("bad visual-condition modulation row");
+    for (size_t index = 7; index < 23; index++)
         if (row_map[index] != 2) die("bad audio modulation row");
-    for (size_t index = 22; index < 24; index++)
+    for (size_t index = 23; index < 25; index++)
         if (row_map[index] != 0) die("bad video modulation row");
 
     h3_st_header fixture;
@@ -111,6 +121,7 @@ int main(int argc, char **argv) {
     free(want);
     free(got);
     h3_st_free_header(&fixture);
+    h3_layout_free(&layout);
     h3_dit_schedule_free(schedule);
     h3_gpu_free(gpu);
     h3_weight_store_free(weights);

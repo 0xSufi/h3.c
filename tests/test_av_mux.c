@@ -39,6 +39,29 @@ int main(int argc, char **argv) {
     struct stat status;
     if (stat(path, &status) != 0 || status.st_size < 1000)
         die("FFmpeg did not create a nonempty A/V container");
+    float *decoded = NULL;
+    if (!h3_ffmpeg_read_image_f32(path, WIDTH, HEIGHT,
+                                  H3_IMAGE_FIT_STRETCH, &decoded,
+                                  error, sizeof(error))) die(error);
+    double red = 0.0, green = 0.0, blue = 0.0;
+    for (size_t pixel = 0; pixel < WIDTH * HEIGHT; pixel++) {
+        if (!isfinite(decoded[pixel]) || decoded[pixel] < 0.0f ||
+            decoded[pixel] > 1.0f ||
+            !isfinite(decoded[WIDTH * HEIGHT + pixel]) ||
+            !isfinite(decoded[2 * WIDTH * HEIGHT + pixel]))
+            die("decoded FFmpeg image contains invalid pixels");
+        red += decoded[pixel];
+        green += decoded[WIDTH * HEIGHT + pixel];
+        blue += decoded[2 * WIDTH * HEIGHT + pixel];
+    }
+    if (red < 100.0 || green < 100.0 || blue > 80.0)
+        die("decoded FFmpeg image has unexpected channel-major content");
+    free(decoded);
+    decoded = NULL;
+    if (!h3_ffmpeg_read_image_f32(path, WIDTH, HEIGHT * 2,
+                                  H3_IMAGE_FIT_COVER, &decoded,
+                                  error, sizeof(error))) die(error);
+    free(decoded);
     printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
            path, (long long)status.st_size);
     free(rgb);

@@ -22,6 +22,22 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_sigma_schedule *sigmas,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
+
+/* Load FL2VA/Ref2VA packing. Condition inputs are already patchified F32 row
+ * sources: visual rows have width 96 and audio rows width 32. Their element
+ * counts must exactly match layout.img_cond_rows/audio_cond_rows. */
+h3_dit *h3_dit_load_conditioned(
+                         const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
 
 size_t h3_dit_video_elements(const h3_dit *dit);

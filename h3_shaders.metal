@@ -137,6 +137,7 @@ kernel void h3_layer_norm_f32(device const float *input [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = reductions[0] / float(args.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     local = 0.0f;
     for (uint k = tid; k < args.width; k += threads) {
         float centered = x[k] - mean;
@@ -639,6 +640,128 @@ kernel void h3_rms_norm_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+kernel void h3_layer_norm_bf16(device const ushort *input [[buffer(0)]],
+                               device const ushort *weight [[buffer(1)]],
+                               device const ushort *bias [[buffer(2)]],
+                               device ushort *output [[buffer(3)]],
+                               constant norm_args &args [[buffer(4)]],
+                               uint3 group [[threadgroup_position_in_grid]],
+                               uint3 thread_position [[thread_position_in_threadgroup]],
+                               uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const ushort *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += threads)
+        local_sum += h3_bf16_to_f32(x[column]);
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(args.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_square = 0.0f;
+    for (uint column = tid; column < args.width; column += threads) {
+        float centered = h3_bf16_to_f32(x[column]) - mean;
+        local_square = fma(centered, centered, local_square);
+    }
+    reductions[tid] = local_square;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = (h3_bf16_to_f32(x[column]) - mean) * inverse;
+        float value = fma(normalized, h3_bf16_to_f32(weight[column]),
+                          h3_bf16_to_f32(bias[column]));
+        output[row * args.width + column] = h3_f32_to_bf16(value);
+    }
+}
+
+struct gelu_bf16_args {
+    uint elements;
+    uint approximate;
+};
+
+inline float h3_erf_approx(float value) {
+    float sign = value < 0.0f ? -1.0f : 1.0f;
+    float x = abs(value);
+    float t = 1.0f / (1.0f + 0.3275911f * x);
+    float polynomial = (((((1.061405429f * t - 1.453152027f) * t) +
+                           1.421413741f) * t - 0.284496736f) * t +
+                           0.254829592f) * t;
+    return sign * (1.0f - polynomial * exp(-x * x));
+}
+
+kernel void h3_gelu_bf16(device const ushort *input [[buffer(0)]],
+                         device ushort *output [[buffer(1)]],
+                         constant gelu_bf16_args &args [[buffer(2)]],
+                         uint index [[thread_position_in_grid]]) {
+    if (index >= args.elements) return;
+    float value = h3_bf16_to_f32(input[index]);
+    float activated;
+    if (args.approximate) {
+        float inner = 0.7978845608028654f *
+            (value + 0.044715f * value * value * value);
+        /* Apple GPU tanh may return NaN for large finite arguments under the
+         * runtime compiler's fast-math mode. Saturation is already exact at
+         * BF16 precision outside this range. */
+        activated = inner <= -10.0f ? 0.0f :
+                    inner >= 10.0f ? value :
+                    0.5f * value * (1.0f + tanh(inner));
+    } else {
+        activated = value <= -10.0f ? 0.0f :
+                    value >= 10.0f ? value :
+                    0.5f * value *
+                    (1.0f + h3_erf_approx(value * 0.7071067811865475f));
+    }
+    output[index] = h3_f32_to_bf16(activated);
+}
+
+kernel void h3_vision_qkv_rope_bf16(
+                            device const ushort *qkv [[buffer(0)]],
+                            device const ushort *rope_cos [[buffer(1)]],
+                            device const ushort *rope_sin [[buffer(2)]],
+                            device ushort *query [[buffer(3)]],
+                            device ushort *key [[buffer(4)]],
+                            device ushort *value [[buffer(5)]],
+                            constant qkv_args &args [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint dimension = gid.x;
+    uint head = gid.y;
+    uint row = gid.z;
+    if (dimension >= args.head_dim || head >= args.heads ||
+        row >= args.sequence) return;
+    uint inner = args.heads * args.head_dim;
+    uint row_base = row * inner * 3;
+    uint q_base = row_base + head * args.head_dim;
+    uint k_base = row_base + inner + head * args.head_dim;
+    uint v_base = row_base + inner * 2 + head * args.head_dim;
+    uint half_dim = args.rope_half;
+    uint rope_index = row * half_dim + dimension % half_dim;
+    float c = h3_bf16_to_f32(rope_cos[rope_index]);
+    float s = h3_bf16_to_f32(rope_sin[rope_index]);
+    uint pair = dimension < half_dim ? dimension + half_dim :
+                dimension - half_dim;
+    float q0 = h3_bf16_to_f32(qkv[q_base + dimension]);
+    float k0 = h3_bf16_to_f32(qkv[k_base + dimension]);
+    float q1 = h3_bf16_to_f32(qkv[q_base + pair]);
+    float k1 = h3_bf16_to_f32(qkv[k_base + pair]);
+    float qr = dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+    float kr = dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = h3_f32_to_bf16(qr);
+    key[output_index] = h3_f32_to_bf16(kr);
+    value[output_index] = qkv[v_base + dimension];
+}
+
 kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
                           device const ushort *weight [[buffer(1)]],
                           device const ushort *modulation [[buffer(2)]],
@@ -959,7 +1082,11 @@ kernel void h3_gqa_causal_bf16(
     threadgroup float shared_query[128];
 
     for (uint d = tid; d < args.head_dim; d += threads) {
-        shared_query[d] = h3_bf16_to_f32(query[q_base + d]);
+        /* MLX's fused SDPA applies the scale to Q before the tiled QK
+         * contraction. Matching that order matters at sharp late-layer
+         * attention boundaries. */
+        shared_query[d] = h3_bf16_to_f32(h3_f32_to_bf16(
+            h3_bf16_to_f32(query[q_base + d]) * args.scale));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -970,7 +1097,7 @@ kernel void h3_gqa_causal_bf16(
         for (uint d = 0; d < args.head_dim; d++) {
             dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]), dot);
         }
-        float score = dot * args.scale;
+        float score = dot;
         scores[key_row] = score;
         local_max = max(local_max, score);
     }

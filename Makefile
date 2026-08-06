@@ -11,7 +11,7 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
-	h3_terminal.c
+	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 
@@ -52,6 +52,12 @@ h3_av_mux_test: tests/test_av_mux.o $(LIB_OBJ)
 h3_real_video_encoder_test: tests/test_real_video_encoder.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_multimodal_text_test: tests/test_real_multimodal_text.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -75,7 +81,9 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_av_mux_test \
-	h3_real_video_encoder_test
+	h3_real_video_encoder_test h3_real_qwen_vision_test \
+	h3_real_multimodal_text_test
+
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
@@ -112,6 +120,18 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	else \
 		echo "skip: released visual encoder weights/fixture are not installed"; \
 	fi
+	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00014-of-00014.safetensors && \
+	         test -f misc/fixtures/h3_real_qwen_vision_64.safetensors; then \
+		./h3_real_qwen_vision_test; \
+	else \
+		echo "skip: released Qwen vision weights/fixture are not installed"; \
+	fi
+	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00001-of-00014.safetensors && \
+	         test -f misc/fixtures/h3_real_multimodal_text_64.safetensors; then \
+		./h3_real_multimodal_text_test; \
+	else \
+		echo "skip: released multimodal Qwen weights/fixture are not installed"; \
+	fi
 
 parity: h3_metal_tests h3_bf16_tests h3_text_tests
 	./h3_metal_tests misc/fixtures/h3_dit.safetensors
@@ -137,7 +157,8 @@ clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_av_mux_test \
-		h3_real_video_encoder_test \
+		h3_real_video_encoder_test h3_real_qwen_vision_test \
+		h3_real_multimodal_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 		libh3.a *.o *.d tests/*.o tests/*.d

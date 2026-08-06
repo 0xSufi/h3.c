@@ -24,7 +24,8 @@ typedef void (*h3_dit_schedule_progress)(int completed_blocks,
  * next is loaded. */
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
-    const h3_sigma_schedule *sigmas,
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);
@@ -33,15 +34,20 @@ int h3_dit_schedule_steps(const h3_dit_schedule *schedule);
 uint32_t h3_dit_schedule_time_rows(const h3_dit_schedule *schedule);
 uint32_t h3_dit_schedule_video_row(const h3_dit_schedule *schedule, int step);
 uint32_t h3_dit_schedule_audio_row(const h3_dit_schedule *schedule, int step);
+uint32_t h3_dit_schedule_visual_condition_row(
+    const h3_dit_schedule *schedule, int step);
+uint32_t h3_dit_schedule_audio_condition_row(
+    const h3_dit_schedule *schedule, int step);
 const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
                                            unsigned block);
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
 
-/* Build the row map consumed by the fused AdaLN/gate kernels. Text uses tag 1,
- * audio tag 2, and video tag 0, matching the released checkpoint layout. */
+/* Build the row map consumed by the fused AdaLN/gate kernels. text_tags may be
+ * NULL (all tag 1), or one tag per text row. Qwen vision presentation spans use
+ * tag 0. Segment kinds select target/condition timesteps and modality tags. */
 int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
-                            size_t text_rows, size_t audio_rows,
-                            size_t video_rows, uint32_t *rows,
-                            size_t row_count);
+                            const h3_layout *layout,
+                            const uint8_t *text_tags, size_t text_tag_count,
+                            uint32_t *rows, size_t row_count);
 
 #endif

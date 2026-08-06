@@ -25,6 +25,15 @@ enum {
 static const float TEXT_RMS_EPSILON = 1e-6f;
 static const float TEXT_ROPE_THETA = 5000000.0f;
 
+static float round_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    bits &= UINT32_C(0xffff0000);
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 typedef struct {
     h3_gpu_tensor *input_norm;
     h3_gpu_tensor *query;
@@ -201,18 +210,24 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
 void h3_text_embedding_free(h3_text_embedding *embedding) {
     if (!embedding) return;
     free(embedding->values);
+    free(embedding->tags);
     memset(embedding, 0, sizeof(*embedding));
 }
 
-int h3_text_encode_bf16(const char *weight_directory,
+static int text_encode_bf16_impl(
+                        const char *weight_directory,
                         const char *shader_source_path,
                         const uint32_t *token_ids, size_t token_count,
+                        const h3_text_vision_span *spans, size_t span_count,
+                        const uint32_t *position_ids, const uint8_t *tags,
+                        int layer_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (!weight_directory || !shader_source_path || !token_ids || !token_count ||
         !output || token_count > UINT32_MAX ||
+        layer_count < 1 || layer_count > TEXT_LAYERS ||
         token_count > UINT32_MAX / TEXT_HIDDEN ||
         token_count > UINT32_MAX / TEXT_INTERMEDIATE) {
         fail(error, error_size, "invalid Qwen text encoder arguments");
@@ -224,6 +239,22 @@ int h3_text_encode_bf16(const char *weight_directory,
                  token_ids[index]);
             return 0;
         }
+        if (tags && tags[index] > 2) {
+            fail(error, error_size, "Qwen presentation tag is invalid");
+            return 0;
+        }
+    }
+    size_t span_cursor = 0;
+    for (size_t index = 0; index < span_count; index++) {
+        const h3_text_vision_span *span = &spans[index];
+        if (!span->tokens || span->start < span_cursor ||
+            span->start > token_count || span->tokens > token_count - span->start ||
+            !span->embeddings || !span->deepstack[0] || !span->deepstack[1] ||
+            !span->deepstack[2]) {
+            fail(error, error_size, "invalid Qwen vision presentation span");
+            return 0;
+        }
+        span_cursor = span->start + span->tokens;
     }
 
     h3_weight_store *store = h3_weight_store_open(weight_directory, error,
@@ -259,9 +290,22 @@ int h3_text_encode_bf16(const char *weight_directory,
     }
     for (size_t position = 0; position < token_count; position++) {
         for (size_t index = 0; index < TEXT_ROPE_HALF; index++) {
-            float angle = (float)position * inverse_frequency[index];
-            cosines[position * TEXT_ROPE_HALF + index] = cosf(angle);
-            sines[position * TEXT_ROPE_HALF + index] = sinf(angle);
+            size_t axis = 0;
+            if (position_ids && index < 60 && index % 3 == 1) axis = 1;
+            else if (position_ids && index < 60 && index % 3 == 2) axis = 2;
+            float coordinate = position_ids ?
+                (float)position_ids[axis * token_count + position] :
+                (float)position;
+            float angle = coordinate * inverse_frequency[index];
+            float cosine = cosf(angle);
+            float sine = sinf(angle);
+            /* The explicit Qwen mRoPE path casts its tables to the BF16
+             * embedding dtype. Keep F32 storage for the fused Metal kernel,
+             * but pin the values to that same operation boundary. */
+            cosines[position * TEXT_ROPE_HALF + index] =
+                position_ids ? round_bf16(cosine) : cosine;
+            sines[position * TEXT_ROPE_HALF + index] =
+                position_ids ? round_bf16(sine) : sine;
         }
     }
 
@@ -282,14 +326,35 @@ int h3_text_encode_bf16(const char *weight_directory,
     h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
     h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
     h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *deepstack[3] = {NULL, NULL, NULL};
+    if (span_count) {
+        uint16_t *values = calloc(hidden_count, sizeof(*values));
+        if (!values) {
+            fail(error, error_size, "out of memory packing Qwen deepstack rows");
+            goto early_cleanup;
+        }
+        for (size_t layer = 0; layer < 3; layer++) {
+            memset(values, 0, hidden_count * sizeof(*values));
+            for (size_t index = 0; index < span_count; index++) {
+                const h3_text_vision_span *span = &spans[index];
+                memcpy(values + span->start * TEXT_HIDDEN,
+                       span->deepstack[layer],
+                       span->tokens * TEXT_HIDDEN * sizeof(*values));
+            }
+            deepstack[layer] = h3_gpu_tensor_from_bf16(gpu, values,
+                                                        hidden_count);
+        }
+        free(values);
+    }
     h3_gpu_tensor *activations[] = {
         ids, rope_cos, rope_sin, hidden, norm, query, key, value,
-        attention_heads, attention_output, gate, up, mlp_output
+        attention_heads, attention_output, gate, up, mlp_output,
+        deepstack[0], deepstack[1], deepstack[2]
     };
     int ok = 1;
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
-        if (!activations[index]) ok = 0;
+        if (!activations[index] && (index < 13 || span_count)) ok = 0;
     }
     if (!ok) {
         fail(error, error_size, "cannot allocate Qwen activations: %s",
@@ -312,8 +377,17 @@ int h3_text_encode_bf16(const char *weight_directory,
         goto cleanup;
     }
     retire_deferred(&load);
+    for (size_t index = 0; index < span_count; index++) {
+        const h3_text_vision_span *span = &spans[index];
+        if (!h3_gpu_tensor_write_bf16_range(
+                hidden, span->start * TEXT_HIDDEN, span->embeddings,
+                span->tokens * TEXT_HIDDEN)) {
+            fail(error, error_size, "cannot splice Qwen vision embeddings");
+            goto cleanup;
+        }
+    }
 
-    for (int layer = 0; layer < TEXT_LAYERS; layer++) {
+    for (int layer = 0; layer < layer_count; layer++) {
         text_layer_weights weights;
         memset(&weights, 0, sizeof(weights));
         if (!layer_weights_load(&load, layer, &weights) ||
@@ -323,6 +397,11 @@ int h3_text_encode_bf16(const char *weight_directory,
                           value, attention_heads, attention_output, gate, up,
                           mlp_output, rope_cos, rope_sin, layer,
                           error, error_size) ||
+            (layer < 3 && span_count &&
+             !gpu_operation(gpu, h3_gpu_add_bf16(
+                 gpu, hidden, hidden, deepstack[layer],
+                 tokens * TEXT_HIDDEN), error, error_size,
+                 "deepstack residual", layer)) ||
             !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
                            "layer stream submit", layer)) {
             goto cleanup;
@@ -344,6 +423,15 @@ int h3_text_encode_bf16(const char *weight_directory,
     }
     output->tokens = token_count;
     output->width = TEXT_HIDDEN;
+    if (tags) {
+        output->tags = malloc(token_count * sizeof(*output->tags));
+        if (!output->tags) {
+            h3_text_embedding_free(output);
+            fail(error, error_size, "out of memory reading Qwen tags");
+            goto cleanup;
+        }
+        memcpy(output->tags, tags, token_count * sizeof(*output->tags));
+    }
     ok = 1;
     goto finished;
 
@@ -358,4 +446,79 @@ finished:
     h3_gpu_free(gpu);
     h3_weight_store_free(store);
     return ok;
+
+early_cleanup:
+    h3_gpu_tensor_free(ids);
+    h3_gpu_tensor_free(rope_cos);
+    h3_gpu_tensor_free(rope_sin);
+    h3_gpu_tensor_free(hidden);
+    h3_gpu_tensor_free(norm);
+    h3_gpu_tensor_free(query);
+    h3_gpu_tensor_free(key);
+    h3_gpu_tensor_free(value);
+    h3_gpu_tensor_free(attention_heads);
+    h3_gpu_tensor_free(attention_output);
+    h3_gpu_tensor_free(gate);
+    h3_gpu_tensor_free(up);
+    h3_gpu_tensor_free(mlp_output);
+    for (size_t index = 0; index < 3; index++)
+        h3_gpu_tensor_free(deepstack[index]);
+    retire_deferred(&load);
+    h3_gpu_free(gpu);
+    h3_weight_store_free(store);
+    return 0;
+}
+
+int h3_text_encode_bf16(const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    return text_encode_bf16_impl(
+        weight_directory, shader_source_path, token_ids, token_count,
+        NULL, 0, NULL, NULL, TEXT_LAYERS, progress, progress_opaque,
+        output, error, error_size);
+}
+
+int h3_text_encode_multimodal_bf16(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        const h3_text_vision_span *spans, size_t span_count,
+                        const uint32_t *position_ids, const uint8_t *tags,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    if (!spans || !span_count || !position_ids || !tags) {
+        if (output) memset(output, 0, sizeof(*output));
+        fail(error, error_size, "multimodal Qwen presentation is incomplete");
+        return 0;
+    }
+    return text_encode_bf16_impl(
+        weight_directory, shader_source_path, token_ids, token_count,
+        spans, span_count, position_ids, tags, TEXT_LAYERS,
+        progress, progress_opaque,
+        output, error, error_size);
+}
+
+int h3_text_encode_multimodal_layers_bf16(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        const h3_text_vision_span *spans, size_t span_count,
+                        const uint32_t *position_ids, const uint8_t *tags,
+                        int layer_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size) {
+    if (!spans || !span_count || !position_ids || !tags) {
+        if (output) memset(output, 0, sizeof(*output));
+        fail(error, error_size, "multimodal Qwen presentation is incomplete");
+        return 0;
+    }
+    return text_encode_bf16_impl(
+        weight_directory, shader_source_path, token_ids, token_count,
+        spans, span_count, position_ids, tags, layer_count,
+        progress, progress_opaque, output, error, error_size);
 }

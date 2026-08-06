@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -31,6 +32,18 @@
 @property(nonatomic, strong) NSArray<NSNumber *> *shape;
 @end
 @implementation H3SDPA
+@end
+
+@interface H3GQA : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *query;
+@property(nonatomic, strong) MPSGraphTensor *key;
+@property(nonatomic, strong) MPSGraphTensor *value;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *queryShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *kvShape;
+@end
+@implementation H3GQA
 @end
 
 @interface H3Linear : NSObject
@@ -68,6 +81,7 @@
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
 @property(nonatomic, strong) NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3SDPA *> *sdpaCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3GQA *> *gqaCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
 @property(nonatomic, copy) NSString *lastError;
@@ -204,6 +218,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
+        gpu.gqaCache = [NSMutableDictionary dictionary];
         gpu.linearCache = [NSMutableDictionary dictionary];
         gpu.convCache = [NSMutableDictionary dictionary];
         if (!gpu.device || !gpu.queue) {
@@ -247,6 +262,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_qkv_rope_bf16", @"h3_swiglu_bf16",
+            @"h3_layer_norm_bf16", @"h3_gelu_bf16",
+            @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16",
@@ -436,17 +453,35 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
 
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements) {
+    return h3_gpu_tensor_write_f32_range(tensor, 0, values, elements);
+}
+
+int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
+                                  size_t destination_offset,
+                                  const float *values, size_t elements) {
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_F32 ||
-        elements > TENSOR(tensor).elements) return 0;
-    memcpy(TENSOR(tensor).buffer.contents, values, elements * sizeof(float));
+        destination_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - destination_offset) return 0;
+    unsigned char *destination = TENSOR(tensor).buffer.contents;
+    memcpy(destination + destination_offset * sizeof(float), values,
+           elements * sizeof(float));
     return 1;
 }
 
 int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
                              size_t elements) {
+    return h3_gpu_tensor_write_bf16_range(tensor, 0, values, elements);
+}
+
+int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
+                                   size_t destination_offset,
+                                   const uint16_t *values, size_t elements) {
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
-        elements > TENSOR(tensor).elements) return 0;
-    memcpy(TENSOR(tensor).buffer.contents, values, elements * sizeof(uint16_t));
+        destination_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - destination_offset) return 0;
+    unsigned char *destination = TENSOR(tensor).buffer.contents;
+    memcpy(destination + destination_offset * sizeof(uint16_t), values,
+           elements * sizeof(uint16_t));
     return 1;
 }
 
@@ -524,6 +559,7 @@ typedef struct {
     float epsilon;
 } vae_encoder_norm_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
+typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
 typedef struct {
     uint32_t sequence, query_heads, kv_heads, head_dim;
@@ -1655,6 +1691,78 @@ int h3_gpu_rms_norm_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_layer_norm_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t width, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * width;
+    if (!h3_gpu_require_bf16(gpu, input, count, @"LayerNorm input") ||
+        !h3_gpu_require_bf16(gpu, weight, width, @"LayerNorm weight") ||
+        !h3_gpu_require_bf16(gpu, bias, width, @"LayerNorm bias") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"LayerNorm output")) return 0;
+    norm_args args = {rows, width, epsilon};
+    return h3_gpu_dispatch_rows(gpu, @"h3_layer_norm_bf16", rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_gelu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input, uint32_t elements,
+                     int approximate) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, elements, @"GELU input") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"GELU output")) return 0;
+    gelu_bf16_args args = {elements, approximate ? 1u : 0u};
+    return h3_gpu_dispatch_1d(gpu, @"h3_gelu_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_vision_qkv_rope_bf16(
+                     h3_gpu *opaque, h3_gpu_tensor *query,
+                     h3_gpu_tensor *key, h3_gpu_tensor *value,
+                     const h3_gpu_tensor *qkv,
+                     const h3_gpu_tensor *rope_cos,
+                     const h3_gpu_tensor *rope_sin, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim,
+                     uint32_t rope_half) {
+    H3GPU *gpu = GPU(opaque);
+    size_t inner = (size_t)heads * head_dim;
+    size_t count = (size_t)sequence * inner;
+    size_t rope_count = (size_t)sequence * rope_half;
+    if (!h3_gpu_require_bf16(gpu, qkv, count * 3, @"vision QKV") ||
+        !h3_gpu_require_bf16(gpu, rope_cos, rope_count,
+                              @"vision RoPE cosine") ||
+        !h3_gpu_require_bf16(gpu, rope_sin, rope_count,
+                              @"vision RoPE sine") ||
+        !h3_gpu_require_bf16(gpu, query, count, @"vision query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"vision key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"vision value") ||
+        rope_half * 2 != head_dim) return 0;
+    qkv_args args = {sequence, heads, head_dim, rope_half, 0, 0.0f};
+    return h3_gpu_dispatch_3d(gpu, @"h3_vision_qkv_rope_bf16",
+        MTLSizeMake(head_dim, heads, sequence),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
 int h3_gpu_adaln_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *norm_weight,
@@ -1904,6 +2012,125 @@ int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
         });
 }
 
+static H3GQA *h3_gpu_gqa_graph(H3GPU *gpu, uint32_t sequence,
+                               uint32_t query_heads, uint32_t kv_heads,
+                               uint32_t head_dim, float scale) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%.9g",
+                         sequence, query_heads, kv_heads, head_dim, scale];
+        H3GQA *cached = gpu.gqaCache[key];
+        if (cached) return cached;
+        if (!kv_heads || query_heads % kv_heads) return nil;
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        MPSShape *query_shape = @[@1, @(sequence), @(query_heads), @(head_dim)];
+        MPSShape *kv_shape = @[@1, @(sequence), @(kv_heads), @(head_dim)];
+        MPSGraphTensor *query = [graph placeholderWithShape:query_shape
+                                                   dataType:MPSDataTypeBFloat16
+                                                       name:nil];
+        MPSGraphTensor *key_tensor = [graph placeholderWithShape:kv_shape
+                                                         dataType:MPSDataTypeBFloat16
+                                                             name:nil];
+        MPSGraphTensor *value = [graph placeholderWithShape:kv_shape
+                                                   dataType:MPSDataTypeBFloat16
+                                                       name:nil];
+        MPSGraphTensor *qt = [graph transposeTensor:query dimension:1
+                                      withDimension:2 name:nil];
+        MPSGraphTensor *kt = [graph transposeTensor:key_tensor dimension:1
+                                      withDimension:2 name:nil];
+        MPSGraphTensor *vt = [graph transposeTensor:value dimension:1
+                                      withDimension:2 name:nil];
+        uint32_t groups = query_heads / kv_heads;
+        MPSShape *split_shape = @[@1, @(kv_heads), @1, @(sequence), @(head_dim)];
+        MPSShape *broadcast_shape = @[@1, @(kv_heads), @(groups),
+                                      @(sequence), @(head_dim)];
+        MPSShape *expanded_shape = @[@1, @(query_heads), @(sequence),
+                                     @(head_dim)];
+        kt = [graph reshapeTensor:kt withShape:split_shape name:nil];
+        vt = [graph reshapeTensor:vt withShape:split_shape name:nil];
+        kt = [graph broadcastTensor:kt toShape:broadcast_shape name:nil];
+        vt = [graph broadcastTensor:vt toShape:broadcast_shape name:nil];
+        kt = [graph reshapeTensor:kt withShape:expanded_shape name:nil];
+        vt = [graph reshapeTensor:vt withShape:expanded_shape name:nil];
+        size_t mask_count = (size_t)sequence * sequence;
+        uint16_t *mask_values = malloc(mask_count * sizeof(*mask_values));
+        if (!mask_values) return nil;
+        for (uint32_t row = 0; row < sequence; row++)
+            for (uint32_t column = 0; column < sequence; column++)
+                mask_values[(size_t)row * sequence + column] =
+                    column <= row ? 0u : UINT16_C(0xff80);
+        NSData *mask_data = [NSData dataWithBytesNoCopy:mask_values
+                                                 length:mask_count * sizeof(*mask_values)
+                                           freeWhenDone:YES];
+        MPSGraphTensor *mask = [graph constantWithData:mask_data
+            shape:@[@1, @1, @(sequence), @(sequence)]
+            dataType:MPSDataTypeBFloat16];
+        MPSGraphTensor *attention = [graph
+            scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt
+            valueTensor:vt maskTensor:mask scale:scale name:nil];
+        H3GQA *result = [[H3GQA alloc] init];
+        result.graph = graph;
+        result.query = query;
+        result.key = key_tensor;
+        result.value = value;
+        result.output = [graph transposeTensor:attention dimension:1
+                                 withDimension:2 name:nil];
+        result.queryShape = query_shape;
+        result.kvShape = kv_shape;
+        gpu.gqaCache[key] = result;
+        return result;
+    }
+}
+
+static int h3_gpu_gqa_mps(H3GPU *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *query,
+                          const h3_gpu_tensor *key,
+                          const h3_gpu_tensor *value,
+                          uint32_t sequence, uint32_t query_heads,
+                          uint32_t kv_heads, uint32_t head_dim,
+                          float scale) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3GQA *cache = h3_gpu_gqa_graph(gpu, sequence, query_heads, kv_heads,
+                                    head_dim, scale);
+    if (!cache) {
+        h3_gpu_set_error(gpu, @"cannot build MPSGraph causal GQA");
+        return 0;
+    }
+    @autoreleasepool {
+        MPSCommandBuffer *command =
+            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSGraphTensorData *query_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(query).buffer shape:cache.queryShape
+            dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *(^kv_data)(const h3_gpu_tensor *) =
+            ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
+                return [[MPSGraphTensorData alloc]
+                    initWithMTLBuffer:TENSOR(tensor).buffer shape:cache.kvShape
+                    dataType:MPSDataTypeBFloat16];
+            };
+        MPSGraphTensorData *output_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(output).buffer shape:cache.queryShape
+            dataType:MPSDataTypeBFloat16];
+        NSDictionary *feeds = @{cache.query: query_data,
+                                cache.key: kv_data(key),
+                                cache.value: kv_data(value)};
+        NSDictionary *results = @{cache.output: output_data};
+        @try {
+            [cache.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph causal GQA failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_sdpa_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,
@@ -1921,6 +2148,9 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, value, kv_count, @"GQA value") ||
         !h3_gpu_require_bf16(gpu, output, query_count, @"GQA output") ||
         !h3_gpu_require_command(gpu)) return 0;
+    if (getenv("H3_MPS_GQA") && h3_gpu_gqa_mps(
+            gpu, output, query, key, value, sequence, query_heads,
+            kv_heads, head_dim, scale)) return 1;
     size_t score_bytes = (size_t)sequence * sizeof(float);
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
                                                            @"h3_gqa_causal_bf16");
