@@ -332,6 +332,108 @@ kernel void h3_swiglu_f32(device const float *fused [[buffer(0)]],
     output[row * args.width + column] = gate / (1.0f + exp(-gate)) * up;
 }
 
+struct weight_norm_args {
+    uint outer;
+    uint inner;
+};
+
+kernel void h3_weight_norm_f32(device const float *vector [[buffer(0)]],
+                               device const float *magnitude [[buffer(1)]],
+                               device float *output [[buffer(2)]],
+                               constant weight_norm_args &args [[buffer(3)]],
+                               uint row [[thread_position_in_grid]]) {
+    if (row >= args.outer) return;
+    uint base = row * args.inner;
+    float square_sum = 0.0f;
+    for (uint index = 0; index < args.inner; index++) {
+        float value = vector[base + index];
+        square_sum = fma(value, value, square_sum);
+    }
+    float scale = magnitude[row] * rsqrt(square_sum);
+    for (uint index = 0; index < args.inner; index++)
+        output[base + index] = vector[base + index] * scale;
+}
+
+struct add_scaled_args {
+    uint elements;
+    float left_scale;
+    float right_scale;
+};
+
+kernel void h3_add_scaled_f32(device const float *left [[buffer(0)]],
+                              device const float *right [[buffer(1)]],
+                              device float *output [[buffer(2)]],
+                              constant add_scaled_args &args [[buffer(3)]],
+                              uint index [[thread_position_in_grid]]) {
+    if (index < args.elements)
+        output[index] = left[index] * args.left_scale +
+                        right[index] * args.right_scale;
+}
+
+struct audio_activation_args {
+    uint batch;
+    uint length;
+    uint channels;
+};
+
+/* BigVGAN's fixed 2x upsample -> SnakeBeta -> 2x low-pass downsample is
+ * fused at the original rate. This avoids materializing the doubled waveform
+ * for each of the decoder's 127 alias-free activations. */
+kernel void h3_alias_free_snake_f32(
+        device const float *input [[buffer(0)]],
+        device const float *alpha_log [[buffer(1)]],
+        device const float *beta_log [[buffer(2)]],
+        device const float *upsample_filter [[buffer(3)]],
+        device const float *downsample_filter [[buffer(4)]],
+        device float *output [[buffer(5)]],
+        constant audio_activation_args &args [[buffer(6)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    uint channel = gid.x;
+    uint time = gid.y;
+    uint batch = gid.z;
+    if (channel >= args.channels || time >= args.length ||
+        batch >= args.batch) return;
+    float alpha = exp(alpha_log[channel]);
+    float beta = exp(beta_log[channel]);
+    float result = 0.0f;
+    for (int down_k = 0; down_k < 12; down_k++) {
+        int up_time = int(time * 2) + down_k - 5;
+        up_time = clamp(up_time, 0, int(args.length * 2) - 1);
+        int raw_time = up_time + 15;
+        float upsampled = 0.0f;
+        for (int up_k = 0; up_k < 12; up_k++) {
+            int numerator = raw_time - up_k;
+            if (numerator < 0 || (numerator & 1)) continue;
+            int padded_time = numerator / 2;
+            int source_time = clamp(padded_time - 5, 0,
+                                    int(args.length) - 1);
+            uint source = (batch * args.length + uint(source_time)) *
+                          args.channels + channel;
+            upsampled = fma(input[source], 2.0f * upsample_filter[up_k],
+                            upsampled);
+        }
+        float sine = sin(alpha * upsampled);
+        float activated = upsampled + sine * sine / (beta + 1e-9f);
+        result = fma(activated, downsample_filter[down_k], result);
+    }
+    uint destination = (batch * args.length + time) * args.channels + channel;
+    output[destination] = result;
+}
+
+struct clip_args {
+    uint elements;
+    float minimum;
+    float maximum;
+};
+
+kernel void h3_clip_f32(device const float *input [[buffer(0)]],
+                        device float *output [[buffer(1)]],
+                        constant clip_args &args [[buffer(2)]],
+                        uint index [[thread_position_in_grid]]) {
+    if (index < args.elements)
+        output[index] = clamp(input[index], args.minimum, args.maximum);
+}
+
 kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
                            device const ushort *weight [[buffer(1)]],
                            device const ushort *bias [[buffer(2)]],

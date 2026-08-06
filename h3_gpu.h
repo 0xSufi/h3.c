@@ -18,6 +18,7 @@ typedef struct {
     uint64_t tensor_allocations;
     uint64_t direct_dispatches;
     uint64_t mps_linear_dispatches;
+    uint64_t mps_conv_dispatches;
     uint64_t mps_sdpa_dispatches;
     uint64_t blit_copies;
     uint64_t submissions;
@@ -127,6 +128,44 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
                               float epsilon);
+
+/* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
+ * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */
+int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t padding, uint32_t dilation);
+int h3_gpu_conv_transpose1d_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t stride, uint32_t padding);
+int h3_gpu_weight_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *vector,
+                           const h3_gpu_tensor *magnitude,
+                           uint32_t outer, uint32_t inner);
+int h3_gpu_add_scaled_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left,
+                          const h3_gpu_tensor *right, float left_scale,
+                          float right_scale, uint32_t elements);
+int h3_gpu_alias_free_snake_f32(
+                          h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *alpha_log,
+                          const h3_gpu_tensor *beta_log,
+                          const h3_gpu_tensor *upsample_filter,
+                          const h3_gpu_tensor *downsample_filter,
+                          uint32_t batch, uint32_t length,
+                          uint32_t channels);
+int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input, uint32_t elements,
+                    float minimum, float maximum);
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */

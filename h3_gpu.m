@@ -47,6 +47,20 @@
 @implementation H3Linear
 @end
 
+@interface H3Conv : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *weight;
+@property(nonatomic, strong) MPSGraphTensor *bias;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *weightShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *biasShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+@end
+@implementation H3Conv
+@end
+
 @interface H3GPU : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -55,6 +69,7 @@
 @property(nonatomic, strong) NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3SDPA *> *sdpaCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic) h3_gpu_stats stats;
 @end
@@ -190,6 +205,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.queue = [gpu.device newCommandQueue];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
         gpu.linearCache = [NSMutableDictionary dictionary];
+        gpu.convCache = [NSMutableDictionary dictionary];
         if (!gpu.device || !gpu.queue) {
             if (error && error_size) snprintf(error, error_size, "cannot initialize Metal");
             return NULL;
@@ -233,7 +249,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_qkv_rope_bf16", @"h3_swiglu_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16"
+            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16",
+            @"h3_weight_norm_f32", @"h3_add_scaled_f32",
+            @"h3_alias_free_snake_f32", @"h3_clip_f32"
         ];
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -490,6 +508,11 @@ typedef struct {
     uint32_t sequence, heads, head_dim, rope_half, grouped;
     float epsilon;
 } qkv_args;
+typedef struct { uint32_t outer, inner; } weight_norm_args;
+typedef struct { uint32_t elements; float left_scale, right_scale; }
+    add_scaled_args;
+typedef struct { uint32_t batch, length, channels; } audio_activation_args;
+typedef struct { uint32_t elements; float minimum, maximum; } clip_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
 typedef struct {
@@ -960,6 +983,282 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
             [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:4];
             [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:5];
             [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+static H3Conv *h3_gpu_conv_graph(H3GPU *gpu, uint32_t batch,
+                                 uint32_t length, uint32_t input_channels,
+                                 uint32_t output_channels, uint32_t kernel,
+                                 uint32_t stride, uint32_t padding,
+                                 uint32_t dilation, uint32_t output_length,
+                                 int transpose, int has_bias) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:
+            @"%d:%u:%u:%u:%u:%u:%u:%u:%u:%d", transpose, batch, length,
+            input_channels, output_channels, kernel, stride, padding,
+            dilation, has_bias];
+        H3Conv *cached = gpu.convCache[key];
+        if (cached) return cached;
+
+        H3Conv *conv = [[H3Conv alloc] init];
+        conv.graph = [[MPSGraph alloc] init];
+        conv.inputShape = @[@(batch), @1, @(length), @(input_channels)];
+        conv.weightShape = transpose ?
+            @[@(input_channels), @(output_channels), @1, @(kernel)] :
+            @[@(output_channels), @(input_channels), @1, @(kernel)];
+        conv.biasShape = @[@1, @1, @1, @(output_channels)];
+        conv.outputShape = @[@(batch), @1, @(output_length),
+                             @(output_channels)];
+        conv.input = [conv.graph placeholderWithShape:conv.inputShape
+                                              dataType:MPSDataTypeFloat32
+                                                  name:nil];
+        conv.weight = [conv.graph placeholderWithShape:conv.weightShape
+                                               dataType:MPSDataTypeFloat32
+                                                   name:nil];
+        MPSGraphConvolution2DOpDescriptor *descriptor =
+            [MPSGraphConvolution2DOpDescriptor
+                descriptorWithStrideInX:stride strideInY:1
+                dilationRateInX:dilation dilationRateInY:1 groups:1
+                paddingLeft:padding paddingRight:padding
+                paddingTop:0 paddingBottom:0
+                paddingStyle:MPSGraphPaddingStyleExplicit
+                dataLayout:MPSGraphTensorNamedDataLayoutNHWC
+                weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+        MPSGraphTensor *result = transpose ?
+            [conv.graph convolutionTranspose2DWithSourceTensor:conv.input
+                 weightsTensor:conv.weight outputShape:conv.outputShape
+                 descriptor:descriptor name:nil] :
+            [conv.graph convolution2DWithSourceTensor:conv.input
+                 weightsTensor:conv.weight descriptor:descriptor name:nil];
+        if (has_bias) {
+            conv.bias = [conv.graph placeholderWithShape:conv.biasShape
+                                                dataType:MPSDataTypeFloat32
+                                                    name:nil];
+            result = [conv.graph additionWithPrimaryTensor:result
+                                           secondaryTensor:conv.bias name:nil];
+        }
+        conv.output = result;
+        gpu.convCache[key] = conv;
+        return conv;
+    }
+}
+
+static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *bias, uint32_t batch,
+                           uint32_t length, uint32_t input_channels,
+                           uint32_t output_channels, uint32_t kernel,
+                           uint32_t stride, uint32_t padding,
+                           uint32_t dilation, uint32_t output_length,
+                           int transpose) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Conv *conv = h3_gpu_conv_graph(
+        gpu, batch, length, input_channels, output_channels, kernel, stride,
+        padding, dilation, output_length, transpose, bias != NULL);
+    if (!conv) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command =
+            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
+            dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *weight_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(weight).buffer shape:conv.weightShape
+            dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *output_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(output).buffer shape:conv.outputShape
+            dataType:MPSDataTypeFloat32];
+        NSMutableDictionary *feeds = [@{conv.input: input_data,
+                                         conv.weight: weight_data} mutableCopy];
+        if (bias) {
+            MPSGraphTensorData *bias_data = [[MPSGraphTensorData alloc]
+                initWithMTLBuffer:TENSOR(bias).buffer shape:conv.biasShape
+                dataType:MPSDataTypeFloat32];
+            feeds[conv.bias] = bias_data;
+        }
+        NSDictionary *results = @{conv.output: output_data};
+        @try {
+            [conv.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph Conv1d failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_conv_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_conv1d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t padding, uint32_t dilation) {
+    H3GPU *gpu = GPU(opaque);
+    uint64_t effective = (uint64_t)dilation * (kernel - 1) + 1;
+    if (!batch || !length || !input_channels || !output_channels || !kernel ||
+        !dilation || (uint64_t)length + 2 * padding < effective) return 0;
+    uint32_t output_length = (uint32_t)((uint64_t)length + 2 * padding -
+                                        effective + 1);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)output_channels * input_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (!h3_gpu_require_elements(gpu, input, input_count, @"Conv1d input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count, @"Conv1d weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count, @"Conv1d output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_channels,
+                                           @"Conv1d bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32))) return 0;
+    return h3_gpu_conv_mps(gpu, output, input, weight, bias, batch, length,
+        input_channels, output_channels, kernel, 1, padding, dilation,
+        output_length, 0);
+}
+
+int h3_gpu_conv_transpose1d_f32(
+                      h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t stride, uint32_t padding) {
+    H3GPU *gpu = GPU(opaque);
+    if (!batch || !length || !input_channels || !output_channels || !kernel ||
+        !stride || (uint64_t)(length - 1) * stride + kernel < 2 * padding)
+        return 0;
+    uint32_t output_length = (uint32_t)((uint64_t)(length - 1) * stride +
+                                        kernel - 2 * padding);
+    size_t input_count = (size_t)batch * length * input_channels;
+    size_t weight_count = (size_t)input_channels * output_channels * kernel;
+    size_t output_count = (size_t)batch * output_length * output_channels;
+    if (!h3_gpu_require_elements(gpu, input, input_count,
+                                 @"ConvTranspose1d input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count,
+                                 @"ConvTranspose1d weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count,
+                                 @"ConvTranspose1d output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_channels,
+                                           @"ConvTranspose1d bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32))) return 0;
+    return h3_gpu_conv_mps(gpu, output, input, weight, bias, batch, length,
+        input_channels, output_channels, kernel, stride, padding, 1,
+        output_length, 1);
+}
+
+int h3_gpu_weight_norm_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *vector,
+                           const h3_gpu_tensor *magnitude,
+                           uint32_t outer, uint32_t inner) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)outer * inner;
+    if (!outer || !inner ||
+        !h3_gpu_require_elements(gpu, vector, count, @"weight-norm vector") ||
+        TENSOR(vector).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, magnitude, outer,
+                                 @"weight-norm magnitude") ||
+        TENSOR(magnitude).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"weight-norm output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    weight_norm_args args = {outer, inner};
+    return h3_gpu_dispatch_1d(gpu, @"h3_weight_norm_f32", outer,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(vector).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(magnitude).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_add_scaled_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left,
+                          const h3_gpu_tensor *right, float left_scale,
+                          float right_scale, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, left, elements, @"scaled-add left") ||
+        TENSOR(left).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, right, elements, @"scaled-add right") ||
+        TENSOR(right).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, elements, @"scaled-add output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    add_scaled_args args = {elements, left_scale, right_scale};
+    return h3_gpu_dispatch_1d(gpu, @"h3_add_scaled_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(left).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_alias_free_snake_f32(
+                          h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *alpha_log,
+                          const h3_gpu_tensor *beta_log,
+                          const h3_gpu_tensor *upsample_filter,
+                          const h3_gpu_tensor *downsample_filter,
+                          uint32_t batch, uint32_t length,
+                          uint32_t channels) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)batch * length * channels;
+    if (!batch || !length || !channels ||
+        !h3_gpu_require_elements(gpu, input, count, @"Snake input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"Snake output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, alpha_log, channels, @"Snake alpha") ||
+        TENSOR(alpha_log).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, beta_log, channels, @"Snake beta") ||
+        TENSOR(beta_log).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, upsample_filter, 12,
+                                 @"Snake upsample filter") ||
+        TENSOR(upsample_filter).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, downsample_filter, 12,
+                                 @"Snake downsample filter") ||
+        TENSOR(downsample_filter).dtype != H3_GPU_F32) return 0;
+    audio_activation_args args = {batch, length, channels};
+    return h3_gpu_dispatch_3d(gpu, @"h3_alias_free_snake_f32",
+        MTLSizeMake(channels, length, batch),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(alpha_log).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(beta_log).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(upsample_filter).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(downsample_filter).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+int h3_gpu_clip_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input, uint32_t elements,
+                    float minimum, float maximum) {
+    H3GPU *gpu = GPU(opaque);
+    if (!(minimum <= maximum) ||
+        !h3_gpu_require_elements(gpu, input, elements, @"clip input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, elements, @"clip output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    clip_args args = {elements, minimum, maximum};
+    return h3_gpu_dispatch_1d(gpu, @"h3_clip_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }
 

@@ -1,6 +1,6 @@
 CC := clang
 AR := ar
-CFLAGS := -std=c11 -O3 -Wall -Wextra -Wpedantic -Wshadow \
+CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
@@ -39,6 +39,9 @@ h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -60,7 +63,8 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests
+test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+	h3_audio_gpu_tests
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
@@ -79,6 +83,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests
 	else \
 		echo "skip: MLX Qwen fixture is not installed"; \
 	fi
+	./h3_audio_gpu_tests
 
 parity: h3_metal_tests h3_bf16_tests h3_text_tests
 	./h3_metal_tests misc/fixtures/h3_dit.safetensors
@@ -98,9 +103,12 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
+-include $(wildcard *.d tests/*.d)
+
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
+		h3_audio_gpu_tests \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-		libh3.a *.o tests/*.o
+		libh3.a *.o *.d tests/*.o tests/*.d
