@@ -669,6 +669,7 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
@@ -690,6 +691,7 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "cannot write persistent DiT condition rows");
         goto failed;
     }
+    h3_gpu_profile_mark(dit->gpu, "load");
     return dit;
 failed:
     h3_dit_free(dit);
@@ -1007,6 +1009,7 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     free(video_velocity); free(audio_velocity); free(video_denoised);
     free(audio_denoised); free(old_video); free(old_audio);
     free(video_next); free(audio_next);
+    h3_gpu_profile_mark(dit->gpu, "RES denoise");
     return ok;
 }
 
@@ -1051,6 +1054,7 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
     }
     free(video_velocity);
     free(audio_velocity);
+    h3_gpu_profile_mark(dit->gpu, "Euler denoise");
     return ok;
 }
 

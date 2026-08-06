@@ -13,12 +13,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+@class H3GPU;
 @interface H3Tensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
 @property(nonatomic) size_t elements;
+@property(nonatomic) size_t bytes;
 @property(nonatomic) h3_gpu_dtype dtype;
+@property(nonatomic, weak) H3GPU *owner;
 @end
 @implementation H3Tensor
 @end
@@ -86,6 +90,12 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic) h3_gpu_stats stats;
+@property(nonatomic, copy) NSString *profileLabel;
+@property(nonatomic) h3_gpu_stats profileStartStats;
+@property(nonatomic) h3_gpu_stats profileMarkStats;
+@property(nonatomic) double profileStartWall;
+@property(nonatomic) double profileMarkWall;
+@property(nonatomic) double commandStartWall;
 @end
 @implementation H3GPU
 @end
@@ -96,6 +106,52 @@ static H3GPU *GPU(h3_gpu *gpu) {
 
 static H3Tensor *TENSOR(const h3_gpu_tensor *tensor) {
     return (__bridge H3Tensor *)(void *)tensor;
+}
+
+static double h3_gpu_now(void) {
+    struct timespec time;
+    if (clock_gettime(CLOCK_MONOTONIC, &time) != 0) return 0.0;
+    return (double)time.tv_sec + (double)time.tv_nsec * 1e-9;
+}
+
+static int h3_gpu_profile_enabled(void) {
+    const char *value = getenv("H3_PROFILE");
+    return value && *value && strcmp(value, "0");
+}
+
+static uint64_t h3_gpu_counter_delta(uint64_t value, uint64_t start) {
+    return value >= start ? value - start : 0;
+}
+
+static void h3_gpu_profile_emit(H3GPU *gpu, NSString *phase,
+                                h3_gpu_stats start, double wall_start) {
+    if (!h3_gpu_profile_enabled()) return;
+    h3_gpu_stats value = gpu.stats;
+    double wall = h3_gpu_now() - wall_start;
+    NSString *label = gpu.profileLabel ? gpu.profileLabel : @"Metal context";
+    fprintf(stderr,
+        "h3 profile: %-24s %-14s wall=%8.3fs encode=%7.3fs "
+        "wait=%8.3fs root-gpu=%7.3fs "
+        "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
+        "direct=%llu linear=%llu conv=%llu attention=%llu\n",
+        label.UTF8String, phase.UTF8String, wall,
+        value.command_encode_seconds - start.command_encode_seconds,
+        value.command_wait_seconds - start.command_wait_seconds,
+        value.gpu_seconds - start.gpu_seconds,
+        (double)value.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
+        (double)h3_gpu_counter_delta(value.allocated_bytes,
+                                     start.allocated_bytes) /
+            (1024.0 * 1024.0 * 1024.0),
+        (unsigned long long)h3_gpu_counter_delta(value.submissions,
+                                                 start.submissions),
+        (unsigned long long)h3_gpu_counter_delta(value.direct_dispatches,
+                                                 start.direct_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.mps_linear_dispatches,
+                                                 start.mps_linear_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.mps_conv_dispatches,
+                                                 start.mps_conv_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.mps_sdpa_dispatches,
+                                                 start.mps_sdpa_dispatches));
 }
 
 static void h3_gpu_set_error(H3GPU *gpu, NSString *format, ...) {
@@ -215,6 +271,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size) {
     @autoreleasepool {
         H3GPU *gpu = [[H3GPU alloc] init];
+        gpu.profileLabel = @"Metal context";
+        gpu.profileStartWall = h3_gpu_now();
+        gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
@@ -300,6 +359,8 @@ void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
     @autoreleasepool {
         H3GPU *object = CFBridgingRelease(gpu);
+        h3_gpu_profile_emit(object, @"total", object.profileStartStats,
+                            object.profileStartWall);
         id<MTLDevice> device = object.device;
         NSUInteger before = device.currentAllocatedSize;
         object.command = nil;
@@ -325,6 +386,7 @@ static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
     size_t bytes = elements * item_size;
     H3Tensor *tensor = [[H3Tensor alloc] init];
     tensor.elements = elements;
+    tensor.bytes = bytes;
     tensor.dtype = dtype;
     tensor.buffer = [gpu.device newBufferWithLength:MAX(bytes, (size_t)1)
                                             options:MTLResourceStorageModeShared];
@@ -332,9 +394,13 @@ static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
         h3_gpu_set_error(gpu, @"cannot allocate %zu-byte Metal buffer", bytes);
         return NULL;
     }
+    tensor.owner = gpu;
     if (values && bytes) memcpy(tensor.buffer.contents, values, bytes);
     h3_gpu_stats stats = gpu.stats;
     stats.allocated_bytes += bytes;
+    stats.live_bytes += bytes;
+    if (stats.live_bytes > stats.peak_live_bytes)
+        stats.peak_live_bytes = stats.live_bytes;
     stats.tensor_allocations++;
     gpu.stats = stats;
     return (__bridge_retained h3_gpu_tensor *)tensor;
@@ -424,6 +490,13 @@ void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
     if (!tensor) return;
     @autoreleasepool {
         H3Tensor *object = CFBridgingRelease(tensor);
+        H3GPU *owner = object.owner;
+        if (owner) {
+            h3_gpu_stats stats = owner.stats;
+            stats.live_bytes = stats.live_bytes >= object.bytes ?
+                stats.live_bytes - object.bytes : 0;
+            owner.stats = stats;
+        }
         [object.buffer setPurgeableState:MTLPurgeableStateEmpty];
         object.buffer = nil;
     }
@@ -498,6 +571,7 @@ int h3_gpu_begin(h3_gpu *opaque) {
         h3_gpu_set_error(gpu, @"cannot create Metal command buffer");
         return 0;
     }
+    gpu.commandStartWall = h3_gpu_now();
     return 1;
 }
 
@@ -507,8 +581,10 @@ int h3_gpu_submit(h3_gpu *opaque) {
     @autoreleasepool {
         id<MTLCommandBuffer> command = gpu.command;
         gpu.command = nil;
+        double commit_time = h3_gpu_now();
         [command commit];
         [command waitUntilCompleted];
+        double complete_time = h3_gpu_now();
         if (command.status == MTLCommandBufferStatusError) {
             h3_gpu_set_error(gpu, @"Metal command failed: %@",
                              command.error.localizedDescription);
@@ -516,6 +592,8 @@ int h3_gpu_submit(h3_gpu *opaque) {
         }
         h3_gpu_stats stats = gpu.stats;
         stats.submissions++;
+        stats.command_encode_seconds += commit_time - gpu.commandStartWall;
+        stats.command_wait_seconds += complete_time - commit_time;
         if (command.GPUEndTime >= command.GPUStartTime) {
             stats.gpu_seconds += command.GPUEndTime - command.GPUStartTime;
         }
@@ -534,6 +612,21 @@ int h3_gpu_get_stats(const h3_gpu *opaque, h3_gpu_stats *stats) {
     if (!opaque || !stats) return 0;
     *stats = GPU((h3_gpu *)(void *)opaque).stats;
     return 1;
+}
+
+void h3_gpu_profile_set_label(h3_gpu *opaque, const char *label) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !label || !*label) return;
+    gpu.profileLabel = [NSString stringWithUTF8String:label];
+}
+
+void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !phase || !*phase || !h3_gpu_profile_enabled()) return;
+    h3_gpu_profile_emit(gpu, [NSString stringWithUTF8String:phase],
+                        gpu.profileMarkStats, gpu.profileMarkWall);
+    gpu.profileMarkStats = gpu.stats;
+    gpu.profileMarkWall = h3_gpu_now();
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
@@ -1758,8 +1851,8 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
         NSDictionary *results = @{linear.output: output_data};
         @try {
             [linear.graph encodeToCommandBuffer:command feeds:feeds
-                               targetOperations:nil resultsDictionary:results
-                            executionDescriptor:nil];
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph linear failed: %@", exception.reason);
             return 0;

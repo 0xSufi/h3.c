@@ -767,6 +767,8 @@ int h3_video_vae_encode(const char *weight_directory,
     encoder_context encoder = {0};
     encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (encoder.gpu)
+        h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
+    if (encoder.gpu)
         encoder.store = h3_weight_store_open(weight_directory, error, error_size);
     ok = encoder.gpu && encoder.store &&
          load_normalization(&encoder, weight_directory, error, error_size) &&

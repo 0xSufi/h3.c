@@ -34,6 +34,9 @@ make test
   --width 512 --height 512 --frames 56 \
   --ref-video-audio silent-fox.mp4 replacement.wav \
   -o outputs/fox-replaced-audio-reference.mp4
+./h3 --profile -d MiniMax-H3 -p "A fox walks through snow" \
+  --width 512 --height 512 --frames 22 --steps 20 \
+  -o outputs/profile.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -79,9 +82,10 @@ VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
 `<Video N>` presentation. `--ref-video` preserves an embedded soundtrack,
 `--ref-video-audio VIDEO AUDIO` supplies an explicit replacement, and
 `--ref-audio` appends an ordered standalone clip. Reference audio is decoded as
-32 kHz stereo F32, encoded by the native AudioVAE posterior-mean path, augmented
-at condition timestep 0.999, and packed as width-32 rows on the same rotary
-timeline as visual references. Audio inputs are 2-15 seconds, at most three are
+32 kHz stereo F32, encoded by the native AudioVAE posterior-mean path, mixed as
+0.999 clean latent plus 0.001 seeded noise, pinned to the audio condition
+timestep 1.0, and packed as width-32 rows on the same rotary timeline as visual
+references. Audio inputs are 2-15 seconds, at most three are
 accepted, their total decoded duration is capped at 15 seconds, and a standalone
 audio reference must be combined with an image or video reference.
 
@@ -92,6 +96,13 @@ PyTorch/SGLang path folds intact stereo channels into the batch dimension. On
 the 128 GB M5 Max, clean end-to-end image+audio and embedded-video+audio renders
 completed in 74.58 and 76.99 seconds respectively, each with about a 40.1 GB
 peak physical footprint and zero swaps.
+
+`--profile` reports each Metal-backed phase separately: wall time, CPU-side
+command encoding, complete commit-to-fence wait, root-command GPU timestamps,
+peak live tensor storage, cumulative allocation, and dispatch counts. The wait
+measurement is the complete command turnaround; the root GPU timestamp alone
+can omit child buffers scheduled internally by MPSGraph and is labeled
+accordingly.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

@@ -457,6 +457,7 @@ int h3_vision_encode_bf16(const char *weight_directory,
         h3_weight_store_free(weights);
         return 0;
     }
+    h3_gpu_profile_set_label(gpu, "Qwen vision encoder");
 
     size_t patch_elements = (size_t)rows * PATCH_DIM;
     size_t hidden_elements = (size_t)rows * VISION_HIDDEN;

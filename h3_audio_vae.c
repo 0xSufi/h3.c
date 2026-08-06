@@ -678,6 +678,7 @@ int h3_audio_vae_decode(const char *weight_directory,
                                    error, error_size)) return 0;
     audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!audio.gpu) return 0;
+    h3_gpu_profile_set_label(audio.gpu, "audio VAE decoder");
     audio.weights = h3_weight_store_open(weight_directory, error, error_size);
     int ok = audio.weights && load_filters(&audio, error, error_size) &&
              prepare_input(&audio, normalized_latent, mean, deviation,
@@ -1291,6 +1292,7 @@ int h3_audio_vae_encode(const char *weight_directory,
                                    error, error_size)) return 0;
     audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!audio.gpu) return 0;
+    h3_gpu_profile_set_label(audio.gpu, "audio VAE encoder");
     audio.weights = h3_weight_store_open(weight_directory, error, error_size);
     int ok = audio.weights && encoder_initial(&audio, pcm, samples,
                                                error, error_size);

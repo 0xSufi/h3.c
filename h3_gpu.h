@@ -15,6 +15,8 @@ typedef enum {
 
 typedef struct {
     uint64_t allocated_bytes;
+    uint64_t live_bytes;
+    uint64_t peak_live_bytes;
     uint64_t tensor_allocations;
     uint64_t direct_dispatches;
     uint64_t mps_linear_dispatches;
@@ -22,6 +24,10 @@ typedef struct {
     uint64_t mps_sdpa_dispatches;
     uint64_t blit_copies;
     uint64_t submissions;
+    double command_encode_seconds;
+    double command_wait_seconds;
+    /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
+     * so command_wait_seconds is the complete turnaround measurement. */
     double gpu_seconds;
 } h3_gpu_stats;
 
@@ -64,6 +70,10 @@ int h3_gpu_begin(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
+/* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
+ * print wall time alongside command-buffer GPU time and allocation counters. */
+void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);
+void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase);
 
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,

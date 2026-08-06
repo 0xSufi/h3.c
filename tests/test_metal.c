@@ -306,6 +306,14 @@ int main(int argc, char **argv) {
     require(mlp_rel < 5e-3, "MLP exceeds MLX error bound");
     require(block_rel < 5e-3, "full block exceeds MLX error bound");
 
+    h3_gpu_stats stats;
+    require(h3_gpu_get_stats(test.gpu, &stats), "cannot read Metal statistics");
+    require(stats.allocated_bytes > 0, "Metal allocation counter stayed zero");
+    require(stats.live_bytes == stats.allocated_bytes,
+            "live Metal tensor bytes do not match retained allocations");
+    require(stats.peak_live_bytes == stats.live_bytes,
+            "peak Metal tensor bytes do not match retained allocations");
+
     cleanup(&test);
     puts("ok: Metal toy block matches MLX fixture without CPU round trips");
     return 0;
