@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
     static const int steps[] = {0, 3, 6, 9, 12, 15, 18};
     double forward_start = seconds();
     for (size_t index = 0; index < sizeof(steps) / sizeof(*steps); index++) {
+        double step_start = seconds();
         if (!h3_dit_forward(dit, steps[index], video, audio,
                             video_velocity, audio_velocity,
                             error, sizeof(error))) die(error);
@@ -93,6 +94,8 @@ int main(int argc, char **argv) {
             video[element] += video_velocity[element] * 0.001f;
         for (size_t element = 0; element < AUDIO_ELEMENTS; element++)
             audio[element] += audio_velocity[element] * 0.001f;
+        printf("  core %zu step %d %.3fs\n", index + 1, steps[index],
+               seconds() - step_start);
     }
     double forward_seconds = seconds() - forward_start;
     printf("DiT 512 load %.3fs, seven forwards %.3fs, combined %.3fs\n",
