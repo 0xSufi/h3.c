@@ -8,6 +8,7 @@ outputs/
 h3
 h3_*test
 h3_*tests
+h3_*bench
 h3_tests
 h3_metal_tests
 h3_bf16_tests

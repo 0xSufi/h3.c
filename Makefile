@@ -79,6 +79,9 @@ h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
 h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
