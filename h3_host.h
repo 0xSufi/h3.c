@@ -94,6 +94,7 @@ typedef struct {
 
 int h3_align_frame_count(int requested);
 int h3_video_latent_t(int frame_count);
+int h3_video_encoder_latent_t(int frame_count);
 h3_temporal_shape h3_temporal(int requested_frames);
 void h3_latent_canvas(int width, int height, int *latent_w, int *latent_h);
 int h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h);
@@ -102,6 +103,10 @@ int h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h);
 int h3_reference_image_canvas(int width, int height,
                               int target_width, int target_height,
                               int max_short_edge,
+                              int *adapted_w, int *adapted_h);
+/* Ref2VA video references use the normal target-style canvas, except that a
+ * smaller source is never enlarged. */
+int h3_reference_video_canvas(int width, int height,
                               int *adapted_w, int *adapted_h);
 
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);

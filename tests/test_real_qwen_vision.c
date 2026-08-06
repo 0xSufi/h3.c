@@ -78,13 +78,15 @@ int main(int argc, char **argv) {
         die(error);
     const h3_st_tensor *pixel_tensor = h3_st_find(&fixture, "x.pixels");
     if (!pixel_tensor || pixel_tensor->dtype != H3_DTYPE_F32 ||
-        pixel_tensor->ndim != 4 || pixel_tensor->shape[0] != 1 ||
+        pixel_tensor->ndim != 4 ||
+        (pixel_tensor->shape[0] != 1 && pixel_tensor->shape[0] != 2) ||
         pixel_tensor->shape[1] != 3 || pixel_tensor->shape[2] < 32 ||
         pixel_tensor->shape[3] < 32 || pixel_tensor->shape[2] > INT32_MAX ||
         pixel_tensor->shape[3] > INT32_MAX)
         die("fixture pixels are absent or malformed");
     int height = (int)pixel_tensor->shape[2];
     int width = (int)pixel_tensor->shape[3];
+    int frames = (int)pixel_tensor->shape[0];
     size_t pixel_count = h3_st_tensor_elements(pixel_tensor);
     size_t tokens = (size_t)(height / 32) * (size_t)(width / 32);
     float *pixels = malloc(pixel_count * sizeof(*pixels));
@@ -96,7 +98,7 @@ int main(int argc, char **argv) {
     snprintf(weights, sizeof(weights), "%s/FL2VA/text_encoder", model_root);
     h3_vision_output output;
     if (!h3_vision_encode_bf16(weights, "h3_shaders.metal", pixels,
-                                1, height, width, progress, NULL, &output,
+                                frames, height, width, progress, NULL, &output,
                                 error, sizeof(error))) die(error);
     if (output.grid_h != height / 16 || output.grid_w != width / 16 ||
         output.tokens != tokens)

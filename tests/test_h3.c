@@ -36,6 +36,10 @@ static void test_temporal_and_canvas(void) {
         CHECK(got.video_t == cases[index].video_t);
         CHECK(got.audio_t == cases[index].audio_t);
     }
+    CHECK(h3_video_encoder_latent_t(1) == 1);
+    CHECK(h3_video_encoder_latent_t(5) == 2);
+    CHECK(h3_video_encoder_latent_t(22) == 6);
+    CHECK(h3_video_encoder_latent_t(39) == 10);
     int width, height;
     CHECK(h3_adapt_canvas(1920, 1080, &width, &height));
     CHECK(width == 1344 && height == 768);
@@ -56,6 +60,11 @@ static void test_temporal_and_canvas(void) {
     CHECK(width == 3872 && height == 2048);
     CHECK(!h3_reference_image_canvas(0, 480, 512, 512, 0,
                                      &width, &height));
+    CHECK(h3_reference_video_canvas(1920, 1080, &width, &height));
+    CHECK(width == 1344 && height == 768);
+    CHECK(h3_reference_video_canvas(640, 360, &width, &height));
+    CHECK(width == 640 && height == 352);
+    CHECK(!h3_reference_video_canvas(0, 360, &width, &height));
 }
 
 static void test_schedule(void) {

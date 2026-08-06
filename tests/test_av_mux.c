@@ -67,6 +67,20 @@ int main(int argc, char **argv) {
                                   H3_IMAGE_FIT_COVER, &decoded,
                                   error, sizeof(error))) die(error);
     free(decoded);
+    decoded = NULL;
+    int decoded_frames = 0;
+    if (!h3_ffmpeg_read_video_f32(path, WIDTH, HEIGHT, FRAMES,
+                                  &decoded, &decoded_frames,
+                                  error, sizeof(error))) die(error);
+    if (decoded_frames != 5)
+        die("FFmpeg video input did not align to 5+17k frames");
+    size_t decoded_values = (size_t)3 * decoded_frames * WIDTH * HEIGHT;
+    for (size_t index = 0; index < decoded_values; index++) {
+        if (!isfinite(decoded[index]) || decoded[index] < 0.0f ||
+            decoded[index] > 1.0f)
+            die("decoded FFmpeg video contains invalid pixels");
+    }
+    free(decoded);
     printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
            path, (long long)status.st_size);
     free(rgb);

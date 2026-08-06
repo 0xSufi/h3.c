@@ -20,6 +20,12 @@ int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
                              h3_image_fit fit, float **pixels,
                              char *error, size_t error_size);
 
+/* Decode a 24 fps visual stream to channel-major F32 [3,T,H,W] in [0,1].
+ * The returned frame count is trimmed down to the released 5+17k cadence. */
+int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
+                             int max_frames, float **pixels, int *frames,
+                             char *error, size_t error_size);
+
 int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
                           int frame_count, int width, int height, int fps,
                           char *error, size_t error_size);

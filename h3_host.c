@@ -23,6 +23,10 @@ int h3_video_latent_t(int frame_count) {
     return ((frame_count - 5) / 17) * 5 + 2;
 }
 
+int h3_video_encoder_latent_t(int frame_count) {
+    return frame_count > 0 ? (frame_count + 3) / 4 : 0;
+}
+
 h3_temporal_shape h3_temporal(int requested_frames) {
     h3_temporal_shape result;
     result.frame_count = h3_align_frame_count(requested_frames);
@@ -88,6 +92,23 @@ int h3_reference_image_canvas(int width, int height,
     if (out_w > INT_MAX || out_h > INT_MAX) return 0;
     *adapted_w = (int)out_w;
     *adapted_h = (int)out_h;
+    return 1;
+}
+
+int h3_reference_video_canvas(int width, int height,
+                              int *adapted_w, int *adapted_h) {
+    if (width < 1 || height < 1 || !adapted_w || !adapted_h ||
+        !h3_adapt_canvas(width, height, adapted_w, adapted_h)) return 0;
+    double source_area = (double)width * (double)height;
+    double target_area = (double)*adapted_w * (double)*adapted_h;
+    if (source_area < target_area) {
+        int out_w = (int)(nearbyint((double)width / H3_CANVAS_MULTIPLE) *
+                          H3_CANVAS_MULTIPLE);
+        int out_h = (int)(nearbyint((double)height / H3_CANVAS_MULTIPLE) *
+                          H3_CANVAS_MULTIPLE);
+        *adapted_w = out_w < H3_CANVAS_MULTIPLE ? H3_CANVAS_MULTIPLE : out_w;
+        *adapted_h = out_h < H3_CANVAS_MULTIPLE ? H3_CANVAS_MULTIPLE : out_h;
+    }
     return 1;
 }
 

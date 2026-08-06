@@ -58,6 +58,9 @@ h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 h3_real_multimodal_text_test: tests/test_real_multimodal_text.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ref_video_text_test: tests/test_real_ref_video_text.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -82,7 +85,7 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -120,17 +123,37 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	else \
 		echo "skip: released visual encoder weights/fixture are not installed"; \
 	fi
+	@if test -f MiniMax-H3/Ref2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_real_video_encoder_video_22x64.safetensors; then \
+		./h3_real_video_encoder_test MiniMax-H3 \
+			misc/fixtures/h3_real_video_encoder_video_22x64.safetensors; \
+	else \
+		echo "skip: released reference-video encoder fixture is not installed"; \
+	fi
 	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00014-of-00014.safetensors && \
 	         test -f misc/fixtures/h3_real_qwen_vision_64.safetensors; then \
 		./h3_real_qwen_vision_test; \
 	else \
 		echo "skip: released Qwen vision weights/fixture are not installed"; \
 	fi
+	@if test -f MiniMax-H3/Ref2VA/text_encoder/model-00014-of-00014.safetensors && \
+	         test -f misc/fixtures/h3_real_qwen_vision_video2x64.safetensors; then \
+		./h3_real_qwen_vision_test MiniMax-H3 \
+			misc/fixtures/h3_real_qwen_vision_video2x64.safetensors; \
+	else \
+		echo "skip: released Qwen video-pair fixture is not installed"; \
+	fi
 	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00001-of-00014.safetensors && \
 	         test -f misc/fixtures/h3_real_multimodal_text_64.safetensors; then \
 		./h3_real_multimodal_text_test; \
 	else \
 		echo "skip: released multimodal Qwen weights/fixture are not installed"; \
+	fi
+	@if test -f MiniMax-H3/Ref2VA/text_encoder/model-00001-of-00014.safetensors && \
+	         test -f misc/fixtures/h3_real_ref_video_text_64.safetensors; then \
+		./h3_real_ref_video_text_test; \
+	else \
+		echo "skip: Ref2VA video presentation fixture is not installed"; \
 	fi
 
 parity: h3_metal_tests h3_bf16_tests h3_text_tests
@@ -158,7 +181,7 @@ clean:
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
-		h3_real_multimodal_text_test \
+		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 		libh3.a *.o *.d tests/*.o tests/*.d

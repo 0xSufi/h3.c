@@ -22,4 +22,33 @@ int h3_multimodal_encode_fl2va_bf16(
                         h3_text_embedding *output,
                         char *error, size_t error_size);
 
+typedef enum {
+    H3_PRESENTATION_IMAGE = 1,
+    H3_PRESENTATION_VIDEO = 2,
+    H3_PRESENTATION_AUDIO = 3
+} h3_presentation_kind;
+
+/* A video owns one Qwen vision output per sampled two-frame block and one
+ * timestamp per block. Images own exactly one output; audio owns none. */
+typedef struct {
+    h3_presentation_kind kind;
+    int has_audio;
+    const h3_vision_output *vision;
+    size_t vision_count;
+    const double *timestamps;
+} h3_reference_presentation;
+
+/* Construct Ref2VA labels in exact request order, including pending audio
+ * labels and per-block video timestamps, then run the Qwen decoder. */
+int h3_multimodal_encode_ref2va_bf16(
+                        const h3_tokenizer *tokenizer,
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const char *prompt,
+                        const h3_reference_presentation *references,
+                        size_t reference_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
 #endif

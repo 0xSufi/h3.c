@@ -5,8 +5,8 @@ sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
 first/last-frame conditioning and then ordered references.
 
-Current milestone: M8 Ref2VA ordered image references are working; ordered
-video/audio references and H3-specific performance work follow incrementally.
+Current milestone: M8 Ref2VA ordered image and silent-video references are
+working; reference audio and H3-specific performance work follow incrementally.
 
 ```sh
 make
@@ -20,6 +20,9 @@ make test
 ./h3 -d MiniMax-H3 -p "Use the animal and setting in the reference" \
   --width 512 --height 512 --frames 22 --ref-image fox.png \
   -o outputs/fox-reference.mp4
+./h3 -d MiniMax-H3 -p "Continue the motion in this clip" \
+  --width 512 --height 512 --frames 22 --ref-silent-video fox.mp4 \
+  -o outputs/fox-video-reference.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -60,7 +63,10 @@ first image is stretched to the target canvas; the last image is aspect-cover
 scaled and center cropped, matching the reference implementation. `--ref-image`
 selects the distinct Ref2VA transformer, preserves ordered `<Picture N>`
 presentation, and uses the released down-only aspect-preserving reference canvas.
-Ordered video and audio preparation remain the active incremental work.
+`--ref-silent-video` additionally performs bounded 24 fps decoding, the visual
+VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
+`<Video N>` presentation. Embedded, explicit, and standalone reference audio
+remain the active incremental work.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

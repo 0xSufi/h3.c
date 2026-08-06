@@ -1,4 +1,5 @@
 #include "h3_safetensors.h"
+#include "h3_host.h"
 #include "h3_video_encoder.h"
 
 #include <math.h>
@@ -33,16 +34,21 @@ int main(int argc, char **argv) {
     const h3_st_tensor *pixel_tensor = h3_st_find(&fixture, "x.pixels");
     const h3_st_tensor *latent_tensor = h3_st_find(&fixture, "x.latent");
     if (!pixel_tensor || pixel_tensor->dtype != H3_DTYPE_F32 ||
-        pixel_tensor->ndim != 4 || pixel_tensor->shape[0] != 1 ||
+        (pixel_tensor->ndim != 4 && pixel_tensor->ndim != 5) ||
+        pixel_tensor->shape[0] != 1 ||
         pixel_tensor->shape[1] != 3 || !latent_tensor ||
         latent_tensor->dtype != H3_DTYPE_F32 || latent_tensor->ndim != 5 ||
         latent_tensor->shape[0] != 1 || latent_tensor->shape[1] != 24 ||
-        latent_tensor->shape[2] != 1 ||
-        latent_tensor->shape[3] * 16 != pixel_tensor->shape[2] ||
-        latent_tensor->shape[4] * 16 != pixel_tensor->shape[3])
+        latent_tensor->shape[3] * 16 !=
+            pixel_tensor->shape[pixel_tensor->ndim - 2] ||
+        latent_tensor->shape[4] * 16 !=
+            pixel_tensor->shape[pixel_tensor->ndim - 1])
         die("malformed visual encoder fixture");
-    int height = (int)pixel_tensor->shape[2];
-    int width = (int)pixel_tensor->shape[3];
+    int frames = pixel_tensor->ndim == 5 ? (int)pixel_tensor->shape[2] : 1;
+    int height = (int)pixel_tensor->shape[pixel_tensor->ndim - 2];
+    int width = (int)pixel_tensor->shape[pixel_tensor->ndim - 1];
+    if (latent_tensor->shape[2] != (uint64_t)h3_video_encoder_latent_t(frames))
+        die("visual encoder fixture has unexpected temporal compression");
     size_t pixel_count = h3_st_tensor_elements(pixel_tensor);
     size_t latent_count = h3_st_tensor_elements(latent_tensor);
     float *pixels = malloc(pixel_count * sizeof(*pixels));
@@ -56,11 +62,13 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
     h3_video_latent got;
-    if (!h3_video_vae_encode(weights, "h3_shaders.metal", pixels, 1,
+    if (!h3_video_vae_encode(weights, "h3_shaders.metal", pixels, frames,
                              height, width,
                              progress, NULL, &got, error, sizeof(error)))
         die(error);
-    if (got.time != 1 || got.height != height / 16 || got.width != width / 16)
+    if (got.time != h3_video_encoder_latent_t(frames) ||
+        got.height != height / 16 ||
+        got.width != width / 16)
         die("native visual encoder returned the wrong shape");
     double maximum = 0.0, square_error = 0.0, square_value = 0.0;
     for (size_t index = 0; index < latent_count; index++) {
