@@ -115,6 +115,14 @@ library if TensorOps compilation is unavailable. The path passes the complete
 128-row tile while full DiT runs currently favor MPSGraph scheduling. This
 keeps a working NAX integration available for later quantized/fused kernels
 without making a benchmark regression the default.
+The narrow DiT audio/video output heads convert their small released F32
+weights to BF16 once and use the Iris-derived 16x16 tiled linear directly on
+BF16 activations. At the production 320-render geometry, isolated paired-head
+measurements are 2.30x faster on M3 Max and 1.83x faster on M5 Max, with
+relative L2 `8.64e-4`; the absolute M5 saving is about 0.6 ms per evaluated
+step. Full fox and surfer sequences remained clean and measured 29.9/38.4 dB
+against the F32-head renders. `H3_DIT_F32_FINAL=1` restores the close-reference
+head and its extra activation buffers.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

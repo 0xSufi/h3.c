@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
      * deliberately changes MLP operation boundaries and is covered by the
      * fused-operation check in test_bf16 plus semantic video validation. */
     setenv("H3_DISABLE_FUSED_MLP", "1", 1);
+    setenv("H3_DIT_F32_FINAL", "1", 1);
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *block_path = argc > 2 ? argv[2] :
         "misc/fixtures/h3_real_dit_block0_bf16.safetensors";
