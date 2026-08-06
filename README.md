@@ -88,6 +88,11 @@ explicit quality/speed tradeoff: a measured 384-to-512 prompt render reduced
 M5 DiT time by 33% and video-VAE time by 18% while retaining a clean,
 recognizable photorealistic result. Both values must be multiples of 32; the
 exact output canvas remains the default.
+For square 512 output, 384 is the fast-quality point and 320 is the validated
+aggressive point. The latter produced a coherent walking fox and repeated at
+8.02 seconds of DiT versus about 15.82 seconds natively. A 256 test softened
+the face and legs and was slightly slower overall than 320, so it is allowed
+but not recommended.
 The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
