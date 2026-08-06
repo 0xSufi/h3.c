@@ -3,4 +3,6 @@ MiniMax-H3/
 outputs/
 *.o
 h3
+h3_tests
 libh3.a
+.DS_Store
