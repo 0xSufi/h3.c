@@ -129,5 +129,44 @@ int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *fused, uint32_t rows,
                        uint32_t width);
+int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *token_ids, uint32_t tokens,
+                          uint32_t vocab_size, uint32_t width);
+int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu,
+                             h3_gpu_tensor *query_output,
+                             h3_gpu_tensor *key_output,
+                             const h3_gpu_tensor *query_input,
+                             const h3_gpu_tensor *key_input,
+                             const h3_gpu_tensor *q_norm,
+                             const h3_gpu_tensor *k_norm,
+                             const h3_gpu_tensor *rope_cos,
+                             const h3_gpu_tensor *rope_sin,
+                             uint32_t sequence, uint32_t query_heads,
+                             uint32_t kv_heads, uint32_t head_dim,
+                             float epsilon);
+int h3_gpu_head_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
+                              const h3_gpu_tensor *weight,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, float epsilon);
+int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                          h3_gpu_tensor *key,
+                          const h3_gpu_tensor *rope_cos_f32,
+                          const h3_gpu_tensor *rope_sin_f32,
+                          uint32_t sequence, uint32_t query_heads,
+                          uint32_t kv_heads, uint32_t head_dim);
+int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value,
+                           uint32_t sequence, uint32_t query_heads,
+                           uint32_t kv_heads, uint32_t head_dim,
+                           float scale);
+int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                    uint32_t elements);
+int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *gate,
+                         const h3_gpu_tensor *up, uint32_t elements);
 
 #endif

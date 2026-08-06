@@ -188,7 +188,10 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
-            @"h3_qkv_rope_bf16", @"h3_swiglu_bf16"
+            @"h3_qkv_rope_bf16", @"h3_swiglu_bf16",
+            @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
+            @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
+            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16"
         ];
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -344,6 +347,17 @@ typedef struct {
 typedef struct { uint32_t rows, width, slots, gate_slot; } gate_args;
 typedef struct { uint32_t sequence, heads, head_dim, rope_half; float epsilon; } qkv_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
+typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
+typedef struct {
+    uint32_t sequence, query_heads, kv_heads, head_dim;
+    float epsilon;
+} text_rope_args;
+typedef struct { uint32_t sequence, heads, head_dim; float epsilon; } head_norm_args;
+typedef struct { uint32_t sequence, query_heads, kv_heads, head_dim; } text_rope_inplace_args;
+typedef struct {
+    uint32_t sequence, query_heads, kv_heads, head_dim;
+    float scale;
+} gqa_args;
 
 int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
@@ -860,5 +874,193 @@ int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_embedding_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *token_ids, uint32_t tokens,
+                          uint32_t vocab_size, uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, weight, (size_t)vocab_size * width,
+                              @"embedding weight") ||
+        !h3_gpu_require_elements(gpu, token_ids, tokens, @"token IDs") ||
+        TENSOR(token_ids).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)tokens * width,
+                              @"embedding output")) return 0;
+    embedding_args args = {tokens, vocab_size, width};
+    return h3_gpu_dispatch_2d(gpu, @"h3_embedding_bf16", width, tokens,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(token_ids).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_text_qk_rope_bf16(h3_gpu *opaque,
+                             h3_gpu_tensor *query_output,
+                             h3_gpu_tensor *key_output,
+                             const h3_gpu_tensor *query_input,
+                             const h3_gpu_tensor *key_input,
+                             const h3_gpu_tensor *q_norm,
+                             const h3_gpu_tensor *k_norm,
+                             const h3_gpu_tensor *rope_cos,
+                             const h3_gpu_tensor *rope_sin,
+                             uint32_t sequence, uint32_t query_heads,
+                             uint32_t kv_heads, uint32_t head_dim,
+                             float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t query_count = (size_t)sequence * query_heads * head_dim;
+    size_t key_count = (size_t)sequence * kv_heads * head_dim;
+    size_t rope_count = (size_t)sequence * (head_dim / 2);
+    if (head_dim % 2 || !kv_heads || query_heads % kv_heads ||
+        !h3_gpu_require_bf16(gpu, query_input, query_count, @"text query") ||
+        !h3_gpu_require_bf16(gpu, key_input, key_count, @"text key") ||
+        !h3_gpu_require_bf16(gpu, q_norm, head_dim, @"text Q norm") ||
+        !h3_gpu_require_bf16(gpu, k_norm, head_dim, @"text K norm") ||
+        !h3_gpu_require_bf16(gpu, rope_cos, rope_count, @"text RoPE cosine") ||
+        !h3_gpu_require_bf16(gpu, rope_sin, rope_count, @"text RoPE sine") ||
+        !h3_gpu_require_bf16(gpu, query_output, query_count, @"text query output") ||
+        !h3_gpu_require_bf16(gpu, key_output, key_count, @"text key output")) return 0;
+    text_rope_args args = {sequence, query_heads, kv_heads, head_dim, epsilon};
+    return h3_gpu_dispatch_3d(gpu, @"h3_text_qk_rope_bf16",
+        MTLSizeMake(head_dim, query_heads, sequence),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(query_input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key_input).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(query_output).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(key_output).buffer offset:0 atIndex:7];
+            [encoder setBytes:&args length:sizeof(args) atIndex:8];
+        });
+}
+
+int h3_gpu_head_rms_norm_bf16(h3_gpu *opaque, h3_gpu_tensor *tensor,
+                              const h3_gpu_tensor *weight,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!h3_gpu_require_bf16(gpu, tensor, count, @"head norm tensor") ||
+        !h3_gpu_require_bf16(gpu, weight, head_dim, @"head norm weight")) return 0;
+    head_norm_args args = {sequence, heads, head_dim, epsilon};
+    return h3_gpu_dispatch_2d(gpu, @"h3_head_rms_norm_bf16", sequence, heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(tensor).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
+                          h3_gpu_tensor *key,
+                          const h3_gpu_tensor *rope_cos_f32,
+                          const h3_gpu_tensor *rope_sin_f32,
+                          uint32_t sequence, uint32_t query_heads,
+                          uint32_t kv_heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t query_count = (size_t)sequence * query_heads * head_dim;
+    size_t key_count = (size_t)sequence * kv_heads * head_dim;
+    size_t rope_count = (size_t)sequence * (head_dim / 2);
+    if (head_dim % 2 || !kv_heads || query_heads % kv_heads ||
+        !h3_gpu_require_bf16(gpu, query, query_count, @"RoPE query") ||
+        !h3_gpu_require_bf16(gpu, key, key_count, @"RoPE key") ||
+        !h3_gpu_require_elements(gpu, rope_cos_f32, rope_count, @"RoPE cosine") ||
+        TENSOR(rope_cos_f32).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, rope_sin_f32, rope_count, @"RoPE sine") ||
+        TENSOR(rope_sin_f32).dtype != H3_GPU_F32) return 0;
+    text_rope_inplace_args args = {sequence, query_heads, kv_heads, head_dim};
+    uint32_t maximum_heads = query_heads > kv_heads ? query_heads : kv_heads;
+    return h3_gpu_dispatch_2d(gpu, @"h3_rope_text_bf16", sequence, maximum_heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(rope_cos_f32).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(rope_sin_f32).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value,
+                           uint32_t sequence, uint32_t query_heads,
+                           uint32_t kv_heads, uint32_t head_dim,
+                           float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t query_count = (size_t)sequence * query_heads * head_dim;
+    size_t kv_count = (size_t)sequence * kv_heads * head_dim;
+    if (!sequence || !query_heads || !kv_heads || !head_dim ||
+        query_heads % kv_heads || head_dim > 128 ||
+        !h3_gpu_require_bf16(gpu, query, query_count, @"GQA query") ||
+        !h3_gpu_require_bf16(gpu, key, kv_count, @"GQA key") ||
+        !h3_gpu_require_bf16(gpu, value, kv_count, @"GQA value") ||
+        !h3_gpu_require_bf16(gpu, output, query_count, @"GQA output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    size_t score_bytes = (size_t)sequence * sizeof(float);
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
+                                                           @"h3_gqa_causal_bf16");
+    if (!pipeline) return 0;
+    if (score_bytes + pipeline.staticThreadgroupMemoryLength >
+        gpu.device.maxThreadgroupMemoryLength) {
+        h3_gpu_set_error(gpu, @"causal attention sequence exceeds threadgroup memory");
+        return 0;
+    }
+    NSUInteger maximum_threads = MIN((NSUInteger)128,
+                                     pipeline.maxTotalThreadsPerThreadgroup);
+    NSUInteger threads = 1;
+    while (threads * 2 <= maximum_threads) threads *= 2;
+    id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+    [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+    [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+    [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+    gqa_args args = {sequence, query_heads, kv_heads, head_dim, scale};
+    [encoder setBytes:&args length:sizeof(args) atIndex:4];
+    [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(sequence, query_heads, 1)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [encoder endEncoding];
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                    uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, left, elements, @"add left") ||
+        !h3_gpu_require_bf16(gpu, right, elements, @"add right") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"add output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_add_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(left).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *gate,
+                         const h3_gpu_tensor *up, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, gate, elements, @"SiLU gate") ||
+        !h3_gpu_require_bf16(gpu, up, elements, @"SiLU up") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"SiLU product")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_silu_mul_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(gate).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
         });
 }

@@ -354,3 +354,253 @@ kernel void h3_swiglu_bf16(device const ushort *fused [[buffer(0)]],
     output[row * args.width + column] =
         h3_f32_to_bf16(gate / (1.0f + exp(-gate)) * up);
 }
+
+struct embedding_args {
+    uint tokens;
+    uint vocab_size;
+    uint width;
+};
+
+kernel void h3_embedding_bf16(device const ushort *weight [[buffer(0)]],
+                              device const uint *token_ids [[buffer(1)]],
+                              device ushort *output [[buffer(2)]],
+                              constant embedding_args &args [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint token = gid.y;
+    if (token >= args.tokens || column >= args.width) return;
+    uint identifier = token_ids[token];
+    output[token * args.width + column] = identifier < args.vocab_size ?
+        weight[identifier * args.width + column] : ushort(0);
+}
+
+struct text_rope_args {
+    uint sequence;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float epsilon;
+};
+
+kernel void h3_text_qk_rope_bf16(
+        device const ushort *query_input [[buffer(0)]],
+        device const ushort *key_input [[buffer(1)]],
+        device const ushort *q_weight [[buffer(2)]],
+        device const ushort *k_weight [[buffer(3)]],
+        device const ushort *rope_cos [[buffer(4)]],
+        device const ushort *rope_sin [[buffer(5)]],
+        device ushort *query_output [[buffer(6)]],
+        device ushort *key_output [[buffer(7)]],
+        constant text_rope_args &args [[buffer(8)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    uint dimension = gid.x;
+    uint head = gid.y;
+    uint row = gid.z;
+    if (dimension >= args.head_dim || head >= args.query_heads || row >= args.sequence) return;
+    uint half_dim = args.head_dim / 2;
+    uint pair = dimension < half_dim ? dimension + half_dim : dimension - half_dim;
+    float c = h3_bf16_to_f32(rope_cos[row * half_dim + (dimension % half_dim)]);
+    float s = h3_bf16_to_f32(rope_sin[row * half_dim + (dimension % half_dim)]);
+
+    uint q_base = (row * args.query_heads + head) * args.head_dim;
+    float q_sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float value = h3_bf16_to_f32(query_input[q_base + d]);
+        q_sum = fma(value, value, q_sum);
+    }
+    float q_inverse = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+    float q0 = h3_bf16_to_f32(query_input[q_base + dimension]) * q_inverse *
+               h3_bf16_to_f32(q_weight[dimension]);
+    float q1 = h3_bf16_to_f32(query_input[q_base + pair]) * q_inverse *
+               h3_bf16_to_f32(q_weight[pair]);
+    float q_rotated = dimension < half_dim ? q0 * c - q1 * s : q0 * c + q1 * s;
+    query_output[q_base + dimension] = h3_f32_to_bf16(q_rotated);
+
+    if (head < args.kv_heads) {
+        uint k_base = (row * args.kv_heads + head) * args.head_dim;
+        float k_sum = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            float value = h3_bf16_to_f32(key_input[k_base + d]);
+            k_sum = fma(value, value, k_sum);
+        }
+        float k_inverse = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+        float k0 = h3_bf16_to_f32(key_input[k_base + dimension]) * k_inverse *
+                   h3_bf16_to_f32(k_weight[dimension]);
+        float k1 = h3_bf16_to_f32(key_input[k_base + pair]) * k_inverse *
+                   h3_bf16_to_f32(k_weight[pair]);
+        float k_rotated = dimension < half_dim ? k0 * c - k1 * s : k0 * c + k1 * s;
+        key_output[k_base + dimension] = h3_f32_to_bf16(k_rotated);
+    }
+}
+
+struct gqa_args {
+    uint sequence;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;
+};
+
+struct head_norm_args {
+    uint sequence;
+    uint heads;
+    uint head_dim;
+    float epsilon;
+};
+
+/* Adapted from Iris's Qwen3 BF16 per-head norm: a single thread owns a
+ * complete head, making in-place normalization race-free. */
+kernel void h3_head_rms_norm_bf16(
+        device ushort *tensor [[buffer(0)]],
+        device const ushort *weight [[buffer(1)]],
+        constant head_norm_args &args [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    if (row >= args.sequence || head >= args.heads) return;
+    uint base = (row * args.heads + head) * args.head_dim;
+    float sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float value = h3_bf16_to_f32(tensor[base + d]);
+        sum = fma(value, value, sum);
+    }
+    float inverse = rsqrt(sum / float(args.head_dim) + args.epsilon);
+    for (uint d = 0; d < args.head_dim; d++) {
+        float value = h3_bf16_to_f32(tensor[base + d]);
+        tensor[base + d] = h3_f32_to_bf16(
+            value * inverse * h3_bf16_to_f32(weight[d]));
+    }
+}
+
+struct text_rope_inplace_args {
+    uint sequence;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+};
+
+/* Iris-style text RoPE. F32 tables avoid compounding table quantization while
+ * Q/K remain BF16 at the operation boundary. */
+kernel void h3_rope_text_bf16(
+        device ushort *query [[buffer(0)]],
+        device ushort *key [[buffer(1)]],
+        device const float *rope_cos [[buffer(2)]],
+        device const float *rope_sin [[buffer(3)]],
+        constant text_rope_inplace_args &args [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    if (row >= args.sequence) return;
+    uint half_dim = args.head_dim / 2;
+    if (head < args.query_heads) {
+        uint base = (row * args.query_heads + head) * args.head_dim;
+        for (uint d = 0; d < half_dim; d++) {
+            float first = h3_bf16_to_f32(query[base + d]);
+            float second = h3_bf16_to_f32(query[base + half_dim + d]);
+            float c = rope_cos[row * half_dim + d];
+            float s = rope_sin[row * half_dim + d];
+            query[base + d] = h3_f32_to_bf16(first * c - second * s);
+            query[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+        }
+    }
+    if (head < args.kv_heads) {
+        uint base = (row * args.kv_heads + head) * args.head_dim;
+        for (uint d = 0; d < half_dim; d++) {
+            float first = h3_bf16_to_f32(key[base + d]);
+            float second = h3_bf16_to_f32(key[base + half_dim + d]);
+            float c = rope_cos[row * half_dim + d];
+            float s = rope_sin[row * half_dim + d];
+            key[base + d] = h3_f32_to_bf16(first * c - second * s);
+            key[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+        }
+    }
+}
+
+kernel void h3_gqa_causal_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant gqa_args &args [[buffer(4)]],
+        threadgroup float *scores [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    uint query_row = group.x;
+    uint query_head = group.y;
+    if (query_row >= args.sequence || query_head >= args.query_heads) return;
+    uint kv_head = query_head / (args.query_heads / args.kv_heads);
+    uint q_base = (query_row * args.query_heads + query_head) * args.head_dim;
+    uint key_count = query_row + 1;
+    threadgroup float reductions[128];
+    threadgroup float shared_query[128];
+
+    for (uint d = tid; d < args.head_dim; d += threads) {
+        shared_query[d] = h3_bf16_to_f32(query[q_base + d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint key_row = tid; key_row < key_count; key_row += threads) {
+        uint k_base = (key_row * args.kv_heads + kv_head) * args.head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]), dot);
+        }
+        float score = dot * args.scale;
+        scores[key_row] = score;
+        local_max = max(local_max, score);
+    }
+    reductions[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reductions[0];
+    float local_sum = 0.0f;
+    for (uint key_row = tid; key_row < key_count; key_row += threads) {
+        float probability = exp(scores[key_row] - maximum);
+        scores[key_row] = probability;
+        local_sum += probability;
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse_sum = 1.0f / reductions[0];
+    for (uint d = tid; d < args.head_dim; d += threads) {
+        float sum = 0.0f;
+        for (uint key_row = 0; key_row < key_count; key_row++) {
+            uint v_index = (key_row * args.kv_heads + kv_head) * args.head_dim + d;
+            sum = fma(scores[key_row] * inverse_sum,
+                      h3_bf16_to_f32(value[v_index]), sum);
+        }
+        output[q_base + d] = h3_f32_to_bf16(sum);
+    }
+}
+
+kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
+                         device const ushort *right [[buffer(1)]],
+                         device ushort *output [[buffer(2)]],
+                         constant uint &count [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(left[gid]) +
+                                  h3_bf16_to_f32(right[gid]));
+}
+
+kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
+                              device const ushort *up [[buffer(1)]],
+                              device ushort *output [[buffer(2)]],
+                              constant uint &count [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    float value = h3_bf16_to_f32(gate[gid]);
+    float other = h3_bf16_to_f32(up[gid]);
+    output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
+}
