@@ -26,5 +26,9 @@ h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
                                    const char *name, int ndim,
                                    const uint64_t *shape,
                                    char *error, size_t error_size);
+h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
+                                  const char *name, int ndim,
+                                  const uint64_t *shape,
+                                  char *error, size_t error_size);
 
 #endif

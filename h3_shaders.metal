@@ -43,6 +43,20 @@ kernel void h3_silu_f32(device const float *input [[buffer(0)]],
     output[gid] = value / (1.0f + exp(-value));
 }
 
+kernel void h3_cast_f32_to_bf16(device const float *input [[buffer(0)]],
+                                device ushort *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = h3_f32_to_bf16(input[gid]);
+}
+
+kernel void h3_cast_bf16_to_f32(device const ushort *input [[buffer(0)]],
+                                device float *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = h3_bf16_to_f32(input[gid]);
+}
+
 struct norm_args {
     uint rows;
     uint width;
@@ -243,20 +257,32 @@ kernel void h3_rms_norm_bf16(device const ushort *input [[buffer(0)]],
                              device const ushort *weight [[buffer(1)]],
                              device ushort *output [[buffer(2)]],
                              constant norm_args &args [[buffer(3)]],
-                             uint2 gid [[thread_position_in_grid]]) {
-    uint column = gid.x;
-    uint row = gid.y;
-    if (row >= args.rows || column >= args.width) return;
+                             uint3 group [[threadgroup_position_in_grid]],
+                             uint3 thread_position [[thread_position_in_threadgroup]],
+                             uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
     device const ushort *x = input + row * args.width;
-    float sum = 0.0f;
-    for (uint k = 0; k < args.width; k++) {
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
         float value = h3_bf16_to_f32(x[k]);
-        sum = fma(value, value, sum);
+        local_sum = fma(value, value, local_sum);
     }
-    float value = h3_bf16_to_f32(x[column]);
-    float normalized = value * rsqrt(sum / float(args.width) + args.epsilon);
-    output[row * args.width + column] =
-        h3_f32_to_bf16(normalized * h3_bf16_to_f32(weight[column]));
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_to_f32(x[column]) * inverse;
+        output[row * args.width + column] =
+            h3_f32_to_bf16(normalized * h3_bf16_to_f32(weight[column]));
+    }
 }
 
 kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
@@ -265,23 +291,38 @@ kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
                           device const uint *row_map [[buffer(3)]],
                           device ushort *output [[buffer(4)]],
                           constant adaln_args &args [[buffer(5)]],
-                          uint2 gid [[thread_position_in_grid]]) {
-    uint column = gid.x;
-    uint row = gid.y;
-    if (row >= args.rows || column >= args.width) return;
+                          uint3 group [[threadgroup_position_in_grid]],
+                          uint3 thread_position [[thread_position_in_threadgroup]],
+                          uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
     device const ushort *x = input + row * args.width;
-    float sum = 0.0f;
-    for (uint k = 0; k < args.width; k++) {
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
         float value = h3_bf16_to_f32(x[k]);
-        sum = fma(value, value, sum);
+        local_sum = fma(value, value, local_sum);
     }
-    float normalized = h3_bf16_to_f32(x[column]) *
-        rsqrt(sum / float(args.width) + args.epsilon) *
-        h3_bf16_to_f32(weight[column]);
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
     uint base = row_map[row] * args.slots * args.width;
-    float shift = h3_bf16_to_f32(modulation[base + args.shift_slot * args.width + column]);
-    float scale = h3_bf16_to_f32(modulation[base + args.scale_slot * args.width + column]);
-    output[row * args.width + column] = h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_to_f32(x[column]) * inverse *
+            h3_bf16_to_f32(weight[column]);
+        float shift = h3_bf16_to_f32(
+            modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_to_f32(
+            modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] =
+            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+    }
 }
 
 kernel void h3_gate_bf16(device const ushort *residual [[buffer(0)]],

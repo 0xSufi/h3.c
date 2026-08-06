@@ -19,6 +19,7 @@ typedef struct {
     uint64_t direct_dispatches;
     uint64_t mps_linear_dispatches;
     uint64_t mps_sdpa_dispatches;
+    uint64_t blit_copies;
     uint64_t submissions;
     double gpu_seconds;
 } h3_gpu_stats;
@@ -38,6 +39,8 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
+                                      uint64_t file_offset, size_t elements);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
@@ -57,6 +60,14 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_silu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_cast_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_cast_bf16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
+                     size_t destination_offset,
+                     const h3_gpu_tensor *source, size_t source_offset,
+                     size_t elements);
 int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *input,
                         const h3_gpu_tensor *weight, uint32_t rows,

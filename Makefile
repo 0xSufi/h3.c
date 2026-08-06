@@ -39,6 +39,9 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_dit_block_test: tests/test_real_dit_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -64,8 +67,9 @@ parity: h3_metal_tests h3_bf16_tests h3_text_tests
 	./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors
 	./h3_text_tests misc/fixtures/h3_text_bf16.safetensors
 
-real-parity: h3_real_prompt_test
+real-parity: h3_real_prompt_test h3_real_dit_block_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
+	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
@@ -78,5 +82,5 @@ tests/%.o: tests/%.c
 
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
-		h3_text_tests h3_real_prompt_test \
+		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		libh3.a *.o tests/*.o
