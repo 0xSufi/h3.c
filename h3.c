@@ -181,7 +181,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
         return 0;
     }
-    size_t images = 0, videos = 0, explicit_audio = 0, visual = 0;
+    size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!reference->path || !*reference->path) {
@@ -194,12 +194,13 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             break;
         case H3_REFERENCE_VIDEO:
             videos++; visual++;
+            if (reference->include_embedded_audio) audio_inputs++;
             break;
         case H3_REFERENCE_AUDIO:
-            explicit_audio++;
+            audio_inputs++;
             break;
         case H3_REFERENCE_VIDEO_AUDIO:
-            videos++; visual++; explicit_audio++;
+            videos++; visual++; audio_inputs++;
             if (!reference->audio_path || !*reference->audio_path) {
                 h3_set_error(ctx,
                     "video+audio reference %zu has no soundtrack path",
@@ -212,9 +213,9 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (images > 9 || videos > 3 || explicit_audio > 3) {
+    if (images > 9 || videos > 3 || audio_inputs > 3) {
         h3_set_error(ctx,
-            "Ref2VA limits are 9 images, 3 videos, and 3 explicit audio inputs");
+            "Ref2VA limits are 9 images, 3 videos, and 3 audio inputs");
         return 0;
     }
     if (params->reference_count && !visual) {
@@ -256,6 +257,11 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
 static void h3_audio_vae_progress_bridge(int completed, int total,
                                          void *opaque) {
     h3_progress_emit(opaque, "audio VAE", completed, total);
+}
+
+static void h3_audio_encoder_progress_bridge(int completed, int total,
+                                             void *opaque) {
+    h3_progress_emit(opaque, "audio VAE encoder", completed, total);
 }
 
 static void h3_video_encoder_progress_bridge(int completed, int total,
@@ -310,19 +316,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
         return NULL;
     }
-    for (size_t index = 0; index < params->reference_count; index++) {
-        const h3_reference *reference = &params->references[index];
-        if (reference->kind == H3_REFERENCE_AUDIO ||
-            reference->kind == H3_REFERENCE_VIDEO_AUDIO ||
-            (reference->kind == H3_REFERENCE_VIDEO &&
-             reference->include_embedded_audio)) {
-            h3_set_error(ctx,
-                "reference audio enters in the next incremental Ref2VA slice; "
-                "use a silent video reference for now");
-            return NULL;
-        }
-    }
-
     h3_generation_progress progress = {ctx, params, 0};
     h3_tokenizer *tokenizer = NULL;
     uint32_t *ids = NULL;
@@ -336,6 +329,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int *condition_heights = NULL;
     int *condition_frames = NULL;
     size_t *visual_reference_indices = NULL;
+    size_t *reference_visual_indices = NULL;
     h3_vision_output *vision_outputs = NULL;
     size_t vision_output_count = 0;
     h3_reference_presentation *presentations = NULL;
@@ -345,6 +339,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t keyframe_count = 0;
     float *condition_video_rows = NULL;
     size_t condition_video_elements = 0;
+    float *condition_audio_rows = NULL;
+    size_t condition_audio_elements = 0;
     h3_text_embedding text;
     memset(&text, 0, sizeof(text));
     h3_layout layout;
@@ -379,6 +375,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         condition_frames = calloc(visual_capacity, sizeof(*condition_frames));
         visual_reference_indices = calloc(
             visual_capacity, sizeof(*visual_reference_indices));
+        reference_visual_indices = malloc(
+            params->reference_count * sizeof(*reference_visual_indices));
+        if (reference_visual_indices)
+            for (size_t index = 0; index < params->reference_count; index++)
+                reference_visual_indices[index] = SIZE_MAX;
         if (ref2va) {
             layout_references = calloc(visual_capacity,
                                        sizeof(*layout_references));
@@ -389,6 +390,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         if (!condition_pixels || !condition_widths || !condition_heights ||
             !condition_frames || !visual_reference_indices ||
+            !reference_visual_indices ||
             (ref2va && (!layout_references || !presentations ||
                         !presentation_timestamps))) {
             h3_set_error(ctx, "out of memory preparing visual references");
@@ -411,6 +413,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (ref2va) {
         for (size_t index = 0; index < params->reference_count; index++) {
             const h3_reference *reference = &params->references[index];
+            if (reference->kind == H3_REFERENCE_AUDIO) {
+                presentations[index].kind = H3_PRESENTATION_AUDIO;
+                layout_references[index] = (h3_layout_ref){
+                    H3_LAYOUT_REF_AUDIO, 0, 0, 0, 0};
+                continue;
+            }
             int source_width, source_height, media_width, media_height;
             if (!h3_ffprobe_visual_size(reference->path,
                                         &source_width, &source_height,
@@ -482,6 +490,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             condition_widths[visual_count] = media_width;
             condition_heights[visual_count] = media_height;
             visual_reference_indices[visual_count] = index;
+            reference_visual_indices[index] = visual_count;
             int ref_latent_w, ref_latent_h;
             h3_latent_canvas(media_width, media_height,
                              &ref_latent_w, &ref_latent_h);
@@ -491,6 +500,117 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 h3_video_encoder_latent_t(condition_frames[visual_count]),
                 ref_latent_h, ref_latent_w, 0};
             visual_count++;
+        }
+
+        size_t total_audio_samples = 0;
+        for (size_t index = 0; index < params->reference_count; index++) {
+            const h3_reference *reference = &params->references[index];
+            const char *audio_path = NULL;
+            int truncate = 0;
+            int max_samples = 32000 * 15;
+            if (reference->kind == H3_REFERENCE_AUDIO) {
+                audio_path = reference->path;
+            } else if (reference->kind == H3_REFERENCE_VIDEO_AUDIO) {
+                audio_path = reference->audio_path;
+                truncate = 1;
+            } else if (reference->kind == H3_REFERENCE_VIDEO &&
+                       reference->include_embedded_audio) {
+                audio_path = reference->path;
+                truncate = 1;
+            }
+            if (!audio_path) continue;
+            if (truncate) {
+                size_t visual = reference_visual_indices[index];
+                if (visual == SIZE_MAX) {
+                    h3_set_error(ctx,
+                        "video soundtrack %zu has no decoded video", index + 1);
+                    goto cleanup;
+                }
+                max_samples = (int)llround(
+                    (double)condition_frames[visual] * 32000.0 / H3_FPS);
+                if (max_samples < 64000) {
+                    h3_set_error(ctx,
+                        "video soundtrack %zu requires at least 2 seconds; "
+                        "request at least 56 output frames", index + 1);
+                    goto cleanup;
+                }
+            }
+            float *pcm = NULL;
+            int samples = 0;
+            if (!h3_ffmpeg_read_audio_f32(
+                    audio_path, max_samples, truncate, &pcm, &samples,
+                    detail, sizeof(detail))) {
+                free(pcm);
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            if ((size_t)samples > (size_t)32000 * 15 - total_audio_samples) {
+                free(pcm);
+                h3_set_error(ctx,
+                    "ordered reference audio exceeds 15 seconds in total");
+                goto cleanup;
+            }
+            h3_audio_latent latent;
+            memset(&latent, 0, sizeof(latent));
+            if (!h3_audio_vae_encode(
+                    audio_vae_path, "h3_shaders.metal", pcm, samples,
+                    h3_audio_encoder_progress_bridge, &progress, &latent,
+                    detail, sizeof(detail))) {
+                free(pcm);
+                h3_audio_latent_free(&latent);
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            free(pcm);
+            if (latent.channels != 32 || latent.stereo != 2 ||
+                latent.length < 1 ||
+                (size_t)latent.length > SIZE_MAX / 2 / 32) {
+                h3_audio_latent_free(&latent);
+                h3_set_error(ctx,
+                    "reference audio encoder produced invalid geometry");
+                goto cleanup;
+            }
+            size_t elements = (size_t)latent.length * 2 * 32;
+            if (condition_audio_elements > SIZE_MAX - elements ||
+                condition_audio_elements + elements >
+                    SIZE_MAX / sizeof(*condition_audio_rows)) {
+                h3_audio_latent_free(&latent);
+                h3_set_error(ctx, "reference audio row count overflows");
+                goto cleanup;
+            }
+            float *grown = realloc(
+                condition_audio_rows,
+                (condition_audio_elements + elements) * sizeof(*grown));
+            if (!grown) {
+                h3_audio_latent_free(&latent);
+                h3_set_error(ctx,
+                    "out of memory packing reference audio conditions");
+                goto cleanup;
+            }
+            condition_audio_rows = grown;
+            float *rows = condition_audio_rows + condition_audio_elements;
+            for (int stereo = 0; stereo < 2; stereo++)
+                for (int time = 0; time < latent.length; time++)
+                    for (int channel = 0; channel < 32; channel++) {
+                        size_t source = ((size_t)channel * 2 +
+                                         (size_t)stereo) * latent.length +
+                                        (size_t)time;
+                        size_t destination = ((size_t)stereo * latent.length +
+                                              (size_t)time) * 32 +
+                                             (size_t)channel;
+                        rows[destination] = latent.values[source];
+                    }
+            h3_rng condition_rng;
+            h3_rng_seed(&condition_rng, params->seed + 1);
+            for (size_t element = 0; element < elements; element++)
+                rows[element] = 0.999f * rows[element] +
+                                0.001f * h3_rng_normal(&condition_rng);
+            condition_audio_elements += elements;
+            total_audio_samples += (size_t)samples;
+            layout_references[index].audio_t = latent.length;
+            presentations[index].has_audio = 1;
+            h3_audio_latent_free(&latent);
+            if (progress.cancelled) goto cleanup;
         }
     } else {
         if (params->first_frame) {
@@ -726,7 +846,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (visual_count) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
-            condition_video_rows, condition_video_elements, NULL, 0,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
@@ -740,6 +861,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_text_embedding_free(&text);
     free(condition_video_rows);
     condition_video_rows = NULL;
+    free(condition_audio_rows);
+    condition_audio_rows = NULL;
     if (progress.cancelled) goto cleanup;
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
@@ -852,11 +975,13 @@ cleanup:
     free(condition_heights);
     free(condition_frames);
     free(visual_reference_indices);
+    free(reference_visual_indices);
     free(vision_outputs);
     free(presentations);
     free(presentation_timestamps);
     free(layout_references);
     free(condition_video_rows);
+    free(condition_audio_rows);
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
     h3_dit_free(dit);

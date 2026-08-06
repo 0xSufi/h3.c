@@ -549,6 +549,86 @@ kernel void h3_alias_free_snake_f32(
     output[destination] = result;
 }
 
+kernel void h3_snake1d_f32(device const float *input [[buffer(0)]],
+                           device const float *alpha [[buffer(1)]],
+                           device float *output [[buffer(2)]],
+                           constant audio_activation_args &args [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    uint count = args.batch * args.length * args.channels;
+    if (gid >= count) return;
+    float a = alpha[gid % args.channels];
+    float x = input[gid];
+    float wave = sin(a * x);
+    output[gid] = x + wave * wave / (a + 1e-9f);
+}
+
+struct audio_qkv_args {
+    uint batch;
+    uint length;
+    uint heads;
+    uint head_dim;
+};
+
+kernel void h3_audio_qkv_split_f32(
+                           device const float *qkv [[buffer(0)]],
+                           device const float *q_bias [[buffer(1)]],
+                           device const float *k_bias [[buffer(2)]],
+                           device const float *v_bias [[buffer(3)]],
+                           device float *query [[buffer(4)]],
+                           device float *key [[buffer(5)]],
+                           device float *value [[buffer(6)]],
+                           constant audio_qkv_args &args [[buffer(7)]],
+                           uint gid [[thread_position_in_grid]]) {
+    uint width = args.heads * args.head_dim;
+    uint count = args.batch * args.length * width;
+    if (gid >= count) return;
+    uint column = gid % width;
+    uint row = gid / width;
+    uint base = row * width * 3;
+    query[gid] = qkv[base + column] + q_bias[column];
+    key[gid] = qkv[base + width + column] + k_bias[column];
+    value[gid] = qkv[base + width * 2 + column] + v_bias[column];
+}
+
+struct audio_pool_args {
+    uint batch;
+    uint length;
+    uint heads;
+    uint head_dim;
+    uint output_dim;
+};
+
+kernel void h3_audio_attention_pool_f32(
+                           device const float *attended [[buffer(0)]],
+                           device float *output [[buffer(1)]],
+                           constant audio_pool_args &args [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    uint count = args.batch * args.length * args.output_dim;
+    if (gid >= count) return;
+    uint column = gid % args.output_dim;
+    uint row = gid / args.output_dim;
+    uint pool = args.head_dim / args.output_dim;
+    float sum = 0.0f;
+    for (uint head = 0; head < args.heads; head++) {
+        uint base = (row * args.heads + head) * args.head_dim + column * pool;
+        for (uint item = 0; item < pool; item++) sum += attended[base + item];
+    }
+    output[gid] = sum / float(args.heads * pool);
+}
+
+kernel void h3_geglu_f32(device const float *gate [[buffer(0)]],
+                          device const float *linear [[buffer(1)]],
+                          device float *output [[buffer(2)]],
+                          constant uint &count [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    float x = gate[gid];
+    float cube = x * x * x;
+    float gelu = 0.5f * x *
+        (1.0f + tanh(0.7978845608028654f * (x + 0.044715f * cube)));
+    output[gid] = gelu * linear[gid];
+}
+
 struct clip_args {
     uint elements;
     float minimum;

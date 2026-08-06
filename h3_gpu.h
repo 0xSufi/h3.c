@@ -144,6 +144,14 @@ int h3_gpu_conv1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t padding, uint32_t dilation);
+int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t stride, uint32_t padding,
+                      uint32_t dilation);
 int h3_gpu_conv_transpose1d_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -169,6 +177,32 @@ int h3_gpu_alias_free_snake_f32(
                           const h3_gpu_tensor *downsample_filter,
                           uint32_t batch, uint32_t length,
                           uint32_t channels);
+int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *alpha, uint32_t batch,
+                       uint32_t length, uint32_t channels);
+int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
+                       h3_gpu_tensor *query, h3_gpu_tensor *key,
+                       h3_gpu_tensor *value, const h3_gpu_tensor *qkv,
+                       const h3_gpu_tensor *q_bias,
+                       const h3_gpu_tensor *k_bias,
+                       const h3_gpu_tensor *v_bias, uint32_t batch,
+                       uint32_t length, uint32_t heads,
+                       uint32_t head_dim);
+int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *query,
+                       const h3_gpu_tensor *key,
+                       const h3_gpu_tensor *value, uint32_t batch,
+                       uint32_t sequence, uint32_t heads,
+                       uint32_t head_dim, float scale);
+int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
+                       h3_gpu_tensor *output,
+                       const h3_gpu_tensor *attended, uint32_t batch,
+                       uint32_t length, uint32_t heads,
+                       uint32_t head_dim, uint32_t output_dim);
+int h3_gpu_geglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *gate,
+                     const h3_gpu_tensor *linear, uint32_t elements);
 int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input, uint32_t elements,
                     float minimum, float maximum);

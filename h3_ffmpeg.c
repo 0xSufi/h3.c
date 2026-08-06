@@ -386,6 +386,124 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
     return 1;
 }
 
+int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
+                             int truncate_at_limit,
+                             float **pcm, int *samples,
+                             char *error, size_t error_size) {
+    enum { AUDIO_RATE = 32000, AUDIO_CHANNELS = 2, MIN_SAMPLES = 64000 };
+    if (error && error_size) error[0] = '\0';
+    if (pcm) *pcm = NULL;
+    if (samples) *samples = 0;
+    if (!path || !*path || !pcm || !samples || max_samples < MIN_SAMPLES ||
+        max_samples > AUDIO_RATE * 15 ||
+        (truncate_at_limit != 0 && truncate_at_limit != 1)) {
+        fail(error, error_size, "invalid FFmpeg audio input arguments");
+        return 0;
+    }
+    size_t elements = (size_t)max_samples * AUDIO_CHANNELS;
+    if (elements > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "decoded audio size overflows");
+        return 0;
+    }
+    float *interleaved = malloc(elements * sizeof(*interleaved));
+    if (!interleaved) {
+        fail(error, error_size, "out of memory decoding reference audio");
+        return 0;
+    }
+    char duration[64];
+    double seconds = (double)max_samples / (double)AUDIO_RATE;
+    if (!truncate_at_limit) seconds += 1.0 / (double)AUDIO_RATE;
+    snprintf(duration, sizeof(duration), "%.9f", seconds);
+    int stream[2];
+    if (pipe(stream) != 0) {
+        free(interleaved);
+        fail(error, error_size, "cannot create FFmpeg audio pipe: %s",
+             strerror(errno));
+        return 0;
+    }
+    char *arguments[] = {
+        "ffmpeg", "-v", "error", "-i", (char *)path,
+        "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "32000",
+        "-t", duration, "-f", "f32le", "pipe:1", NULL
+    };
+    posix_spawn_file_actions_t actions;
+    int code = posix_spawn_file_actions_init(&actions);
+    if (!code) code = posix_spawn_file_actions_adddup2(
+        &actions, stream[1], STDOUT_FILENO);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[0]);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[1]);
+    pid_t child = -1;
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
+                                    arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stream[1]);
+    if (code) {
+        close(stream[0]);
+        free(interleaved);
+        fail(error, error_size, "cannot start FFmpeg: %s", strerror(code));
+        return 0;
+    }
+    size_t capacity = elements * sizeof(*interleaved);
+    size_t received = 0;
+    while (received < capacity) {
+        ssize_t amount = read(stream[0], (uint8_t *)interleaved + received,
+                              capacity - received);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) break;
+        received += (size_t)amount;
+    }
+    uint8_t extra;
+    ssize_t trailing;
+    do trailing = read(stream[0], &extra, 1);
+    while (trailing < 0 && errno == EINTR);
+    close(stream[0]);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        free(interleaved);
+        fail(error, error_size, "cannot wait for FFmpeg: %s", strerror(errno));
+        return 0;
+    }
+    size_t frame_bytes = AUDIO_CHANNELS * sizeof(float);
+    if (!truncate_at_limit && trailing > 0) {
+        free(interleaved);
+        fail(error, error_size,
+             "reference audio exceeds the 15 second total limit");
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        received % frame_bytes) {
+        free(interleaved);
+        fail(error, error_size,
+             "FFmpeg could not decode a stereo soundtrack from %s", path);
+        return 0;
+    }
+    int sample_count = (int)(received / frame_bytes);
+    if (sample_count < MIN_SAMPLES) {
+        free(interleaved);
+        fail(error, error_size,
+             "reference audio requires at least 2 seconds at 32 kHz");
+        return 0;
+    }
+    size_t output_elements = (size_t)sample_count * AUDIO_CHANNELS;
+    float *channel_major = malloc(output_elements * sizeof(*channel_major));
+    if (!channel_major) {
+        free(interleaved);
+        fail(error, error_size, "out of memory converting reference audio");
+        return 0;
+    }
+    for (int sample = 0; sample < sample_count; sample++)
+        for (int channel = 0; channel < AUDIO_CHANNELS; channel++)
+            channel_major[(size_t)channel * (size_t)sample_count +
+                          (size_t)sample] =
+                interleaved[(size_t)sample * AUDIO_CHANNELS +
+                            (size_t)channel];
+    free(interleaved);
+    *pcm = channel_major;
+    *samples = sample_count;
+    return 1;
+}
+
 int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
                           int frame_count, int width, int height, int fps,
                           char *error, size_t error_size) {

@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
     };
     double timestamp = 0.25;
     h3_reference_presentation reference = {
-        H3_PRESENTATION_VIDEO, 0, &visual, 1, &timestamp};
+        H3_PRESENTATION_VIDEO, 1, &visual, 1, &timestamp};
     char tokenizer_path[1024], weights[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path),
              "%s/Ref2VA/tokenizer/tokenizer.json", model_root);
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     }
     double rel_max = maximum / (scale > 1e-12 ? scale : 1e-12);
     double rel_l2 = sqrt(squares / (norm > 1e-24 ? norm : 1e-24));
-    printf("Ref2VA video presentation: rel-max %.7g, rel-L2 %.7g, "
+    printf("Ref2VA video+audio presentation: rel-max %.7g, rel-L2 %.7g, "
            "nonfinite %zu\n", rel_max, rel_l2, nonfinite);
     if (nonfinite || rel_max >= 0.15 || rel_l2 >= 0.15)
         die("Ref2VA video presentation parity bound exceeded");
@@ -133,6 +133,6 @@ int main(int argc, char **argv) {
     h3_st_free_header(&fixture);
     free(positions); free(tags_i32); free(vision); free(want);
     for (unsigned index = 0; index < 3; index++) free(deepstack[index]);
-    puts("ok: native Ref2VA video presentation matches the MLX oracle");
+    puts("ok: native Ref2VA video+audio presentation matches the MLX oracle");
     return 0;
 }

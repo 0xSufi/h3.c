@@ -12,7 +12,7 @@ static void die(const char *message) {
 }
 
 int main(int argc, char **argv) {
-    enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 3200 };
+    enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
     uint8_t *rgb = malloc(WIDTH * HEIGHT * 3 * FRAMES);
     float *pcm = malloc(2 * SAMPLES * sizeof(*pcm));
@@ -81,6 +81,25 @@ int main(int argc, char **argv) {
             die("decoded FFmpeg video contains invalid pixels");
     }
     free(decoded);
+    float *decoded_pcm = NULL;
+    int decoded_samples = 0;
+    if (!h3_ffmpeg_read_audio_f32(path, SAMPLES, 1,
+                                  &decoded_pcm, &decoded_samples,
+                                  error, sizeof(error))) die(error);
+    if (decoded_samples != SAMPLES)
+        die("FFmpeg audio input returned an unexpected sample count");
+    double left_energy = 0.0, right_energy = 0.0;
+    for (int sample = 0; sample < decoded_samples; sample++) {
+        float left = decoded_pcm[sample];
+        float right = decoded_pcm[decoded_samples + sample];
+        if (!isfinite(left) || !isfinite(right))
+            die("decoded FFmpeg audio contains non-finite PCM");
+        left_energy += (double)left * left;
+        right_energy += (double)right * right;
+    }
+    if (left_energy < 1.0 || right_energy < 1.0)
+        die("decoded FFmpeg audio has no stereo signal");
+    free(decoded_pcm);
     printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
            path, (long long)status.st_size);
     free(rgb);

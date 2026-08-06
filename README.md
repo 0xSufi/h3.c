@@ -5,8 +5,8 @@ sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
 first/last-frame conditioning and then ordered references.
 
-Current milestone: M8 Ref2VA ordered image and silent-video references are
-working; reference audio and H3-specific performance work follow incrementally.
+Current milestone: M8 Ref2VA ordered image/video/audio reference support is complete;
+H3-specific Metal performance and memory work follows incrementally.
 
 ```sh
 make
@@ -23,6 +23,17 @@ make test
 ./h3 -d MiniMax-H3 -p "Continue the motion in this clip" \
   --width 512 --height 512 --frames 22 --ref-silent-video fox.mp4 \
   -o outputs/fox-video-reference.mp4
+./h3 -d MiniMax-H3 -p "Use the animal and the music" \
+  --width 512 --height 512 --frames 22 \
+  --ref-image fox.png --ref-audio music.wav \
+  -o outputs/fox-image-audio-reference.mp4
+./h3 -d MiniMax-H3 -p "Continue this audiovisual scene" \
+  --width 512 --height 512 --frames 56 --ref-video fox-with-audio.mp4 \
+  -o outputs/fox-video-audio-reference.mp4
+./h3 -d MiniMax-H3 -p "Continue the clip with this replacement soundtrack" \
+  --width 512 --height 512 --frames 56 \
+  --ref-video-audio silent-fox.mp4 replacement.wav \
+  -o outputs/fox-replaced-audio-reference.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -65,8 +76,22 @@ selects the distinct Ref2VA transformer, preserves ordered `<Picture N>`
 presentation, and uses the released down-only aspect-preserving reference canvas.
 `--ref-silent-video` additionally performs bounded 24 fps decoding, the visual
 VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
-`<Video N>` presentation. Embedded, explicit, and standalone reference audio
-remain the active incremental work.
+`<Video N>` presentation. `--ref-video` preserves an embedded soundtrack,
+`--ref-video-audio VIDEO AUDIO` supplies an explicit replacement, and
+`--ref-audio` appends an ordered standalone clip. Reference audio is decoded as
+32 kHz stereo F32, encoded by the native AudioVAE posterior-mean path, augmented
+at condition timestep 0.999, and packed as width-32 rows on the same rotary
+timeline as visual references. Audio inputs are 2-15 seconds, at most three are
+accepted, their total decoded duration is capped at 15 seconds, and a standalone
+audio reference must be combined with an image or video reference.
+
+The native audio encoder matches the corrected MLX oracle at relative L2
+`3.59e-6` on a real two-second stereo fixture. The correction is important: the
+original MLX reshape interleaved left/right samples, whereas the official
+PyTorch/SGLang path folds intact stereo channels into the batch dimension. On
+the 128 GB M5 Max, clean end-to-end image+audio and embedded-video+audio renders
+completed in 74.58 and 76.99 seconds respectively, each with about a 40.1 GB
+peak physical footprint and zero swaps.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

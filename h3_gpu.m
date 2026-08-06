@@ -268,7 +268,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
-            @"h3_alias_free_snake_f32", @"h3_clip_f32",
+            @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
+            @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
+            @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
             @"h3_vae_encoder_group_norm_silu_f32"
         ];
@@ -549,6 +551,10 @@ typedef struct { uint32_t outer, inner; } weight_norm_args;
 typedef struct { uint32_t elements; float left_scale, right_scale; }
     add_scaled_args;
 typedef struct { uint32_t batch, length, channels; } audio_activation_args;
+typedef struct { uint32_t batch, length, heads, head_dim; } audio_qkv_args;
+typedef struct {
+    uint32_t batch, length, heads, head_dim, output_dim;
+} audio_pool_args;
 typedef struct { uint32_t elements; float minimum, maximum; } clip_args;
 typedef struct {
     uint32_t batch, depth, height, width, channels, depth_front;
@@ -825,16 +831,19 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
         });
 }
 
-static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t sequence,
+static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
+                                 uint32_t sequence,
                                  uint32_t heads, uint32_t head_dim, float scale,
-                                 MPSDataType dataType) {
+                                 MPSDataType dataType, int causal) {
     @autoreleasepool {
-        NSString *cacheKey = [NSString stringWithFormat:@"%u:%u:%u:%u:%.9g",
-                              (unsigned)dataType, sequence, heads, head_dim, scale];
+        NSString *cacheKey = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%.9g:%d",
+                              (unsigned)dataType, batch, sequence, heads,
+                              head_dim, scale, causal];
         H3SDPA *cached = gpu.sdpaCache[cacheKey];
         if (cached) return cached;
         MPSGraph *graph = [[MPSGraph alloc] init];
-        NSArray<NSNumber *> *shape = @[@1, @(sequence), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *shape = @[@(batch), @(sequence), @(heads),
+                                       @(head_dim)];
         MPSGraphTensor *q = [graph placeholderWithShape:shape dataType:dataType name:nil];
         MPSGraphTensor *k = [graph placeholderWithShape:shape dataType:dataType name:nil];
         MPSGraphTensor *v = [graph placeholderWithShape:shape dataType:dataType name:nil];
@@ -845,11 +854,27 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t sequence,
             h3_gpu_set_error(gpu, @"native MPSGraph SDPA is unavailable");
             return nil;
         }
-        MPSGraphTensor *attention = [graph scaledDotProductAttentionWithQueryTensor:qt
-                                                                          keyTensor:kt
-                                                                        valueTensor:vt
-                                                                             scale:scale
-                                                                               name:nil];
+        MPSGraphTensor *attention;
+        if (causal) {
+            size_t mask_count = (size_t)sequence * sequence;
+            float *mask_values = malloc(mask_count * sizeof(*mask_values));
+            if (!mask_values) return nil;
+            for (uint32_t row = 0; row < sequence; row++)
+                for (uint32_t column = 0; column < sequence; column++)
+                    mask_values[(size_t)row * sequence + column] =
+                        column <= row ? 0.0f : -INFINITY;
+            NSData *mask_data = [NSData dataWithBytesNoCopy:mask_values
+                length:mask_count * sizeof(*mask_values) freeWhenDone:YES];
+            MPSGraphTensor *mask = [graph constantWithData:mask_data
+                shape:@[@1, @1, @(sequence), @(sequence)]
+                dataType:MPSDataTypeFloat32];
+            attention = [graph
+                scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt
+                valueTensor:vt maskTensor:mask scale:scale name:nil];
+        } else {
+            attention = [graph scaledDotProductAttentionWithQueryTensor:qt
+                keyTensor:kt valueTensor:vt scale:scale name:nil];
+        }
         H3SDPA *result = [[H3SDPA alloc] init];
         result.graph = graph;
         result.query = q;
@@ -864,12 +889,15 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t sequence,
 
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
-                       const h3_gpu_tensor *value, uint32_t sequence,
+                       const h3_gpu_tensor *value, uint32_t batch,
+                       uint32_t sequence,
                        uint32_t heads, uint32_t head_dim, float scale,
-                       h3_gpu_dtype tensor_dtype, MPSDataType mps_dtype) {
+                       h3_gpu_dtype tensor_dtype, MPSDataType mps_dtype,
+                       int causal) {
     H3GPU *gpu = GPU(opaque);
-    size_t count = (size_t)sequence * heads * head_dim;
-    if (!h3_gpu_require_command(gpu) ||
+    size_t count = (size_t)batch * sequence * heads * head_dim;
+    if (!batch || !sequence || !heads || !head_dim ||
+        !h3_gpu_require_command(gpu) ||
         !h3_gpu_require_elements(gpu, query, count, @"SDPA query") ||
         !h3_gpu_require_elements(gpu, key, count, @"SDPA key") ||
         !h3_gpu_require_elements(gpu, value, count, @"SDPA value") ||
@@ -879,8 +907,8 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
-    H3SDPA *cache = h3_gpu_sdpa_graph(gpu, sequence, heads, head_dim, scale,
-                                      mps_dtype);
+    H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
+                                      scale, mps_dtype, causal);
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command =
@@ -915,16 +943,26 @@ int h3_gpu_sdpa_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
                     uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, sequence, heads,
-                       head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32);
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
+                       head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32, 0);
+}
+
+int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, uint32_t batch,
+                    uint32_t sequence, uint32_t heads, uint32_t head_dim,
+                    float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, batch, sequence,
+                       heads, head_dim, scale, H3_GPU_F32,
+                       MPSDataTypeFloat32, 1);
 }
 
 int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16);
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
+                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0);
 }
 
 int h3_gpu_swiglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -1273,19 +1311,21 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
-int h3_gpu_conv1d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+int h3_gpu_conv1d_stride_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t length, uint32_t input_channels,
                       uint32_t output_channels, uint32_t kernel,
-                      uint32_t padding, uint32_t dilation) {
+                      uint32_t stride, uint32_t padding,
+                      uint32_t dilation) {
     H3GPU *gpu = GPU(opaque);
     uint64_t effective = (uint64_t)dilation * (kernel - 1) + 1;
     if (!batch || !length || !input_channels || !output_channels || !kernel ||
-        !dilation || (uint64_t)length + 2 * padding < effective) return 0;
-    uint32_t output_length = (uint32_t)((uint64_t)length + 2 * padding -
-                                        effective + 1);
+        !stride || !dilation || (uint64_t)length + 2 * padding < effective)
+        return 0;
+    uint32_t output_length = (uint32_t)(((uint64_t)length + 2 * padding -
+                                         effective) / stride + 1);
     size_t input_count = (size_t)batch * length * input_channels;
     size_t weight_count = (size_t)output_channels * input_channels * kernel;
     size_t output_count = (size_t)batch * output_length * output_channels;
@@ -1299,8 +1339,20 @@ int h3_gpu_conv1d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                                            @"Conv1d bias") ||
                   TENSOR(bias).dtype != H3_GPU_F32))) return 0;
     return h3_gpu_conv_mps(gpu, output, input, weight, bias, batch, length,
-        input_channels, output_channels, kernel, 1, padding, dilation,
+        input_channels, output_channels, kernel, stride, padding, dilation,
         output_length, 0);
+}
+
+int h3_gpu_conv1d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t padding, uint32_t dilation) {
+    return h3_gpu_conv1d_stride_f32(opaque, output, input, weight, bias,
+        batch, length, input_channels, output_channels, kernel, 1, padding,
+        dilation);
 }
 
 int h3_gpu_conv_transpose1d_f32(
@@ -1419,6 +1471,112 @@ int h3_gpu_alias_free_snake_f32(
             [encoder setBuffer:TENSOR(downsample_filter).buffer offset:0 atIndex:4];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:5];
             [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+int h3_gpu_snake1d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *alpha, uint32_t batch,
+                       uint32_t length, uint32_t channels) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)batch * length * channels;
+    if (!batch || !length || !channels || count > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, input, count, @"Snake1d input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, alpha, channels, @"Snake1d alpha") ||
+        TENSOR(alpha).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"Snake1d output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    audio_activation_args args = {batch, length, channels};
+    return h3_gpu_dispatch_1d(gpu, @"h3_snake1d_f32", (uint32_t)count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_audio_qkv_split_f32(h3_gpu *opaque,
+                       h3_gpu_tensor *query, h3_gpu_tensor *key,
+                       h3_gpu_tensor *value, const h3_gpu_tensor *qkv,
+                       const h3_gpu_tensor *q_bias,
+                       const h3_gpu_tensor *k_bias,
+                       const h3_gpu_tensor *v_bias, uint32_t batch,
+                       uint32_t length, uint32_t heads,
+                       uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t width = (size_t)heads * head_dim;
+    size_t count = (size_t)batch * length * width;
+    if (!batch || !length || !heads || !head_dim || count > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, qkv, count * 3, @"audio QKV") ||
+        TENSOR(qkv).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, q_bias, width, @"audio Q bias") ||
+        !h3_gpu_require_elements(gpu, k_bias, width, @"audio K bias") ||
+        !h3_gpu_require_elements(gpu, v_bias, width, @"audio V bias") ||
+        TENSOR(q_bias).dtype != H3_GPU_F32 ||
+        TENSOR(k_bias).dtype != H3_GPU_F32 ||
+        TENSOR(v_bias).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, query, count, @"audio query") ||
+        !h3_gpu_require_elements(gpu, key, count, @"audio key") ||
+        !h3_gpu_require_elements(gpu, value, count, @"audio value") ||
+        TENSOR(query).dtype != H3_GPU_F32 || TENSOR(key).dtype != H3_GPU_F32 ||
+        TENSOR(value).dtype != H3_GPU_F32) return 0;
+    audio_qkv_args args = {batch, length, heads, head_dim};
+    return h3_gpu_dispatch_1d(gpu, @"h3_audio_qkv_split_f32",
+        (uint32_t)count, ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(q_bias).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(k_bias).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(v_bias).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:6];
+            [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        });
+}
+
+int h3_gpu_audio_attention_pool_f32(h3_gpu *opaque,
+                       h3_gpu_tensor *output,
+                       const h3_gpu_tensor *attended, uint32_t batch,
+                       uint32_t length, uint32_t heads,
+                       uint32_t head_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)batch * length * heads * head_dim;
+    size_t output_count = (size_t)batch * length * output_dim;
+    if (!batch || !length || !heads || !head_dim || !output_dim ||
+        head_dim % output_dim || output_count > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, attended, input_count,
+                                 @"audio attended values") ||
+        TENSOR(attended).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count,
+                                 @"audio pooled values") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    audio_pool_args args = {batch, length, heads, head_dim, output_dim};
+    return h3_gpu_dispatch_1d(gpu, @"h3_audio_attention_pool_f32",
+        (uint32_t)output_count, ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(attended).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_geglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *gate,
+                     const h3_gpu_tensor *linear, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, gate, elements, @"GeGLU gate") ||
+        !h3_gpu_require_elements(gpu, linear, elements, @"GeGLU linear") ||
+        !h3_gpu_require_elements(gpu, output, elements, @"GeGLU output") ||
+        TENSOR(gate).dtype != H3_GPU_F32 ||
+        TENSOR(linear).dtype != H3_GPU_F32 ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_geglu_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(gate).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(linear).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
         });
 }
 
