@@ -108,6 +108,8 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3MLP *> *mlpCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
+@property(nonatomic, strong) MPSCommandBuffer *mpsCommand;
+@property(nonatomic) BOOL reuseMPSCommandDefault;
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic) h3_gpu_stats stats;
 @property(nonatomic, copy) NSString *profileLabel;
@@ -148,6 +150,18 @@ static MPSGraphTensorData *h3_gpu_graph_data(const h3_gpu_tensor *tensor,
         object.graphDataType = data_type;
     }
     return data;
+}
+
+static MPSCommandBuffer *h3_gpu_mps_command(H3GPU *gpu) {
+    const char *override = getenv("H3_REUSE_MPS_COMMAND");
+    BOOL reuse = override ? (*override && strcmp(override, "0")) :
+                            gpu.reuseMPSCommandDefault;
+    if (!reuse)
+        return [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+    if (!gpu.mpsCommand || gpu.mpsCommand.rootCommandBuffer != gpu.command)
+        gpu.mpsCommand =
+            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+    return gpu.mpsCommand;
 }
 
 static double h3_gpu_now(void) {
@@ -318,6 +332,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
+        gpu.reuseMPSCommandDefault =
+            [gpu.device.name rangeOfString:@"M5"].location == NSNotFound;
         gpu.inflightCommands = [NSMutableArray array];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
         gpu.gqaCache = [NSMutableDictionary dictionary];
@@ -768,6 +784,7 @@ int h3_gpu_continue(h3_gpu *opaque) {
     @autoreleasepool {
         id<MTLCommandBuffer> command = gpu.command;
         gpu.command = nil;
+        gpu.mpsCommand = nil;
         double commit_time = h3_gpu_now();
         [command commit];
         [gpu.inflightCommands addObject:command];
@@ -791,6 +808,7 @@ int h3_gpu_submit(h3_gpu *opaque) {
     @autoreleasepool {
         id<MTLCommandBuffer> command = gpu.command;
         gpu.command = nil;
+        gpu.mpsCommand = nil;
         double commit_time = h3_gpu_now();
         [command commit];
         [gpu.inflightCommands addObject:command];
@@ -1252,8 +1270,7 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                                       scale, mps_dtype, causal);
     if (!cache) return 0;
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
             ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
                 return h3_gpu_graph_data(tensor, cache.shape, mps_dtype, 0);
@@ -1480,8 +1497,7 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
         padding, dilation, output_length, transpose, bias != NULL);
     if (!conv) return 0;
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
             dataType:MPSDataTypeFloat32];
@@ -1612,8 +1628,7 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         stride_width, output_depth, output_height, output_width, bias != NULL);
     if (!conv) return 0;
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
             dataType:MPSDataTypeFloat32];
@@ -2070,8 +2085,7 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                                            bias != NULL, dataType);
     if (!linear) return 0;
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *input_data = h3_gpu_graph_data(
             input, linear.inputShape, dataType, 0);
         MPSGraphTensorData *weight_data = h3_gpu_graph_data(
@@ -2253,8 +2267,7 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                   output_dim);
     if (!mlp) return 0;
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *inputData = h3_gpu_graph_data(
             input, mlp.inputShape, MPSDataTypeBFloat16, 0);
         MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
@@ -2720,8 +2733,7 @@ static int h3_gpu_gqa_mps(H3GPU *gpu, h3_gpu_tensor *output,
         return 0;
     }
     @autoreleasepool {
-        MPSCommandBuffer *command =
-            [MPSCommandBuffer commandBufferWithCommandBuffer:gpu.command];
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *query_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(query).buffer shape:cache.queryShape
             dataType:MPSDataTypeBFloat16];

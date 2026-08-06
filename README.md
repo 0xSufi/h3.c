@@ -147,6 +147,11 @@ ABBA gains were 1.6% on M3 Max and 0.4-1.1% on M5 Max. Activation wrappers stay
 transient because retaining them regressed the M5. The outputs remain
 byte-identical, and `H3_DISABLE_GRAPH_DATA_CACHE=1` restores transient wrappers
 for all tensors.
+On M3/older hardware, the four MPSGraph segments in each DiT block also reuse
+one `MPSCommandBuffer` wrapper for their shared underlying Metal command buffer.
+Repeated thermal-balanced runs measured 1.0-1.6% faster on M3 Max; M5 measured
+neutral, so it retains fresh wrappers. `H3_REUSE_MPS_COMMAND=0` or `1` overrides
+the automatic selection. Results are byte-identical.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE

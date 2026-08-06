@@ -164,6 +164,65 @@ static void run_graph_data_ab(h3_dit *dit, float *video, float *audio,
     free(audio_reference);
 }
 
+static void run_mps_command_ab(h3_dit *dit, float *video, float *audio,
+                               float *video_velocity,
+                               float *audio_velocity) {
+    char error[512];
+    setenv("H3_REUSE_MPS_COMMAND", "0", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating MPS-command AB references");
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    setenv("H3_REUSE_MPS_COMMAND", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int reuse_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0;
+    double reused_seconds = 0.0;
+    int baseline_count = 0;
+    int reused_count = 0;
+    for (size_t index = 0;
+         index < sizeof(reuse_pattern) / sizeof(*reuse_pattern); index++) {
+        if (reuse_pattern[index]) setenv("H3_REUSE_MPS_COMMAND", "1", 1);
+        else setenv("H3_REUSE_MPS_COMMAND", "0", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (memcmp(video_reference, video_velocity,
+                   VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+            memcmp(audio_reference, audio_velocity,
+                   AUDIO_ELEMENTS * sizeof(*audio_reference)))
+            die("MPS-command reuse changed DiT output bytes");
+        if (reuse_pattern[index]) {
+            reused_seconds += elapsed;
+            reused_count++;
+            printf("  AB MPS command reused %.3fs\n", elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  AB MPS command baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_REUSE_MPS_COMMAND");
+    printf("DiT MPS-command AB baseline %.4fs, reused %.4fs, ratio %.4f, "
+           "outputs byte-identical\n", baseline_seconds / baseline_count,
+           reused_seconds / reused_count,
+           reused_seconds * baseline_count /
+               (baseline_seconds * reused_count));
+    free(video_reference);
+    free(audio_reference);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -229,6 +288,16 @@ int main(int argc, char **argv) {
     if (getenv("H3_BENCH_GRAPH_DATA_AB")) {
         run_graph_data_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT 512/%u-layer load %.3fs before graph-data AB\n",
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (getenv("H3_BENCH_MPS_COMMAND_AB")) {
+        run_mps_command_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT 512/%u-layer load %.3fs before MPS-command AB\n",
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
