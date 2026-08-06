@@ -631,7 +631,42 @@ static void tile_axis_free(tile_axis *axis) {
     memset(axis, 0, sizeof(*axis));
 }
 
-static int tile_axis_build(int extent, tile_axis *axis, char *error,
+static int tile_count_for_extent(int extent, int tile_pixels) {
+    if (extent <= tile_pixels) return 1;
+    int count = (extent + tile_pixels - 1) / tile_pixels;
+    while (tile_pixels * count - TILE_OVERLAP_MIN * (count - 1) < extent)
+        count++;
+    return count;
+}
+
+static int configured_tile_pixels(int pixel_height, int pixel_width) {
+    const char *value = getenv("H3_VAE_TILE_PIXELS");
+    if (value && *value) {
+        char *end = NULL;
+        long pixels = strtol(value, &end, 10);
+        if (end && !*end && pixels >= TILE_PIXELS && pixels <= 512 &&
+            pixels % SPATIAL_RATIO == 0) return (int)pixels;
+    }
+    int best = TILE_PIXELS;
+    uint64_t best_score = UINT64_MAX;
+    for (int pixels = TILE_PIXELS; pixels <= 320;
+         pixels += SPATIAL_RATIO) {
+        uint64_t tiles = (uint64_t)tile_count_for_extent(pixel_height, pixels) *
+            (uint64_t)tile_count_for_extent(pixel_width, pixels);
+        /* The resident VAE is dominated by linears and activation traffic;
+         * measured tile cost follows area more closely than cubic sequence
+         * growth at these shapes. Attention is still included in each tile. */
+        uint64_t score = tiles * (uint64_t)pixels * (uint64_t)pixels;
+        if (score < best_score) {
+            best = pixels;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+static int tile_axis_build(int extent, int tile_pixels, tile_axis *axis,
+                           char *error,
                            size_t error_size) {
     memset(axis, 0, sizeof(*axis));
     if (extent < 1 || extent % SPATIAL_RATIO) {
@@ -639,7 +674,7 @@ static int tile_axis_build(int extent, tile_axis *axis, char *error,
              SPATIAL_RATIO);
         return 0;
     }
-    if (extent <= TILE_PIXELS) {
+    if (extent <= tile_pixels) {
         axis->count = 1;
         axis->length = extent;
         axis->starts = calloc(1, sizeof(*axis->starts));
@@ -649,9 +684,7 @@ static int tile_axis_build(int extent, tile_axis *axis, char *error,
         }
         return 1;
     }
-    int count = (extent + TILE_PIXELS - 1) / TILE_PIXELS;
-    while (TILE_PIXELS * count - TILE_OVERLAP_MIN * (count - 1) < extent)
-        count++;
+    int count = tile_count_for_extent(extent, tile_pixels);
     axis->starts = calloc((size_t)count, sizeof(*axis->starts));
     axis->overlaps = malloc((size_t)(count - 1) * sizeof(*axis->overlaps));
     if (!axis->starts || !axis->overlaps) {
@@ -661,15 +694,15 @@ static int tile_axis_build(int extent, tile_axis *axis, char *error,
     }
     for (int index = 0; index < count - 1; index++)
         axis->overlaps[index] = TILE_OVERLAP_MIN;
-    int remaining = TILE_PIXELS * count - TILE_OVERLAP_MIN * (count - 1) -
+    int remaining = tile_pixels * count - TILE_OVERLAP_MIN * (count - 1) -
                     extent;
     for (int unit = 0; unit < remaining / SPATIAL_RATIO; unit++)
         axis->overlaps[unit % (count - 1)] += SPATIAL_RATIO;
     for (int index = 1; index < count; index++)
-        axis->starts[index] = axis->starts[index - 1] + TILE_PIXELS -
+        axis->starts[index] = axis->starts[index - 1] + tile_pixels -
                               axis->overlaps[index - 1];
     axis->count = count;
-    axis->length = TILE_PIXELS;
+    axis->length = tile_pixels;
     return 1;
 }
 
@@ -775,20 +808,26 @@ static int decode_chunked(const char *weight_directory,
                           const float *normalized_latent, int latent_time,
                           int latent_height, int latent_width,
                           const float *latent_mean, const float *latent_std,
+                          int tile_pixels,
                           h3_video_vae_progress progress, void *progress_opaque,
                           h3_video_frames *output, char *error,
                           size_t error_size) {
     tile_axis y_axis, x_axis;
     memset(&y_axis, 0, sizeof(y_axis));
     memset(&x_axis, 0, sizeof(x_axis));
-    int ok = tile_axis_build(latent_height * SPATIAL_RATIO, &y_axis,
+    int ok = tile_axis_build(latent_height * SPATIAL_RATIO, tile_pixels,
+                             &y_axis,
                              error, error_size) &&
-             tile_axis_build(latent_width * SPATIAL_RATIO, &x_axis,
+             tile_axis_build(latent_width * SPATIAL_RATIO, tile_pixels,
+                             &x_axis,
                              error, error_size);
     if (!ok) {
         tile_axis_free(&y_axis); tile_axis_free(&x_axis);
         return 0;
     }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: video VAE tiles %dx%d at %d pixels\n",
+                x_axis.count, y_axis.count, tile_pixels);
     vae_context vae;
     memset(&vae, 0, sizeof(vae));
     vae.latent_h = y_axis.length / SPATIAL_RATIO;
@@ -932,6 +971,8 @@ int h3_video_vae_decode(const char *weight_directory,
     float latent_mean[LATENT_CHANNELS], latent_std[LATENT_CHANNELS];
     if (!load_latent_normalization(weight_directory, latent_mean, latent_std,
                                    error, error_size)) return 0;
+    int tile_pixels = configured_tile_pixels(
+        latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
     if (latent_time == 2 &&
         (latent_height > TILE_PIXELS / SPATIAL_RATIO ||
          latent_width > TILE_PIXELS / SPATIAL_RATIO)) {
@@ -940,11 +981,12 @@ int h3_video_vae_decode(const char *weight_directory,
         return 0;
     }
     if (latent_time > CHUNK_LATENT_TIME ||
-        latent_height > TILE_PIXELS / SPATIAL_RATIO ||
-        latent_width > TILE_PIXELS / SPATIAL_RATIO) {
+        latent_height > tile_pixels / SPATIAL_RATIO ||
+        latent_width > tile_pixels / SPATIAL_RATIO) {
         int ok = decode_chunked(weight_directory, shader_source_path,
                                 normalized_latent, latent_time, latent_height,
-                                latent_width, latent_mean, latent_std, progress,
+                                latent_width, latent_mean, latent_std,
+                                tile_pixels, progress,
                                 progress_opaque, output, error, error_size);
         if (!ok) h3_video_frames_free(output);
         return ok;

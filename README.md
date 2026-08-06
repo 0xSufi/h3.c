@@ -78,6 +78,10 @@ transformer-core residual while still refreshing the patch projection and
 timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
 validated aggressive limit; values above 6 lose subject fidelity. Core reuse
 and whole-velocity `--reuse` are intentionally mutually exclusive.
+The video VAE automatically chooses a 256-320 pixel spatial tile from the
+requested canvas geometry, minimizing repeated overlap work while keeping peak
+storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
+tile plan for close-reference diagnosis.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE
