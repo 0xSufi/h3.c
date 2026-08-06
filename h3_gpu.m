@@ -98,6 +98,7 @@
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLLibrary> library;
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
+@property(nonatomic, strong) NSMutableArray<id<MTLCommandBuffer>> *inflightCommands;
 @property(nonatomic, strong) NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3SDPA *> *sdpaCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3GQA *> *gqaCache;
@@ -294,6 +295,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
+        gpu.inflightCommands = [NSMutableArray array];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
         gpu.gqaCache = [NSMutableDictionary dictionary];
         gpu.linearCache = [NSMutableDictionary dictionary];
@@ -410,6 +412,7 @@ void h3_gpu_free(h3_gpu *gpu) {
         id<MTLDevice> device = object.device;
         NSUInteger before = device.currentAllocatedSize;
         object.command = nil;
+        object.inflightCommands = nil;
         object.sdpaCache = nil;
         object.linearCache = nil;
         object.pipelines = nil;
@@ -723,13 +726,36 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
 
 int h3_gpu_begin(h3_gpu *opaque) {
     H3GPU *gpu = GPU(opaque);
-    if (!gpu || gpu.command) return 0;
+    if (!gpu || gpu.command || gpu.inflightCommands.count) return 0;
     gpu.lastError = nil;
     @autoreleasepool {
         gpu.command = [gpu.queue commandBuffer];
     }
     if (!gpu.command) {
         h3_gpu_set_error(gpu, @"cannot create Metal command buffer");
+        return 0;
+    }
+    gpu.commandStartWall = h3_gpu_now();
+    return 1;
+}
+
+int h3_gpu_continue(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.command) return 0;
+    @autoreleasepool {
+        id<MTLCommandBuffer> command = gpu.command;
+        gpu.command = nil;
+        double commit_time = h3_gpu_now();
+        [command commit];
+        [gpu.inflightCommands addObject:command];
+        h3_gpu_stats stats = gpu.stats;
+        stats.submissions++;
+        stats.command_encode_seconds += commit_time - gpu.commandStartWall;
+        gpu.stats = stats;
+        gpu.command = [gpu.queue commandBuffer];
+    }
+    if (!gpu.command) {
+        h3_gpu_set_error(gpu, @"cannot continue Metal command chain");
         return 0;
     }
     gpu.commandStartWall = h3_gpu_now();
@@ -744,21 +770,28 @@ int h3_gpu_submit(h3_gpu *opaque) {
         gpu.command = nil;
         double commit_time = h3_gpu_now();
         [command commit];
-        [command waitUntilCompleted];
+        [gpu.inflightCommands addObject:command];
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands)
+            [pending waitUntilCompleted];
         double complete_time = h3_gpu_now();
-        if (command.status == MTLCommandBufferStatusError) {
-            h3_gpu_set_error(gpu, @"Metal command failed: %@",
-                             command.error.localizedDescription);
-            return 0;
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands) {
+            if (pending.status == MTLCommandBufferStatusError) {
+                h3_gpu_set_error(gpu, @"Metal command failed: %@",
+                                 pending.error.localizedDescription);
+                [gpu.inflightCommands removeAllObjects];
+                return 0;
+            }
         }
         h3_gpu_stats stats = gpu.stats;
         stats.submissions++;
         stats.command_encode_seconds += commit_time - gpu.commandStartWall;
         stats.command_wait_seconds += complete_time - commit_time;
-        if (command.GPUEndTime >= command.GPUStartTime) {
-            stats.gpu_seconds += command.GPUEndTime - command.GPUStartTime;
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands) {
+            if (pending.GPUEndTime >= pending.GPUStartTime)
+                stats.gpu_seconds += pending.GPUEndTime - pending.GPUStartTime;
         }
         gpu.stats = stats;
+        [gpu.inflightCommands removeAllObjects];
     }
     return 1;
 }

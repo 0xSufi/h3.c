@@ -325,6 +325,8 @@ int main(int argc, char **argv) {
     require_gpu(&test, h3_gpu_linear_bf16(test.gpu, full_attn, full_sdpa,
                                            out_w, NULL, SEQUENCE, INNER, HIDDEN),
                 "full attention output");
+    require_gpu(&test, h3_gpu_continue(test.gpu),
+                "continue split command stream");
     require_gpu(&test, h3_gpu_gate_bf16(test.gpu, after_attn, h_in, full_attn,
                                          modulation, gpu_rows, SEQUENCE, HIDDEN,
                                          MODULATION_SLOTS, 2), "attention gate");
@@ -417,8 +419,8 @@ int main(int argc, char **argv) {
     require(stats.mps_linear_dispatches == 6,
             "wide BF16 linears did not use the cached MPSGraph path");
     require(stats.mps_sdpa_dispatches == 2, "BF16 SDPA counter mismatch");
-    require(stats.submissions == setup_stats.submissions + 1,
-            "block used more than one command submission");
+    require(stats.submissions == setup_stats.submissions + 2,
+            "split block did not use two command submissions");
     cleanup(&test);
     puts("ok: portable BF16 Metal block matches the MLX BF16 oracle");
     return 0;

@@ -121,6 +121,19 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+static unsigned command_block_interval(const h3_dit *dit) {
+    const char *value = getenv("H3_DIT_COMMAND_BLOCKS");
+    if (value && *value) {
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+        return end != value && !*end && parsed >= 0 &&
+               parsed <= H3_DIT_BLOCKS ? (unsigned)parsed : 0;
+    }
+    if (h3_gpu_is_m5(dit->gpu))
+        return dit->active_block_count * 3 / 5;
+    return dit->active_block_count == H3_DIT_BLOCKS ? 30u : 0u;
+}
+
 static int gpu_op(h3_dit *dit, int ok, char *error, size_t error_size,
                   const char *operation) {
     if (ok) return 1;
@@ -990,9 +1003,16 @@ static int encode_forward(h3_dit *dit, int step, char *error,
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
     if (evaluate_core) {
+        unsigned command_blocks = command_block_interval(dit);
+        unsigned completed_blocks = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             if (!dit->block_active[block]) continue;
             if (!run_block(dit, block, step, error, error_size)) return 0;
+            completed_blocks++;
+            if (command_blocks &&
+                completed_blocks < dit->active_block_count &&
+                completed_blocks % command_blocks == 0)
+                OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
         }
         if (dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,

@@ -74,6 +74,9 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    const uint16_t *values, size_t elements);
 
 int h3_gpu_begin(h3_gpu *gpu);
+/* Commit the current command buffer without waiting, then continue encoding on
+ * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
+int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
