@@ -68,11 +68,12 @@ static void *load(test_context *test, const char *name, h3_dtype dtype,
 
 static h3_gpu_tensor *upload_bf16(test_context *test, const char *name,
                                    size_t elements) {
-    uint16_t *values = load(test, name, H3_DTYPE_BF16, elements);
-    h3_gpu_tensor *tensor = own(test, h3_gpu_tensor_from_bf16(
-                                         test->gpu, values, elements));
-    free(values);
-    return tensor;
+    const h3_st_tensor *source = h3_st_find(&test->fixture, name);
+    require(source != NULL && source->dtype == H3_DTYPE_BF16 &&
+            h3_st_tensor_elements(source) == (uint64_t)elements,
+            "invalid direct-load BF16 tensor");
+    return own(test, h3_gpu_tensor_load_bf16(test->gpu, test->fixture.path,
+                                              source->file_offset, elements));
 }
 
 static h3_gpu_tensor *upload_f32(test_context *test, const char *name,

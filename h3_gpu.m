@@ -5,10 +5,14 @@
 
 #include "h3_gpu.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 @interface H3Tensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -267,6 +271,45 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
 }
 
+h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *opaque, const char *path,
+                                       uint64_t file_offset, size_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !path || !*path || file_offset > INT64_MAX ||
+        elements > SIZE_MAX / sizeof(uint16_t)) return NULL;
+    size_t bytes = elements * sizeof(uint16_t);
+    if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
+    h3_gpu_tensor *opaque_tensor = h3_gpu_tensor_new_bf16(opaque, elements);
+    if (!opaque_tensor) return NULL;
+    H3Tensor *tensor = TENSOR(opaque_tensor);
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        h3_gpu_set_error(gpu, @"cannot open %s: %s", path, strerror(errno));
+        h3_gpu_tensor_free(opaque_tensor);
+        return NULL;
+    }
+    size_t remaining = bytes;
+    size_t completed = 0;
+    while (remaining) {
+        size_t request = MIN(remaining, (size_t)SSIZE_MAX);
+        ssize_t count = pread(descriptor,
+                              (unsigned char *)tensor.buffer.contents + completed,
+                              request, (off_t)(file_offset + completed));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            int detail = count < 0 ? errno : 0;
+            h3_gpu_set_error(gpu, @"cannot read BF16 payload from %s: %s", path,
+                             detail ? strerror(detail) : "unexpected end of file");
+            close(descriptor);
+            h3_gpu_tensor_free(opaque_tensor);
+            return NULL;
+        }
+        completed += (size_t)count;
+        remaining -= (size_t)count;
+    }
+    close(descriptor);
+    return opaque_tensor;
+}
+
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
     if (!tensor) return;
     H3Tensor *object = CFBridgingRelease(tensor);
@@ -322,6 +365,9 @@ int h3_gpu_submit(h3_gpu *opaque) {
     }
     h3_gpu_stats stats = gpu.stats;
     stats.submissions++;
+    if (command.GPUEndTime >= command.GPUStartTime) {
+        stats.gpu_seconds += command.GPUEndTime - command.GPUStartTime;
+    }
     gpu.stats = stats;
     return 1;
 }
@@ -725,14 +771,28 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                input_dim, output_dim)) return 1;
     linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
-    return h3_gpu_dispatch_2d(gpu, @"h3_linear_bf16", output_dim, rows,
-        ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
-            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
-            [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
-            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
-            [encoder setBytes:&args length:sizeof(args) atIndex:4];
-        });
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
+                                                           @"h3_linear_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the 16x16 BF16 linear tile");
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+    [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+    [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+    [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+    [encoder setBytes:&args length:sizeof(args) atIndex:4];
+    [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                              (rows + 15) / 16, 1)
+             threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [encoder endEncoding];
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_silu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

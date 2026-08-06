@@ -20,6 +20,7 @@ typedef struct {
     uint64_t mps_linear_dispatches;
     uint64_t mps_sdpa_dispatches;
     uint64_t submissions;
+    double gpu_seconds;
 } h3_gpu_stats;
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
@@ -34,6 +35,9 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
+/* Allocate shared Metal storage and pread BF16 payload directly into it. */
+h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
+                                       uint64_t file_offset, size_t elements);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);

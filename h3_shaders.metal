@@ -199,17 +199,35 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
                            device const ushort *bias [[buffer(2)]],
                            device ushort *output [[buffer(3)]],
                            constant linear_args &args [[buffer(4)]],
-                           uint2 gid [[thread_position_in_grid]]) {
-    uint column = gid.x;
-    uint row = gid.y;
-    if (row >= args.rows || column >= args.output_dim) return;
-    float sum = args.has_bias ? h3_bf16_to_f32(bias[column]) : 0.0f;
-    device const ushort *x = input + row * args.input_dim;
-    device const ushort *w = weight + column * args.input_dim;
-    for (uint k = 0; k < args.input_dim; k++) {
-        sum = fma(h3_bf16_to_f32(x[k]), h3_bf16_to_f32(w[k]), sum);
+                           uint2 tid [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    /* Adapted from Iris's short-sequence Qwen path. Each 16x16 weight/input
+     * tile is loaded once per threadgroup instead of once per output scalar. */
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = args.has_bias && column < args.output_dim ?
+        h3_bf16_to_f32(bias[column]) : 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            h3_bf16_to_f32(input[row * args.input_dim + input_k]) : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+            h3_bf16_to_f32(weight[column * args.input_dim + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++) {
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+    if (row < args.rows && column < args.output_dim) {
+        output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+    }
 }
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],
