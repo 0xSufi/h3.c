@@ -4,7 +4,8 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
-	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
+	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \

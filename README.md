@@ -40,6 +40,9 @@ make test
 ./h3 --profile -d MiniMax-H3 -p "A surfer riding a blue ocean wave" \
   --width 512 --height 512 --frames 22 --steps 20 --core-reuse 4 \
   -o outputs/fast-surfer.mp4
+./h3 --profile -d MiniMax-H3 -p "A red fox walking through snow" \
+  --width 512 --height 512 --render-width 384 --render-height 384 \
+  --frames 22 --steps 20 --reuse 3 -o outputs/fast-scaled-fox.mp4
 ```
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
@@ -78,6 +81,13 @@ transformer-core residual while still refreshing the patch projection and
 timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
 validated aggressive limit; values above 6 lose subject fidelity. Core reuse
 and whole-velocity `--reuse` are intentionally mutually exclusive.
+`--render-width` and `--render-height` run the model and VAE on a lower
+same-aspect internal canvas, then high-quality vImage-scale RGB frames to the
+requested output size before callbacks, terminal display, and encoding. This is an
+explicit quality/speed tradeoff: a measured 384-to-512 prompt render reduced
+M5 DiT time by 33% and video-VAE time by 18% while retaining a clean,
+recognizable photorealistic result. Both values must be multiples of 32; the
+exact output canvas remains the default.
 The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative

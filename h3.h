@@ -73,6 +73,10 @@ typedef struct {
     /* Recompute the transformer core every N denoiser steps while refreshing
      * the timestep head each step. 1 is exact, 4 fast, and 6 aggressive. */
     int core_reuse;
+    /* Optional lower internal model canvas. Both must be zero (exact output
+     * canvas) or valid same-aspect dimensions no larger than width/height. */
+    int render_width;
+    int render_height;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
@@ -81,7 +85,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

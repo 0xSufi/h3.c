@@ -286,6 +286,29 @@ static void test_rng_and_solver(void) {
     CHECK(!h3_euler_velocity_step(euler, velocity, 2, 0.25f, 0.25f));
 }
 
+static void test_rgb_resize(void) {
+    const uint8_t constant[] = {
+        17, 33, 201, 17, 33, 201,
+        17, 33, 201, 17, 33, 201
+    };
+    uint8_t *identity = NULL;
+    CHECK(h3_resize_rgb24_high_quality(constant, 1, 2, 2, 2, 2, &identity));
+    CHECK(identity != NULL);
+    CHECK(memcmp(identity, constant, sizeof(constant)) == 0);
+    free(identity);
+
+    uint8_t *upscaled = NULL;
+    CHECK(h3_resize_rgb24_high_quality(constant, 1, 2, 2, 8, 8, &upscaled));
+    CHECK(upscaled != NULL);
+    for (size_t pixel = 0; pixel < 64; pixel++) {
+        CHECK(upscaled[3 * pixel] == 17);
+        CHECK(upscaled[3 * pixel + 1] == 33);
+        CHECK(upscaled[3 * pixel + 2] == 201);
+    }
+    free(upscaled);
+    CHECK(!h3_resize_rgb24_high_quality(NULL, 1, 2, 2, 8, 8, &upscaled));
+}
+
 static void test_dit_row_conversions(void) {
     enum { C = 3, T = 2, H = 4, W = 6, VIDEO = C * T * H * W };
     float latent[VIDEO], rows[VIDEO], roundtrip[VIDEO];
@@ -329,6 +352,7 @@ int main(void) {
     test_layout_ref2va();
     test_safetensors();
     test_rng_and_solver();
+    test_rgb_resize();
     test_dit_row_conversions();
     test_metal_probe();
     printf("ok: %d checks\n", tests_run);

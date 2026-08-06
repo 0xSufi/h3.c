@@ -18,6 +18,8 @@ static void usage(const char *program) {
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
+        "      --render-width N   Lower internal model width (optional)\n"
+        "      --render-height N  Lower internal model height (optional)\n"
         "      --frames N         Requested frames (default: 56)\n"
         "      --steps N          Sigma points (default: 50; 49 forwards)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
@@ -143,7 +145,8 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 }
 
 int main(int argc, char **argv) {
-    enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_FRAMES, OPT_STEPS, OPT_REUSE,
+    enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
+           OPT_FRAMES, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_SEED,
@@ -156,6 +159,8 @@ int main(int argc, char **argv) {
         {"output", required_argument, NULL, 'o'},
         {"width", required_argument, NULL, OPT_WIDTH},
         {"height", required_argument, NULL, OPT_HEIGHT},
+        {"render-width", required_argument, NULL, OPT_RENDER_WIDTH},
+        {"render-height", required_argument, NULL, OPT_RENDER_HEIGHT},
         {"frames", required_argument, NULL, OPT_FRAMES},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"reuse", required_argument, NULL, OPT_REUSE},
@@ -195,6 +200,12 @@ int main(int argc, char **argv) {
             case 'h': usage(argv[0]); return 0;
             case OPT_WIDTH: params.width = parse_int(optarg, "width"); break;
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
+            case OPT_RENDER_WIDTH:
+                params.render_width = parse_int(optarg, "render width");
+                break;
+            case OPT_RENDER_HEIGHT:
+                params.render_height = parse_int(optarg, "render height");
+                break;
             case OPT_FRAMES: params.frames = parse_int(optarg, "frames"); break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_REUSE:

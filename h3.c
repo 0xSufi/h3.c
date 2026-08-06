@@ -156,6 +156,24 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "canvas exceeds the released 768*1344 pixel limit");
         return 0;
     }
+    if ((params->render_width == 0) != (params->render_height == 0)) {
+        h3_set_error(ctx, "render width and height must be set together");
+        return 0;
+    }
+    if (params->render_width) {
+        if (params->render_width < 32 || params->render_height < 32 ||
+            params->render_width % H3_CANVAS_MULTIPLE ||
+            params->render_height % H3_CANVAS_MULTIPLE ||
+            params->render_width > params->width ||
+            params->render_height > params->height ||
+            (int64_t)params->render_width * params->height !=
+                (int64_t)params->render_height * params->width) {
+            h3_set_error(ctx,
+                "internal render canvas must be same-aspect multiples of 32 "
+                "no larger than the output canvas");
+            return 0;
+        }
+    }
     if (params->frames < 5 || h3_align_frame_count(params->frames) > 362) {
         h3_set_error(ctx, "frames must align within the released 5..362 range");
         return 0;
@@ -323,6 +341,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    int render_width = params->render_width ? params->render_width :
+                                               params->width;
+    int render_height = params->render_height ? params->render_height :
+                                                 params->height;
     if (h3_align_frame_count(params->frames) < 22) {
         h3_set_error(ctx,
             "generation requires at least one trained 22-frame decoder chunk");
@@ -425,7 +447,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (progress.cancelled) goto cleanup;
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
-    h3_latent_canvas(params->width, params->height, &latent_w, &latent_h);
+    h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
 
     if (ref2va) {
         for (size_t index = 0; index < params->reference_count; index++) {
@@ -446,7 +468,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (reference->kind == H3_REFERENCE_IMAGE) {
                 if (!h3_reference_image_canvas(
                         source_width, source_height,
-                        params->width, params->height,
+                        render_width, render_height,
                         params->reference_image_size == H3_REFERENCE_IMAGE_MAX ?
                         2048 : 0, &media_width, &media_height)) {
                     h3_set_error(ctx,
@@ -633,28 +655,28 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (params->first_frame) {
             keyframes[keyframe_count++] = 0;
             if (!h3_ffmpeg_read_image_f32(
-                    params->first_frame, params->width, params->height,
+                    params->first_frame, render_width, render_height,
                     H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
-            condition_widths[visual_count] = params->width;
-            condition_heights[visual_count] = params->height;
+            condition_widths[visual_count] = render_width;
+            condition_heights[visual_count] = render_height;
             condition_frames[visual_count] = 1;
             visual_count++;
         }
         if (params->last_frame) {
             keyframes[keyframe_count++] = temporal.frame_count - 1;
             if (!h3_ffmpeg_read_image_f32(
-                    params->last_frame, params->width, params->height,
+                    params->last_frame, render_width, render_height,
                     H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
-            condition_widths[visual_count] = params->width;
-            condition_heights[visual_count] = params->height;
+            condition_widths[visual_count] = render_width;
+            condition_heights[visual_count] = render_height;
             condition_frames[visual_count] = 1;
             visual_count++;
         }
@@ -940,10 +962,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (scaled > 255.0f) scaled = 255.0f;
         rgb8[index] = (uint8_t)lrintf(scaled);
     }
+    int output_width = frames.width;
+    int output_height = frames.height;
+    if (output_width != params->width || output_height != params->height) {
+        uint8_t *resized = NULL;
+        if (!h3_resize_rgb24_high_quality(
+                rgb8, frames.frames, output_width, output_height,
+                params->width, params->height, &resized)) {
+            h3_set_error(ctx, "cannot resize generated RGB frames");
+            goto cleanup;
+        }
+        free(rgb8);
+        rgb8 = resized;
+        output_width = params->width;
+        output_height = params->height;
+    }
     if (params->on_frame) {
-        size_t frame_bytes = (size_t)frames.width * (size_t)frames.height * 3;
+        size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
         for (int index = 0; index < frames.frames; index++) {
-            h3_frame frame = {frames.width, frames.height, frames.width * 3,
+            h3_frame frame = {output_width, output_height, output_width * 3,
                               rgb8 + (size_t)index * frame_bytes,
                               index, frames.frames};
             if (params->on_frame(&frame, params->callback_opaque)) {
@@ -956,8 +993,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (params->output_path && *params->output_path) {
         h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
         if (!h3_ffmpeg_write_av_rgb24_f32(
-                params->output_path, rgb8, frames.frames, frames.width,
-                frames.height, H3_FPS, waveform.pcm, waveform.samples,
+                params->output_path, rgb8, frames.frames, output_width,
+                output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate,
                 detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
@@ -970,8 +1007,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory creating generation result");
         goto cleanup;
     }
-    result->width = frames.width;
-    result->height = frames.height;
+    result->width = output_width;
+    result->height = output_height;
     result->frames = frames.frames;
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;

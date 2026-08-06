@@ -125,6 +125,14 @@ uint32_t h3_rng_u32(h3_rng *rng);
 float h3_rng_normal(h3_rng *rng);
 void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count);
 
+/* Resize interleaved RGB24 frames with Accelerate/vImage high-quality
+ * resampling. The caller owns *output. Identity geometry still returns an
+ * independent copy. */
+int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
+                                 int input_width, int input_height,
+                                 int output_width, int output_height,
+                                 uint8_t **output);
+
 int h3_res_step(float *output, const float *sample, const float *denoised,
                 const float *old_denoised, size_t count,
                 const float *sigmas, int step, int total_steps);
