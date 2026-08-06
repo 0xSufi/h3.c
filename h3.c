@@ -82,13 +82,29 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         return NULL;
     }
     if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
-        !h3_require_file(ctx, "Ref2VA/transformer/config.json") ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
         !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
         !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
-        !h3_inventory(ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer) ||
         !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
+     * FL2VA usable while that optional 62 GiB checkpoint is not installed. */
+    char *ref_index = h3_path(
+        ctx->model_dir, "Ref2VA/transformer/model.safetensors.index.json");
+    if (!ref_index) {
+        h3_set_error(ctx, "out of memory resolving optional Ref2VA path");
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    int has_ref2va = h3_is_file(ref_index);
+    free(ref_index);
+    if (has_ref2va && !h3_inventory(
+            ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
         return NULL;
