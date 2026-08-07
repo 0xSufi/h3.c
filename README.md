@@ -60,7 +60,10 @@ FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 uncompressed media file is created.
 
 The CLI follows Iris-style conventions. `--show` has a callback-based terminal
-renderer for Kitty/Ghostty and iTerm2/WezTerm/Konsole. Prompt-to-video is now a
+renderer for Kitty/Ghostty and iTerm2/WezTerm/Konsole. `--frames-dir DIR`
+writes callback frames as PPM files; combine it with `-o ''` to inspect frames
+on a machine without FFmpeg while retaining the same generation path.
+Prompt-to-video is now a
 working native vertical slice: a corrected 512x512x22 run produces a coherent
 fox walking through a snowy pine forest, semantically matching the independent
 MLX render. The default sampler follows current SGLang serving: 50 shifted sigma

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static void usage(const char *program) {
     fprintf(stderr,
@@ -35,6 +36,7 @@ static void usage(const char *program) {
         "      --ref-silent-video PATH  Append video without its audio\n"
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
+        "      --frames-dir PATH  Write generated frames as PPM files\n"
         "      --show             Graphical-terminal frame display (M5)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
@@ -110,6 +112,8 @@ typedef struct {
     int total;
     h3_terminal_protocol terminal;
     int display_failed;
+    const char *frames_dir;
+    int frame_write_failed;
 } cli_state;
 
 static int cli_progress(const char *phase, int completed, int total,
@@ -132,6 +136,35 @@ static int cli_progress(const char *phase, int completed, int total,
 
 static int cli_frame(const h3_frame *frame, void *opaque) {
     cli_state *state = opaque;
+    if (state->frames_dir && !state->frame_write_failed) {
+        char path[1024];
+        int length = snprintf(path, sizeof(path), "%s/frame-%04d.ppm",
+                              state->frames_dir, frame->frame_index);
+        FILE *output = length > 0 && (size_t)length < sizeof(path) ?
+            fopen(path, "wb") : NULL;
+        if (!output ||
+            fprintf(output, "P6\n%d %d\n255\n", frame->width,
+                    frame->height) < 0) {
+            fprintf(stderr, "h3: cannot write frame %d to %s\n",
+                    frame->frame_index, state->frames_dir);
+            if (output) fclose(output);
+            state->frame_write_failed = 1;
+        } else {
+            size_t row_bytes = (size_t)frame->width * 3;
+            for (int row = 0; row < frame->height; row++) {
+                if (fwrite(frame->rgb + (size_t)row * frame->stride, 1,
+                           row_bytes, output) != row_bytes) {
+                    state->frame_write_failed = 1;
+                    break;
+                }
+            }
+            if (fclose(output) != 0) state->frame_write_failed = 1;
+            if (state->frame_write_failed)
+                fprintf(stderr, "h3: incomplete frame %d in %s\n",
+                        frame->frame_index, state->frames_dir);
+        }
+    }
+    if (state->frame_write_failed) return 1;
     if (state->display_failed || state->terminal == H3_TERM_NONE) return 0;
     fprintf(stderr, "h3: frame %d/%d via %s\n", frame->frame_index + 1,
             frame->frame_count, h3_terminal_protocol_name(state->terminal));
@@ -154,7 +187,7 @@ int main(int argc, char **argv) {
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
-           OPT_REF_AUDIO, OPT_SHOW, OPT_PROFILE, OPT_INFO };
+           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -178,6 +211,7 @@ int main(int argc, char **argv) {
         {"ref-silent-video", required_argument, NULL, OPT_REF_SILENT_VIDEO},
         {"ref-video-audio", required_argument, NULL, OPT_REF_VIDEO_AUDIO},
         {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
+        {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
@@ -190,7 +224,7 @@ int main(int argc, char **argv) {
     h3_params params = H3_PARAMS_DEFAULT;
     h3_reference references[12];
     size_t reference_count = 0;
-    cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0};
+    cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
     int show = 0;
     int profile = 0;
     int info = 0;
@@ -278,6 +312,7 @@ int main(int argc, char **argv) {
                 reference->path = optarg;
                 break;
             }
+            case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;
@@ -290,6 +325,12 @@ int main(int argc, char **argv) {
     }
     params.references = references;
     params.reference_count = reference_count;
+    if (cli.frames_dir && mkdir(cli.frames_dir, 0755) != 0 &&
+        errno != EEXIST) {
+        fprintf(stderr, "h3: cannot create frames directory %s: %s\n",
+                cli.frames_dir, strerror(errno));
+        return 1;
+    }
     if (profile) setenv("H3_PROFILE", "1", 1);
     h3_ctx *ctx = h3_load_dir(model_dir);
     if (!ctx) {
@@ -301,6 +342,7 @@ int main(int argc, char **argv) {
         params.output_path = output;
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;
+        if (cli.frames_dir) params.on_frame = cli_frame;
         if (show) {
             cli.terminal = h3_terminal_detect();
             if (cli.terminal == H3_TERM_NONE) {
@@ -320,7 +362,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         h3_result_free(result);
-        fprintf(stderr, "h3: wrote %s\n", output);
+        if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
+        if (cli.frames_dir)
+            fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
     }
     h3_free(ctx);
     return 0;
