@@ -736,17 +736,22 @@ static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
                               float *video_velocity,
                               float *audio_velocity) {
     char error[512];
+    int split_boundary_ab =
+        getenv("H3_BENCH_NAX_SPLIT_BOUNDARY_AB") != NULL;
     int head_major_ab = getenv("H3_BENCH_HEAD_MAJOR_SDPA_AB") != NULL;
     int split_qkv_ab = getenv("H3_BENCH_SPLIT_NAX_QKV_AB") != NULL;
     int schedule_ab = getenv("H3_BENCH_NAX_LINEAR_MORTON_AB") != NULL;
-    const char *disable = head_major_ab ? "H3_DISABLE_HEAD_MAJOR_SDPA" :
+    const char *disable = split_boundary_ab ? "H3_NAX_SPLIT_ROWS" :
+        head_major_ab ? "H3_DISABLE_HEAD_MAJOR_SDPA" :
         split_qkv_ab ? "H3_DISABLE_SPLIT_NAX_QKV" :
         schedule_ab ? "H3_DISABLE_NAX_LINEAR_MORTON4" :
                       "H3_DISABLE_NAX_LINEAR";
-    const char *baseline_name = head_major_ab ? "row-major split QKV" :
+    const char *baseline_name = split_boundary_ab ? "split 1536" :
+        head_major_ab ? "row-major split QKV" :
         split_qkv_ab ? "grouped NAX QKV" :
         schedule_ab ? "row-major NAX" : "MPSGraph";
-    const char *candidate_name = head_major_ab ? "head-major split QKV" :
+    const char *candidate_name = split_boundary_ab ? "split 2048" :
+        head_major_ab ? "head-major split QKV" :
         split_qkv_ab ? "split NAX QKV" :
         schedule_ab ? "compact NAX" : "NAX";
     float *baseline_video = malloc(VIDEO_ELEMENTS * sizeof(*baseline_video));
@@ -759,7 +764,7 @@ static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
     h3_gpu_stats stats_before, stats_baseline, stats_candidate;
     if (!h3_dit_get_gpu_stats(dit, &stats_before))
         die("cannot read NAX linear baseline GPU stats");
-    setenv(disable, "1", 1);
+    setenv(disable, split_boundary_ab ? "1536" : "1", 1);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
     if (!h3_dit_get_gpu_stats(dit, &stats_baseline))
@@ -768,7 +773,8 @@ static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
            VIDEO_ELEMENTS * sizeof(*baseline_video));
     memcpy(baseline_audio, audio_velocity,
            AUDIO_ELEMENTS * sizeof(*baseline_audio));
-    unsetenv(disable);
+    if (split_boundary_ab) setenv(disable, "2048", 1);
+    else unsetenv(disable);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
     if (!h3_dit_get_gpu_stats(dit, &stats_candidate))
@@ -782,8 +788,12 @@ static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
     double baseline_seconds = 0.0, candidate_seconds = 0.0;
     int baseline_count = 0, candidate_count = 0;
     for (size_t run = 0; run < sizeof(pattern) / sizeof(*pattern); run++) {
-        if (pattern[run]) unsetenv(disable);
-        else setenv(disable, "1", 1);
+        if (pattern[run]) {
+            if (split_boundary_ab) setenv(disable, "2048", 1);
+            else unsetenv(disable);
+        } else {
+            setenv(disable, split_boundary_ab ? "1536" : "1", 1);
+        }
         double start = seconds();
         if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
                             audio_velocity, error, sizeof(error))) die(error);
@@ -1381,6 +1391,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (getenv("H3_BENCH_NAX_LINEAR_AB") ||
+        getenv("H3_BENCH_NAX_SPLIT_BOUNDARY_AB") ||
         getenv("H3_BENCH_HEAD_MAJOR_SDPA_AB") ||
         getenv("H3_BENCH_SPLIT_NAX_QKV_AB") ||
         getenv("H3_BENCH_NAX_LINEAR_MORTON_AB")) {

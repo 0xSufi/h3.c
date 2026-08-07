@@ -2327,7 +2327,13 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, weight, weight_count, @"linear weight") ||
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
-    BOOL specializedRows = rows <= 2048;
+    const char *splitRowsValue = getenv("H3_NAX_SPLIT_ROWS");
+    BOOL autoSplitRows = gpu.tensorOpsEnabled && rows > 2048 && rows <= 3072 &&
+        (gpu.tensorOpsMode == 2 || gpu.tensorOpsMode == 3 ||
+         gpu.tensorOpsMode == 4);
+    BOOL splitRows = rows > 2048 &&
+        (autoSplitRows || (splitRowsValue && *splitRowsValue));
+    BOOL specializedRows = rows <= 2048 || splitRows;
     BOOL naxShape = gpu.tensorOpsMode == 1 ||
         (specializedRows && gpu.tensorOpsMode == 2 &&
          input_dim == 7168 && output_dim == 5376) ||
@@ -2339,11 +2345,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (gpu.tensorOpsEnabled && naxShape && !bias && rows >= 128 &&
         !getenv("H3_DISABLE_NAX_LINEAR") &&
         (input_dim % 32) == 0 && (output_dim % 64) == 0) {
-        linear_args args = {rows, input_dim, output_dim, 0};
         if (!h3_gpu_require_command(gpu)) return 0;
-        uint32_t row_tiles = (rows + 127) / 128;
         uint32_t column_tiles = (output_dim + 63) / 64;
-        BOOL morton4 = rows <= 2048 && !(column_tiles % 4) &&
+        BOOL morton4 = (rows <= 2048 || splitRows) &&
+                       !(column_tiles % 4) &&
                        getenv("H3_DISABLE_NAX_LINEAR_MORTON4") == NULL;
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
             gpu, morton4 ? @"h3_linear_bf16_nax_r128_morton4" :
@@ -2352,13 +2357,29 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps");
             return 0;
         }
-        @autoreleasepool {
+        uint32_t splitAt = splitRows ? 2048 : rows;
+        if (splitRows) {
+            unsigned long requested = splitRowsValue ?
+                strtoul(splitRowsValue, NULL, 10) : 0;
+            if (requested >= 128 && requested <= 2048)
+                splitAt = (uint32_t)requested;
+        }
+        uint32_t dispatches = 0;
+        for (uint32_t rowOffset = 0; rowOffset < rows;
+             rowOffset += splitAt) @autoreleasepool {
+            uint32_t chunkRows = MIN(splitAt, rows - rowOffset);
+            linear_args args = {chunkRows, input_dim, output_dim, 0};
+            uint32_t row_tiles = (chunkRows + 127) / 128;
             id<MTLComputeCommandEncoder> encoder =
                 [gpu.command computeCommandEncoder];
             [encoder setComputePipelineState:pipeline];
-            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(input).buffer
+                         offset:(NSUInteger)rowOffset * input_dim *
+                                sizeof(uint16_t) atIndex:0];
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
-            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(output).buffer
+                         offset:(NSUInteger)rowOffset * output_dim *
+                                sizeof(uint16_t) atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
             if (morton4) {
                 [encoder dispatchThreadgroups:
@@ -2370,9 +2391,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             }
             [encoder endEncoding];
+            dispatches++;
         }
         h3_gpu_stats stats = gpu.stats;
-        stats.direct_dispatches++;
+        stats.direct_dispatches += dispatches;
         gpu.stats = stats;
         return 1;
     }
