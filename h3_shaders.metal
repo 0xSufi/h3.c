@@ -1364,6 +1364,7 @@ kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
 
 struct h3_token_pool_args {
     uint input_offset;
+    uint baseline_offset;
     uint rows;
     uint width;
 };
@@ -1374,22 +1375,26 @@ kernel void h3_token_pool_bf16(
                          device const ushort *input [[buffer(0)]],
                          device const uint2 *pairs [[buffer(1)]],
                          device ushort *output [[buffer(2)]],
-                         constant h3_token_pool_args &args [[buffer(3)]],
+                         device ushort *baseline [[buffer(3)]],
+                         device const uint *baseline_indices [[buffer(4)]],
+                         constant h3_token_pool_args &args [[buffer(5)]],
                          uint2 gid [[thread_position_in_grid]]) {
     uint column = gid.x;
     uint row = gid.y;
     if (row >= args.rows || column >= args.width) return;
     uint2 pair = pairs[row];
     ushort first = input[args.input_offset + pair.x * args.width + column];
-    if (pair.x == pair.y) {
-        output[row * args.width + column] = first;
-    } else {
-        float average = (h3_bf16_to_f32(first) +
-                         h3_bf16_to_f32(
-                             input[args.input_offset + pair.y * args.width +
-                                   column])) * 0.5f;
-        output[row * args.width + column] = h3_f32_to_bf16(average);
+    ushort pooled = first;
+    if (pair.x != pair.y) {
+        float average = (h3_bf16_to_f32(first) + h3_bf16_to_f32(
+            input[args.input_offset + pair.y * args.width + column])) * 0.5f;
+        pooled = h3_f32_to_bf16(average);
     }
+    output[row * args.width + column] = pooled;
+    uint baseline_index = baseline_indices[row];
+    if (baseline_index != 0xffffffffu)
+        baseline[args.baseline_offset + baseline_index * args.width + column] =
+            pooled;
 }
 
 struct h3_token_expand_args {
@@ -1407,9 +1412,10 @@ kernel void h3_token_expand_delta_bf16(
                          device const ushort *original [[buffer(0)]],
                          device const ushort *reduced [[buffer(1)]],
                          device const ushort *baseline [[buffer(2)]],
-                         device const uint *parents [[buffer(3)]],
-                         device ushort *output [[buffer(4)]],
-                         constant h3_token_expand_args &args [[buffer(5)]],
+                         device const uint *baseline_indices [[buffer(3)]],
+                         device const uint *parents [[buffer(4)]],
+                         device ushort *output [[buffer(5)]],
+                         constant h3_token_expand_args &args [[buffer(6)]],
                          uint2 gid [[thread_position_in_grid]]) {
     uint column = gid.x;
     uint row = gid.y;
@@ -1420,8 +1426,13 @@ kernel void h3_token_expand_delta_bf16(
     if (row < args.exact_prefix_rows) {
         output[destination] = reduced[reduced_index];
     } else {
+        uint baseline_row = baseline_indices[parent];
+        if (baseline_row == 0xffffffffu) {
+            output[destination] = reduced[reduced_index];
+            return;
+        }
         uint baseline_index = args.baseline_offset +
-            (parent - args.exact_prefix_rows) * args.width + column;
+            baseline_row * args.width + column;
         float update = h3_bf16_to_f32(reduced[reduced_index]) -
                        h3_bf16_to_f32(baseline[baseline_index]);
         output[destination] = h3_f32_to_bf16(

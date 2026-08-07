@@ -75,6 +75,7 @@ struct h3_dit {
     uint32_t sequence;
     uint32_t reduced_sequence;
     uint32_t reduced_video_rows;
+    uint32_t token_baseline_rows;
     h3_gpu_tensor *refined_text;
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
@@ -111,11 +112,10 @@ struct h3_dit {
     h3_gpu_tensor *attention_heads;
     h3_gpu_tensor *attention_output;
     h3_gpu_tensor *token_pool_pairs;
+    h3_gpu_tensor *token_baseline_indices;
     h3_gpu_tensor *token_expand_parents;
     h3_gpu_tensor *token_original;
-    h3_gpu_tensor *token_baseline;
     int token_original_in_qkv;
-    int token_baseline_in_attention;
     size_t token_original_offset;
     size_t token_baseline_offset;
     h3_gpu_tensor *mod_mlp;
@@ -405,6 +405,7 @@ static int configure_token_reduction(h3_dit *dit, int requested,
     dit->token_reduction_early_end = early_end;
     dit->token_reduction_scale = scale;
     dit->reduced_video_rows = (uint32_t)reduced_video;
+    dit->token_baseline_rows = dit->video_rows - dit->reduced_video_rows;
     dit->reduced_sequence = dit->video_target_start +
                             dit->reduced_video_rows;
     return 1;
@@ -785,26 +786,46 @@ static int prepare_token_reduction_maps(h3_dit *dit, char *error,
     if (!dit->token_reduction) return 1;
     size_t pair_count = (size_t)dit->reduced_sequence * 2;
     uint32_t *pairs = malloc(pair_count * sizeof(*pairs));
+    uint32_t *baseline_indices = malloc(
+        (size_t)dit->reduced_sequence * sizeof(*baseline_indices));
     uint32_t *parents = malloc((size_t)dit->sequence * sizeof(*parents));
-    if (!pairs || !parents) {
+    if (!pairs || !baseline_indices || !parents) {
         free(pairs);
+        free(baseline_indices);
         free(parents);
         fail(error, error_size,
              "out of memory allocating token-reduction maps");
         return 0;
     }
-    for (uint32_t row = 0; row < dit->reduced_sequence; row++)
+    uint32_t baseline_row = 0;
+    for (uint32_t row = 0; row < dit->reduced_sequence; row++) {
         token_pool_sources(dit, row, &pairs[(size_t)row * 2],
                            &pairs[(size_t)row * 2 + 1]);
+        baseline_indices[row] =
+            row >= dit->video_target_start &&
+            pairs[(size_t)row * 2] != pairs[(size_t)row * 2 + 1] ?
+                baseline_row++ : UINT32_MAX;
+    }
+    if (baseline_row != dit->token_baseline_rows) {
+        free(pairs);
+        free(baseline_indices);
+        free(parents);
+        fail(error, error_size, "token-reduction baseline map is inconsistent");
+        return 0;
+    }
     for (uint32_t row = 0; row < dit->sequence; row++)
         parents[row] = token_reduced_parent(dit, row);
     dit->token_pool_pairs = h3_gpu_tensor_from_u32(
         dit->gpu, pairs, pair_count);
+    dit->token_baseline_indices = h3_gpu_tensor_from_u32(
+        dit->gpu, baseline_indices, dit->reduced_sequence);
     dit->token_expand_parents = h3_gpu_tensor_from_u32(
         dit->gpu, parents, dit->sequence);
     free(pairs);
+    free(baseline_indices);
     free(parents);
-    if (!dit->token_pool_pairs || !dit->token_expand_parents) {
+    if (!dit->token_pool_pairs || !dit->token_baseline_indices ||
+        !dit->token_expand_parents) {
         fail(error, error_size,
              "cannot allocate token-reduction map tensors: %s",
              h3_gpu_error(dit->gpu));
@@ -1012,7 +1033,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         size_t qkv_capacity = sequence * INNER * 3;
         size_t qkv_used = (size_t)dit->reduced_sequence * INNER * 3;
         size_t baseline_elements =
-            (size_t)dit->reduced_video_rows * HIDDEN;
+            (size_t)dit->token_baseline_rows * HIDDEN;
         size_t attention_capacity = sequence * HIDDEN;
         size_t attention_used =
             (size_t)dit->reduced_sequence * HIDDEN;
@@ -1021,23 +1042,17 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             full_elements <= qkv_capacity - qkv_used &&
             qkv_used <= UINT32_MAX &&
             full_elements <= UINT32_MAX - qkv_used;
-        dit->token_baseline_in_attention =
-            attention_used <= attention_capacity &&
-            baseline_elements <= attention_capacity - attention_used &&
-            attention_used <= UINT32_MAX &&
-            baseline_elements <= UINT32_MAX - attention_used;
         if (dit->token_original_in_qkv)
             dit->token_original_offset = qkv_used;
         else
             dit->token_original = h3_gpu_tensor_new_bf16(
                 dit->gpu, full_elements);
-        if (dit->token_baseline_in_attention)
-            dit->token_baseline_offset = attention_used;
-        else
-            dit->token_baseline = h3_gpu_tensor_new_bf16(
-                dit->gpu, baseline_elements);
-        if ((!dit->token_original_in_qkv && !dit->token_original) ||
-            (!dit->token_baseline_in_attention && !dit->token_baseline)) {
+        dit->token_baseline_offset = attention_used;
+        if (attention_used > attention_capacity ||
+            baseline_elements > attention_capacity - attention_used ||
+            attention_used > UINT32_MAX ||
+            baseline_elements > UINT32_MAX - attention_used ||
+            (!dit->token_original_in_qkv && !dit->token_original)) {
             fail(error, error_size,
                  "cannot allocate token-reduction residual state: %s",
                  h3_gpu_error(dit->gpu));
@@ -1202,7 +1217,6 @@ h3_dit *h3_dit_load_conditioned(
 static int enter_token_reduction(h3_dit *dit, char *error,
                                  size_t error_size) {
     uint32_t full_elements = dit->sequence * HIDDEN;
-    uint32_t baseline_elements = dit->reduced_video_rows * HIDDEN;
     h3_gpu_tensor *original = dit->token_original_in_qkv ?
         dit->qkv : dit->token_original;
     if (!gpu_op(dit, h3_gpu_copy_bf16(
@@ -1211,19 +1225,14 @@ static int enter_token_reduction(h3_dit *dit, char *error,
             error, error_size, "save full token residual") ||
         !gpu_op(dit, h3_gpu_token_pool_bf16(
             dit->gpu, dit->attention_output, original,
-            dit->token_original_offset, dit->token_pool_pairs,
-            dit->sequence, dit->reduced_sequence, HIDDEN),
+            dit->token_original_offset, dit->hidden,
+            dit->token_baseline_offset, dit->token_baseline_indices,
+            dit->token_pool_pairs, dit->sequence, dit->reduced_sequence,
+            dit->token_baseline_rows, HIDDEN),
             error, error_size, "pool video tokens")) return 0;
     h3_gpu_tensor *swap = dit->hidden;
     dit->hidden = dit->attention_output;
     dit->attention_output = swap;
-    h3_gpu_tensor *baseline = dit->token_baseline_in_attention ?
-        dit->attention_output : dit->token_baseline;
-    if (!gpu_op(dit, h3_gpu_copy_bf16(
-            dit->gpu, baseline, dit->token_baseline_offset, dit->hidden,
-            (size_t)dit->video_target_start * HIDDEN, baseline_elements),
-            error, error_size,
-            "save pooled token baseline")) return 0;
     dit->token_reduction_active = 1;
     return 1;
 }
@@ -1232,13 +1241,12 @@ static int leave_token_reduction(h3_dit *dit, char *error,
                                  size_t error_size) {
     h3_gpu_tensor *original = dit->token_original_in_qkv ?
         dit->qkv : dit->token_original;
-    h3_gpu_tensor *baseline = dit->token_baseline_in_attention ?
-        dit->attention_output : dit->token_baseline;
     if (!gpu_op(dit, h3_gpu_token_expand_delta_bf16(
             dit->gpu, dit->mod_attention, original,
-            dit->token_original_offset, dit->hidden, baseline,
-            dit->token_baseline_offset, dit->token_expand_parents,
-            dit->sequence, dit->reduced_sequence, HIDDEN,
+            dit->token_original_offset, dit->hidden, dit->attention_output,
+            dit->token_baseline_offset, dit->token_baseline_indices,
+            dit->token_expand_parents, dit->sequence,
+            dit->reduced_sequence, dit->token_baseline_rows, HIDDEN,
             dit->video_target_start,
             dit->token_reduction_scale), error, error_size,
             "restore full video-token grid")) return 0;
@@ -2025,8 +2033,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
-    FREE(token_pool_pairs); FREE(token_expand_parents);
-    FREE(token_original); FREE(token_baseline); FREE(mod_mlp); FREE(fc1);
+    FREE(token_pool_pairs); FREE(token_baseline_indices);
+    FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);

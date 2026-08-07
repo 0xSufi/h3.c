@@ -8,12 +8,21 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef H3_BENCH_LATENT_H
+#define H3_BENCH_LATENT_H 32
+#endif
+#ifndef H3_BENCH_LATENT_W
+#define H3_BENCH_LATENT_W 32
+#endif
+
 enum {
     TEXT_ROWS = 6,
     TEXT_WIDTH = 5120,
     LATENT_T = 7,
-    LATENT_H = 32,
-    LATENT_W = 32,
+    LATENT_H = H3_BENCH_LATENT_H,
+    LATENT_W = H3_BENCH_LATENT_W,
+    CANVAS_H = LATENT_H * 16,
+    CANVAS_W = LATENT_W * 16,
     AUDIO_T = 37,
     VIDEO_ELEMENTS = 24 * LATENT_T * LATENT_H * LATENT_W,
     AUDIO_ELEMENTS = 32 * 2 * AUDIO_T
@@ -655,7 +664,8 @@ int main(int argc, char **argv) {
             die("H3_BENCH_COMMAND_AB must be in [1, 50]");
         run_command_ab(dit, (int)interval, video, audio, video_velocity,
                        audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before command AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before command AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -665,7 +675,8 @@ int main(int argc, char **argv) {
     }
     if (getenv("H3_BENCH_GRAPH_DATA_AB")) {
         run_graph_data_ab(dit, video, audio, video_velocity, audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before graph-data AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before graph-data AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -675,7 +686,8 @@ int main(int argc, char **argv) {
     }
     if (getenv("H3_BENCH_MPS_COMMAND_AB")) {
         run_mps_command_ab(dit, video, audio, video_velocity, audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before MPS-command AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before MPS-command AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -685,7 +697,8 @@ int main(int argc, char **argv) {
     }
     if (getenv("H3_BENCH_NAX_MLP_AB")) {
         run_nax_mlp_ab(dit, video, audio, video_velocity, audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before NAX MLP AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before NAX MLP AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -695,7 +708,8 @@ int main(int argc, char **argv) {
     }
     if (sampler_ab) {
         run_sampler_ab(dit, video, audio, video_velocity, audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before sampler AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before sampler AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -710,7 +724,8 @@ int main(int argc, char **argv) {
         else
             run_token_reduction_ab(dit, video, audio, video_velocity,
                                    audio_velocity);
-        printf("DiT 512/%u-layer load %.3fs before token reduction AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before token reduction AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);
@@ -734,8 +749,10 @@ int main(int argc, char **argv) {
                seconds() - step_start);
     }
     double forward_seconds = seconds() - forward_start;
-    printf("DiT 512 load %.3fs, seven forwards %.3fs, combined %.3fs\n",
-           load_seconds, forward_seconds, load_seconds + forward_seconds);
+    printf("DiT %ux%u load %.3fs, seven forwards %.3fs, combined %.3fs\n",
+           (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+           load_seconds, forward_seconds,
+           load_seconds + forward_seconds);
 
     h3_dit_free(dit);
     h3_layout_free(&layout);

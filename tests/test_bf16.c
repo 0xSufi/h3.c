@@ -92,33 +92,45 @@ static uint16_t f32_to_bf16(float value) {
 }
 
 static void test_token_reduction_kernels(test_context *test) {
-    enum { FULL_ROWS = 5, REDUCED_ROWS = 3, WIDTH = 4, PADDING = 4 };
+    enum {
+        FULL_ROWS = 6, REDUCED_ROWS = 4, BASELINE_ROWS = 2,
+        WIDTH = 4, PADDING = 4
+    };
     const float input_values[FULL_ROWS * WIDTH] = {
          1.0f,  2.0f,  3.0f,  4.0f,
         10.0f, 12.0f, 14.0f, 16.0f,
         14.0f, 16.0f, 18.0f, 20.0f,
         -8.0f, -4.0f,  0.0f,  4.0f,
-        -4.0f,  0.0f,  4.0f,  8.0f
+        -4.0f,  0.0f,  4.0f,  8.0f,
+        20.0f, 21.0f, 22.0f, 23.0f
     };
     const float pooled_values[REDUCED_ROWS * WIDTH] = {
          1.0f,  2.0f,  3.0f,  4.0f,
         12.0f, 14.0f, 16.0f, 18.0f,
-        -6.0f, -2.0f,  2.0f,  6.0f
+        -6.0f, -2.0f,  2.0f,  6.0f,
+        20.0f, 21.0f, 22.0f, 23.0f
     };
     const float processed_values[REDUCED_ROWS * WIDTH] = {
          2.0f,  3.0f,  4.0f,  5.0f,
         14.0f, 12.0f, 20.0f, 14.0f,
-        -5.0f,  0.0f,  5.0f, 10.0f
+        -5.0f,  0.0f,  5.0f, 10.0f,
+        30.0f, 31.0f, 32.0f, 33.0f
     };
     const float expanded_values[FULL_ROWS * WIDTH] = {
          2.0f,  3.0f,  4.0f,  5.0f,
         12.0f, 10.0f, 18.0f, 12.0f,
         16.0f, 14.0f, 22.0f, 16.0f,
         -7.0f, -2.0f,  3.0f,  8.0f,
-        -3.0f,  2.0f,  7.0f, 12.0f
+        -3.0f,  2.0f,  7.0f, 12.0f,
+        30.0f, 31.0f, 32.0f, 33.0f
     };
-    const uint32_t pairs[REDUCED_ROWS * 2] = {0, 0, 1, 2, 3, 4};
-    const uint32_t parents[FULL_ROWS] = {0, 1, 1, 2, 2};
+    const uint32_t pairs[REDUCED_ROWS * 2] = {
+        0, 0, 1, 2, 3, 4, 5, 5
+    };
+    const uint32_t baseline_indices[REDUCED_ROWS] = {
+        UINT32_MAX, 0, 1, UINT32_MAX
+    };
+    const uint32_t parents[FULL_ROWS] = {0, 1, 1, 2, 2, 3};
     uint16_t input_bf16[PADDING + FULL_ROWS * WIDTH];
     uint16_t processed_bf16[REDUCED_ROWS * WIDTH];
     uint16_t expected_pooled[REDUCED_ROWS * WIDTH];
@@ -137,7 +149,12 @@ static void test_token_reduction_kernels(test_context *test) {
         test->gpu, input_bf16, PADDING + FULL_ROWS * WIDTH));
     h3_gpu_tensor *gpu_pairs = own(test, h3_gpu_tensor_from_u32(
         test->gpu, pairs, REDUCED_ROWS * 2));
+    h3_gpu_tensor *gpu_baseline_indices = own(
+        test, h3_gpu_tensor_from_u32(test->gpu, baseline_indices,
+                                     REDUCED_ROWS));
     h3_gpu_tensor *pooled = fresh(test, REDUCED_ROWS * WIDTH);
+    h3_gpu_tensor *baseline = fresh(
+        test, PADDING + BASELINE_ROWS * WIDTH);
     h3_gpu_tensor *processed = own(test, h3_gpu_tensor_from_bf16(
         test->gpu, processed_bf16, REDUCED_ROWS * WIDTH));
     h3_gpu_tensor *gpu_parents = own(test, h3_gpu_tensor_from_u32(
@@ -147,8 +164,9 @@ static void test_token_reduction_kernels(test_context *test) {
     require_gpu(test, h3_gpu_begin(test->gpu),
                 "begin token-pool command stream");
     require_gpu(test, h3_gpu_token_pool_bf16(
-        test->gpu, pooled, input, PADDING, gpu_pairs, FULL_ROWS,
-        REDUCED_ROWS, WIDTH),
+        test->gpu, pooled, input, PADDING, baseline, PADDING,
+        gpu_baseline_indices, gpu_pairs, FULL_ROWS, REDUCED_ROWS,
+        BASELINE_ROWS, WIDTH),
         "encode token pooling");
     require_gpu(test, h3_gpu_submit(test->gpu),
                 "submit token-pool command stream");
@@ -158,12 +176,20 @@ static void test_token_reduction_kernels(test_context *test) {
             "cannot read pooled tokens");
     require(memcmp(got_pooled, expected_pooled, sizeof(got_pooled)) == 0,
             "horizontal token pooling differs from exact BF16 reference");
+    uint16_t got_baseline[PADDING + BASELINE_ROWS * WIDTH];
+    require(h3_gpu_tensor_read_bf16(
+                baseline, got_baseline, PADDING + BASELINE_ROWS * WIDTH),
+            "cannot read fused pair baselines");
+    require(memcmp(got_baseline + PADDING, expected_pooled + WIDTH,
+                   BASELINE_ROWS * WIDTH * sizeof(*got_baseline)) == 0,
+            "fused pooling wrote the wrong dense pair baselines");
 
     require_gpu(test, h3_gpu_begin(test->gpu),
                 "begin token-expand command stream");
     require_gpu(test, h3_gpu_token_expand_delta_bf16(
-        test->gpu, expanded, input, PADDING, processed, pooled, WIDTH,
-        gpu_parents, FULL_ROWS, REDUCED_ROWS, WIDTH, 1, 1.0f),
+        test->gpu, expanded, input, PADDING, processed, baseline, PADDING,
+        gpu_baseline_indices, gpu_parents, FULL_ROWS, REDUCED_ROWS,
+        BASELINE_ROWS, WIDTH, 1, 1.0f),
         "encode token delta expansion");
     require_gpu(test, h3_gpu_submit(test->gpu),
                 "submit token-expand command stream");
