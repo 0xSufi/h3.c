@@ -674,18 +674,21 @@ static void run_nax_morton_ab(h3_dit *dit, float *video, float *audio,
                               float *video_velocity,
                               float *audio_velocity) {
     char error[512];
+    int compact_ab = getenv("H3_BENCH_NAX_MORTON4_AB") != NULL;
+    const char *disable = compact_ab ? "H3_DISABLE_NAX_MORTON4" :
+                                       "H3_DISABLE_NAX_MORTON";
     float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
     float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
     if (!video_reference || !audio_reference)
         die("out of memory allocating NAX Morton AB references");
-    setenv("H3_DISABLE_NAX_MORTON", "1", 1);
+    setenv(disable, "1", 1);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
     memcpy(video_reference, video_velocity,
            VIDEO_ELEMENTS * sizeof(*video_reference));
     memcpy(audio_reference, audio_velocity,
            AUDIO_ELEMENTS * sizeof(*audio_reference));
-    unsetenv("H3_DISABLE_NAX_MORTON");
+    unsetenv(disable);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
 
@@ -693,8 +696,8 @@ static void run_nax_morton_ab(h3_dit *dit, float *video, float *audio,
     double row_major_seconds = 0.0, morton_seconds = 0.0;
     int row_major_count = 0, morton_count = 0;
     for (size_t run = 0; run < sizeof(pattern) / sizeof(*pattern); run++) {
-        if (pattern[run]) unsetenv("H3_DISABLE_NAX_MORTON");
-        else setenv("H3_DISABLE_NAX_MORTON", "1", 1);
+        if (pattern[run]) unsetenv(disable);
+        else setenv(disable, "1", 1);
         double start = seconds();
         if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
                             audio_velocity, error, sizeof(error))) die(error);
@@ -707,17 +710,21 @@ static void run_nax_morton_ab(h3_dit *dit, float *video, float *audio,
         if (pattern[run]) {
             morton_seconds += elapsed;
             morton_count++;
-            printf("  NAX Morton %.3fs\n", elapsed);
+            printf("  NAX %s Morton %.3fs\n",
+                   compact_ab ? "compact" : "padded", elapsed);
         } else {
             row_major_seconds += elapsed;
             row_major_count++;
-            printf("  NAX row-major %.3fs\n", elapsed);
+            printf("  NAX %s %.3fs\n",
+                   compact_ab ? "padded Morton" : "row-major", elapsed);
         }
     }
-    unsetenv("H3_DISABLE_NAX_MORTON");
-    printf("DiT NAX Morton AB row-major %.4fs, Morton %.4fs, ratio %.4f; "
+    unsetenv(disable);
+    printf("DiT NAX Morton AB %s %.4fs, %s %.4fs, ratio %.4f; "
            "outputs byte-identical\n",
+           compact_ab ? "padded" : "row-major",
            row_major_seconds / row_major_count,
+           compact_ab ? "compact" : "Morton",
            morton_seconds / morton_count,
            morton_seconds * row_major_count /
                (row_major_seconds * morton_count));
@@ -1257,7 +1264,8 @@ int main(int argc, char **argv) {
         free(video_velocity); free(audio_velocity);
         return 0;
     }
-    if (getenv("H3_BENCH_NAX_MORTON_AB")) {
+    if (getenv("H3_BENCH_NAX_MORTON_AB") ||
+        getenv("H3_BENCH_NAX_MORTON4_AB")) {
         run_nax_morton_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before NAX Morton AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
