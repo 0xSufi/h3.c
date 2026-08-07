@@ -447,6 +447,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
             [names addObject:@"h3_quantize_bf16_int8_rows"];
             [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
+            [names addObject:
+                @"h3_quantize_bf16_int8_head_major_to_rows_cached"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
@@ -942,6 +944,10 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
+typedef struct {
+    uint32_t rows, padded_rows, heads, head_dim;
+    float clip;
+} int8_head_major_quant_args;
 typedef struct { uint32_t rows, columns, group_size, groups; }
     int8_group_quant_args;
 typedef struct { uint32_t rows, width; float epsilon; } norm_args;
@@ -1413,19 +1419,24 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
                                  uint32_t sequence,
                                  uint32_t heads, uint32_t head_dim, float scale,
                                  MPSDataType dataType, int causal,
-                                 int headMajor) {
+                                 int headMajor, int outputHeadMajor) {
     @autoreleasepool {
         NSString *cacheKey = [NSString stringWithFormat:
-                              @"%u:%u:%u:%u:%u:%.9g:%d:%d",
+                              @"%u:%u:%u:%u:%u:%.9g:%d:%d:%d",
                               (unsigned)dataType, batch, sequence, heads,
-                              head_dim, scale, causal, headMajor];
+                              head_dim, scale, causal, headMajor,
+                              outputHeadMajor];
         H3SDPA *cached = gpu.sdpaCache[cacheKey];
         if (cached) return cached;
         MPSGraph *graph = [[MPSGraph alloc] init];
-        NSArray<NSNumber *> *outputShape =
+        NSArray<NSNumber *> *rowMajorShape =
             @[@(batch), @(sequence), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *headMajorShape =
+            @[@(batch), @(heads), @(sequence), @(head_dim)];
+        NSArray<NSNumber *> *outputShape = outputHeadMajor ?
+            headMajorShape : rowMajorShape;
         NSArray<NSNumber *> *inputShape = headMajor ?
-            @[@(batch), @(heads), @(sequence), @(head_dim)] : outputShape;
+            headMajorShape : rowMajorShape;
         MPSGraphTensor *q = [graph placeholderWithShape:inputShape
                                                dataType:dataType name:nil];
         MPSGraphTensor *k = [graph placeholderWithShape:inputShape
@@ -1468,7 +1479,9 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         result.query = q;
         result.key = k;
         result.value = v;
-        result.output = [graph transposeTensor:attention dimension:1 withDimension:2 name:nil];
+        result.output = outputHeadMajor ? attention :
+            [graph transposeTensor:attention dimension:1 withDimension:2
+             name:nil];
         result.inputShape = inputShape;
         result.outputShape = outputShape;
         gpu.sdpaCache[cacheKey] = result;
@@ -1482,7 +1495,7 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        uint32_t sequence,
                        uint32_t heads, uint32_t head_dim, float scale,
                        h3_gpu_dtype tensor_dtype, MPSDataType mps_dtype,
-                       int causal) {
+                       int causal, int outputHeadMajor) {
     H3GPU *gpu = GPU(opaque);
     int headMajor = gpu.headMajorSDPAInputs &&
         tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal;
@@ -1500,7 +1513,8 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         return 0;
     }
     H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
-                                      scale, mps_dtype, causal, headMajor);
+                                      scale, mps_dtype, causal, headMajor,
+                                      outputHeadMajor);
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
@@ -1535,7 +1549,7 @@ int h3_gpu_sdpa_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                     const h3_gpu_tensor *value, uint32_t sequence,
                     uint32_t heads, uint32_t head_dim, float scale) {
     return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32, 0);
+                       head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32, 0, 0);
 }
 
 int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -1545,7 +1559,7 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                     float scale) {
     return h3_gpu_sdpa(opaque, output, query, key, value, batch, sequence,
                        heads, head_dim, scale, H3_GPU_F32,
-                       MPSDataTypeFloat32, 1);
+                       MPSDataTypeFloat32, 1, 0);
 }
 
 int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -1553,7 +1567,18 @@ int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
     return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0);
+                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
+                       0);
+}
+
+int h3_gpu_sdpa_bf16_head_major_output(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
+                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
+                       1);
 }
 
 int h3_gpu_swiglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -2763,6 +2788,51 @@ static int h3_gpu_quantize_bf16_int8_rows(
     return 1;
 }
 
+static int h3_gpu_quantize_bf16_int8_head_major_rows(
+                        h3_gpu *opaque, h3_gpu_tensor *output,
+                        h3_gpu_tensor *scales,
+                        const h3_gpu_tensor *input, uint32_t rows,
+                        uint32_t padded_rows, uint32_t heads,
+                        uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t columns = (size_t)heads * head_dim;
+    if (!gpu.tensorOpsEnabled || !rows || padded_rows < rows ||
+        heads != 56 || head_dim != 128 ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * columns,
+                             @"head-major int8 linear input") ||
+        !h3_gpu_require_i8(gpu, output, (size_t)padded_rows * columns,
+                           @"head-major int8 quantized output") ||
+        !h3_gpu_require_f32(gpu, scales, padded_rows,
+                            @"head-major int8 quantization scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_quantize_bf16_int8_head_major_to_rows_cached");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(
+            gpu, @"device cannot dispatch M5 head-major int8 quantizer");
+        return 0;
+    }
+    int8_head_major_quant_args args = {
+        rows, padded_rows, heads, head_dim, 1.0f
+    };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(padded_rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_quantize_bf16_int8_groups(
                         h3_gpu *opaque, h3_gpu_tensor *output,
                         h3_gpu_tensor *scales,
@@ -2835,7 +2905,8 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         1.0f, @"BF16 weight to quantize");
 }
 
-int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+static int h3_gpu_linear_int8_bf16_layout(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
                             const h3_gpu_tensor *input,
@@ -2843,7 +2914,9 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
-                            int use_slower_uncached_int8_scales) {
+                            int use_slower_uncached_int8_scales,
+                            BOOL headMajorInput, uint32_t heads,
+                            uint32_t headDim) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
     if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
@@ -2855,9 +2928,15 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
                              @"int8 linear output") ||
         !h3_gpu_require_command(gpu)) return 0;
-    if (!h3_gpu_quantize_bf16_int8_rows(
-            opaque, quantized_input, input_scales, input, rows, padded_rows,
-            input_dim, 1.0f, @"int8 linear input")) return 0;
+    if (headMajorInput) {
+        if (use_slower_uncached_int8_scales || heads * headDim != input_dim ||
+            !h3_gpu_quantize_bf16_int8_head_major_rows(
+                opaque, quantized_input, input_scales, input, rows,
+                padded_rows, heads, headDim)) return 0;
+    } else if (!h3_gpu_quantize_bf16_int8_rows(
+                   opaque, quantized_input, input_scales, input, rows,
+                   padded_rows, input_dim, 1.0f,
+                   @"int8 linear input")) return 0;
     BOOL local_scales = !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
     BOOL known_linear = local_scales && rows <= 2048 && input_dim == 7168 &&
@@ -2892,6 +2971,36 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim,
+                            int use_slower_uncached_int8_scales) {
+    return h3_gpu_linear_int8_bf16_layout(
+        opaque, output, quantized_input, input_scales, input, weight,
+        weight_scales, rows, input_dim, output_dim,
+        use_slower_uncached_int8_scales, NO, 0, 0);
+}
+
+int h3_gpu_linear_int8_head_major_bf16(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t heads,
+                            uint32_t head_dim, uint32_t output_dim) {
+    return h3_gpu_linear_int8_bf16_layout(
+        opaque, output, quantized_input, input_scales, input, weight,
+        weight_scales, rows, heads * head_dim, output_dim, 0, YES, heads,
+        head_dim);
 }
 
 int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

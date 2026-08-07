@@ -31,6 +31,14 @@ struct int8_quant_args {
     float clip;
 };
 
+struct int8_head_major_quant_args {
+    uint rows;
+    uint padded_rows;
+    uint heads;
+    uint head_dim;
+    float clip;
+};
+
 struct int8_group_quant_args {
     uint rows;
     uint columns;
@@ -1399,6 +1407,62 @@ kernel void h3_quantize_bf16_int8_rows_scalar(
     for (uint column = tid; column < args.columns; column += 256) {
         int quantized = (int)rint((float)input[base + column] * inverse);
         output[base + column] = (int8_t)clamp(quantized, -127, 127);
+    }
+}
+
+/* Convert SDPA's head-major source directly to the row-major int8 layout used
+ * by the projection. The gather replaces the removed BF16 transpose while
+ * preserving fully coalesced int8 stores and the proven projection kernel. */
+kernel void h3_quantize_bf16_int8_head_major_to_rows_cached(
+                           device const bfloat4 *input [[buffer(0)]],
+                           device char4 *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_head_major_quant_args &args
+                               [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint THREADS = 256;
+    constexpr uint VECTORS = 7;
+    constexpr uint VECTORS_PER_HEAD = 32;
+    constexpr uint VECTORS_PER_ROW = 56 * VECTORS_PER_HEAD;
+    if (row >= args.rows) {
+        for (uint slot = 0; slot < VECTORS; slot++) {
+            uint linear = tid + slot * THREADS;
+            output[row * VECTORS_PER_ROW + linear] = char4(0);
+        }
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    thread bfloat4 values[VECTORS];
+    threadgroup float scratch[8];
+    float local_max = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint slot = 0; slot < VECTORS; slot++) {
+        uint linear = tid + slot * THREADS;
+        uint head = linear >> 5;
+        uint vector = linear & (VECTORS_PER_HEAD - 1);
+        bfloat4 value = input[
+            (head * args.rows + row) * VECTORS_PER_HEAD + vector];
+        values[slot] = value;
+        float4 f = float4(value);
+        local_max = max(local_max,
+            max(max(fabs(f.x), fabs(f.y)), max(fabs(f.z), fabs(f.w))));
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, scratch, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    #pragma clang loop unroll(full)
+    for (uint slot = 0; slot < VECTORS; slot++) {
+        uint linear = tid + slot * THREADS;
+        int4 quantized = int4(rint(float4(values[slot]) * inverse));
+        output[row * VECTORS_PER_ROW + linear] =
+            char4(clamp(quantized, int4(-127), int4(127)));
     }
 }
 

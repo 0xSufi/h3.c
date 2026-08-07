@@ -57,6 +57,7 @@ struct h3_dit {
     int int8_attention_out;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
+    int use_slower_row_major_attention_output;
     int use_slower_unfused_int8_inputs;
     int use_slower_unfused_qkv_rope;
     int use_slower_scalar_qkv_rms;
@@ -1347,6 +1348,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
                         int use_slower_bf16_attention_output,
+                        int use_slower_row_major_attention_output,
                         int use_slower_unfused_int8_inputs,
                         int use_slower_unfused_qkv_rope,
                         int use_slower_scalar_qkv_rms,
@@ -1409,6 +1411,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->int8_attention_out = !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    dit->use_slower_row_major_attention_output =
+        use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
         use_slower_unfused_int8_inputs;
     dit->use_slower_unfused_qkv_rope =
@@ -1475,6 +1479,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
                          int use_slower_scalar_qkv_rms,
@@ -1487,6 +1492,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_slower_row_major_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,
                     use_slower_scalar_qkv_rms,
@@ -1509,6 +1515,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
                          int use_slower_scalar_qkv_rms,
@@ -1525,6 +1532,7 @@ h3_dit *h3_dit_load_conditioned(
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_slower_row_major_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,
                     use_slower_scalar_qkv_rms,
@@ -1667,17 +1675,36 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
-    OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
-        dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-       "DiT full attention");
-    if (dit->int8_attention_out &&
-        !getenv("H3_DISABLE_INT8_ATTENTION_OUT")) {
-        OP(h3_gpu_linear_int8_bf16(
-            dit->gpu, dit->attention_output, dit->int8_activation,
-            dit->int8_activation_scales, dit->attention_heads,
-            weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
-            dit->use_slower_uncached_int8_scales),
-           "DiT int8 attention output");
+    int int8_attention_output = dit->int8_attention_out &&
+        !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
+    int head_major_attention_output = int8_attention_output &&
+        !dit->use_slower_row_major_attention_output &&
+        !dit->use_slower_uncached_int8_scales &&
+        !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    if (head_major_attention_output)
+        OP(h3_gpu_sdpa_bf16_head_major_output(
+            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+            rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+           "DiT head-major full attention");
+    else
+        OP(h3_gpu_sdpa_bf16(
+            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+            rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+           "DiT full attention");
+    if (int8_attention_output) {
+        if (head_major_attention_output)
+            OP(h3_gpu_linear_int8_head_major_bf16(
+                dit->gpu, dit->attention_output, dit->int8_activation,
+                dit->int8_activation_scales, dit->attention_heads,
+                weight->out_int8, weight->out_scales, rows, HEADS, HEAD_DIM,
+                HIDDEN), "DiT head-major int8 attention output");
+        else
+            OP(h3_gpu_linear_int8_bf16(
+                dit->gpu, dit->attention_output, dit->int8_activation,
+                dit->int8_activation_scales, dit->attention_heads,
+                weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
+                dit->use_slower_uncached_int8_scales),
+               "DiT int8 attention output");
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),

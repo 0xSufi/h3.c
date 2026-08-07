@@ -30,6 +30,7 @@ static void usage(const char *program) {
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
         "      --use-slower-bf16-qkv  Force close-reference BF16 QKV\n"
         "      --use-slower-bf16-attention-output  Force BF16 attention output\n"
+        "      --use-slower-row-major-attention-output  Restore SDPA transpose\n"
         "      --use-slower-unfused-int8-inputs  Keep standalone quantizers\n"
         "      --use-slower-unfused-qkv-rope  Keep separate Q/K norm/RoPE\n"
         "      --use-slower-scalar-qkv-rms  Force scalar Q/K RMS loads\n"
@@ -196,6 +197,7 @@ int main(int argc, char **argv) {
            OPT_USE_SLOWER_BF16_MLP,
            OPT_USE_SLOWER_BF16_QKV,
            OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT,
+           OPT_USE_SLOWER_ROW_MAJOR_ATTENTION_OUTPUT,
            OPT_USE_SLOWER_UNFUSED_INT8_INPUTS,
            OPT_USE_SLOWER_UNFUSED_QKV_ROPE,
            OPT_USE_SLOWER_SCALAR_QKV_RMS,
@@ -226,6 +228,8 @@ int main(int argc, char **argv) {
          OPT_USE_SLOWER_BF16_QKV},
         {"use-slower-bf16-attention-output", no_argument, NULL,
          OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT},
+        {"use-slower-row-major-attention-output", no_argument, NULL,
+         OPT_USE_SLOWER_ROW_MAJOR_ATTENTION_OUTPUT},
         {"use-slower-unfused-int8-inputs", no_argument, NULL,
          OPT_USE_SLOWER_UNFUSED_INT8_INPUTS},
         {"use-slower-unfused-qkv-rope", no_argument, NULL,
@@ -299,6 +303,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT:
                 params.use_slower_bf16_attention_output = 1;
+                break;
+            case OPT_USE_SLOWER_ROW_MAJOR_ATTENTION_OUTPUT:
+                params.use_slower_row_major_attention_output = 1;
                 break;
             case OPT_USE_SLOWER_UNFUSED_INT8_INPUTS:
                 params.use_slower_unfused_int8_inputs = 1;

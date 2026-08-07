@@ -819,7 +819,9 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                                    float *video_velocity,
                                    float *audio_velocity) {
     char error[512];
-    int known_linear =
+    int head_major_attention_output =
+        getenv("H3_BENCH_HEAD_MAJOR_ATTENTION_OUT_AB") != NULL;
+    int known_linear = !head_major_attention_output &&
         getenv("H3_BENCH_INT8_LINEAR_KNOWN_AB") != NULL;
     int local_qkv_scales = !known_linear &&
         getenv("H3_BENCH_QKV_LOCAL_SCALES_AB") != NULL;
@@ -837,7 +839,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
     int attention_out = !fused_mlp_input &&
         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
-    const char *disable = known_linear ?
+    const char *disable = head_major_attention_output ?
+        "H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT" : known_linear ?
         "H3_DISABLE_INT8_LINEAR_KNOWN" : local_qkv_scales ?
         "H3_DISABLE_QKV_LOCAL_SCALES" : local_linear_scales ?
         "H3_DISABLE_INT8_LOCAL_SCALES" : vector_qkv_rms ?
@@ -849,7 +852,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         "H3_DISABLE_INT8_ATTENTION_OUT" : "H3_DISABLE_INT8_QKV";
     const char *disable2 = fused_inputs ?
         "H3_DISABLE_FUSED_INT8_QKV_INPUT" : NULL;
-    const char *name = known_linear ?
+    const char *name = head_major_attention_output ?
+        "head-major attention output" : known_linear ?
         "compile-time-shape int8 attention output" :
         local_qkv_scales ? "local int8 QKV scales" :
         local_linear_scales ? "local int8 linear scales" :
@@ -899,12 +903,12 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (candidate) {
-            if (known_linear &&
+            if ((head_major_attention_output || known_linear) &&
                 (memcmp(video_velocity, video_reference,
                         VIDEO_ELEMENTS * sizeof(*video_reference)) ||
                  memcmp(audio_velocity, audio_reference,
                         AUDIO_ELEMENTS * sizeof(*audio_reference))))
-                die("compile-time-K int8 attention output changed bytes");
+                die("layout/specialized int8 attention output changed bytes");
             video_rel = relative_l2(video_velocity, video_reference,
                                     VIDEO_ELEMENTS, &video_abs);
             audio_rel = relative_l2(audio_velocity, audio_reference,
@@ -1521,6 +1525,8 @@ int main(int argc, char **argv) {
     int final_slice_ab = getenv("H3_BENCH_FINAL_SLICE_AB") != NULL;
     int final_head_ab = getenv("H3_BENCH_FINAL_HEAD_AB") != NULL;
     int int8_qkv_ab = getenv("H3_BENCH_INT8_QKV_AB") != NULL;
+    int head_major_attention_output_ab =
+        getenv("H3_BENCH_HEAD_MAJOR_ATTENTION_OUT_AB") != NULL;
     int known_int8_linear_ab =
         getenv("H3_BENCH_INT8_LINEAR_KNOWN_AB") != NULL;
     int int8_attention_out_ab =
@@ -1597,7 +1603,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
@@ -1607,7 +1613,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, NULL, NULL, error,
             sizeof(error));
     }
@@ -1620,7 +1626,8 @@ int main(int argc, char **argv) {
     }
     double load_seconds = seconds() - load_start;
 
-    if (known_int8_linear_ab || int8_qkv_ab || int8_attention_out_ab ||
+    if (head_major_attention_output_ab || known_int8_linear_ab ||
+        int8_qkv_ab || int8_attention_out_ab ||
         fused_int8_mlp_input_ab ||
         fused_int8_qkv_input_ab || fused_int8_inputs_ab ||
         fused_int8_qkv_rope_ab || vector_int8_qkv_rms_ab ||

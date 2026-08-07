@@ -592,6 +592,15 @@ at 512 and 864. A decoded fox render remained clean and closely matched the
 int8-QKV-only composition; its thermally hot denoise measured 19.18 seconds.
 Use `--use-slower-bf16-attention-output` to retain that projection in BF16.
 
+On that int8 path, SDPA now leaves its result in native
+`[head,row,dimension]` order. A specialized 256-thread kernel gathers and
+quantizes each H3 row directly into the projection's row-major int8 buffer,
+eliminating the intervening full-width BF16 transpose without changing any
+output byte. Thermally controlled crossed runs improve complete 512 and 864
+forwards by roughly 0.2-1.2%. Use
+`--use-slower-row-major-attention-output` to restore the explicit BF16
+row-major SDPA output and ordinary quantizer.
+
 The M5 path also folds QKV and MLP activation quantization into the preceding
 gated AdaLN kernel. This removes 99 standalone quantizer dispatches per
 50-layer forward while preserving the previous output bytes, improving crossed

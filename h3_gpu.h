@@ -317,6 +317,17 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
+/* Consume SDPA's native [head,row,dimension] BF16 layout without a full
+ * BF16 transpose, gathering directly into the projection's row-major int8. */
+int h3_gpu_linear_int8_head_major_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t heads,
+                            uint32_t head_dim, uint32_t output_dim);
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,
@@ -473,6 +484,13 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale);
+/* Preserve SDPA's native [head,row,dimension] output for an immediately
+ * following layout-aware projection. */
+int h3_gpu_sdpa_bf16_head_major_output(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale);
