@@ -57,6 +57,7 @@ struct h3_dit {
     int int8_attention_out;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
+    int use_slower_unfused_int8_inputs;
     int use_slower_grouped_quantizer;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -1342,6 +1343,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
                         int use_slower_bf16_attention_output,
+                        int use_slower_unfused_int8_inputs,
                         int use_slower_grouped_quantizer,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
@@ -1399,6 +1401,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->int8_attention_out = !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    dit->use_slower_unfused_int8_inputs =
+        use_slower_unfused_int8_inputs;
     dit->keep_bf16_attention_out = dit->int8_attention_out &&
         (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
          getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
@@ -1457,6 +1461,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_slower_unfused_int8_inputs,
                          int use_slower_grouped_quantizer,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
@@ -1464,6 +1469,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_slower_unfused_int8_inputs,
                     use_slower_grouped_quantizer,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
@@ -1481,6 +1487,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_slower_unfused_int8_inputs,
                          int use_slower_grouped_quantizer,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
@@ -1492,6 +1499,7 @@ h3_dit *h3_dit_load_conditioned(
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_slower_unfused_int8_inputs,
                     use_slower_grouped_quantizer,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
@@ -1586,8 +1594,11 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
 }
 
 static int run_block(h3_dit *dit, unsigned index, int step,
-                     int attention_adaln_ready, int fuse_next_attention,
-                     unsigned next_index, int *next_attention_adaln_ready,
+                     int attention_adaln_ready,
+                     int attention_input_quantized,
+                     int fuse_next_attention, unsigned next_index,
+                     int *next_attention_adaln_ready,
+                     int *next_attention_input_quantized,
                      char *error, size_t error_size) {
     h3_dit_block *weight = &dit->blocks[index];
     const h3_gpu_tensor *modulation = h3_dit_schedule_block(dit->schedule,
@@ -1613,7 +1624,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->int8_activation, dit->int8_activation_scales,
             dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,
-            rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+            rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f,
+            attention_input_quantized),
            "DiT int8 QKV projection/norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
@@ -1637,7 +1649,19 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
-    if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
+    int fused_int8_mlp_input = dit->int8_mlp &&
+        !dit->use_slower_unfused_int8_inputs &&
+        !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
+        !getenv("H3_INT8_MLP_STAGE");
+    if (fused_int8_mlp_input) {
+        uint32_t padded_rows = (rows + 127u) & ~127u;
+        OP(h3_gpu_gate_adaln_quantize_int8(
+            dit->gpu, dit->hidden, dit->int8_activation,
+            dit->int8_activation_scales, dit->hidden,
+            dit->attention_output, weight->norm2, modulation, modulation,
+            row_map, rows, padded_rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
+           "DiT fused attention gate, MLP AdaLN and int8 quantization");
+    } else if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_gate_adaln_bf16(
             dit->gpu, dit->hidden, dit->mod_mlp, dit->hidden,
             dit->attention_output, weight->norm2, modulation, modulation,
@@ -1665,7 +1689,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->fc2_int8, weight->fc2_scales,
             weight->fc1, weight->fc2,
             rows, HIDDEN, FFN, HIDDEN,
-            dit->use_slower_grouped_quantizer), "DiT int8 fused MLP");
+            dit->use_slower_grouped_quantizer, fused_int8_mlp_input),
+           "DiT int8 fused MLP");
     } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
             dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
@@ -1686,11 +1711,27 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         h3_dit_block *next_weight = &dit->blocks[next_index];
         const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
             dit->schedule, next_index);
-        OP(h3_gpu_gate_adaln_bf16(
-            dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
-            mlp_output, next_weight->norm1, modulation,
-            next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
-           "DiT fused MLP gate and next attention AdaLN");
+        int fuse_int8_qkv_input = dit->int8_qkv &&
+            !dit->use_slower_unfused_int8_inputs &&
+            !getenv("H3_DISABLE_INT8_QKV") &&
+            !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");
+        if (fuse_int8_qkv_input) {
+            uint32_t padded_rows = (rows + 127u) & ~127u;
+            OP(h3_gpu_gate_adaln_quantize_int8(
+                dit->gpu, dit->hidden, dit->int8_activation,
+                dit->int8_activation_scales, dit->hidden, mlp_output,
+                next_weight->norm1, modulation, next_modulation, row_map,
+                rows, padded_rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
+               "DiT fused MLP gate, next attention AdaLN and int8 quantization");
+            *next_attention_input_quantized = 1;
+        } else {
+            OP(h3_gpu_gate_adaln_bf16(
+                dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
+                mlp_output, next_weight->norm1, modulation,
+                next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1,
+                1e-5f), "DiT fused MLP gate and next attention AdaLN");
+            *next_attention_input_quantized = 0;
+        }
         *next_attention_adaln_ready = 1;
     } else {
         OP(h3_gpu_gate_bf16(
@@ -1831,9 +1872,13 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
+        int carried_attention_input_quantized = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             int fused_token_adaln = carried_attention_adaln;
+            int fused_attention_input_quantized =
+                carried_attention_input_quantized;
             carried_attention_adaln = 0;
+            carried_attention_input_quantized = 0;
             if (use_token_reduction &&
                 block == dit->token_reduction_begin) {
                 fused_token_adaln = dit->block_active[block] &&
@@ -1841,6 +1886,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 if (fused_token_adaln) {
                     if (!enter_token_reduction_adaln(
                             dit, block, step, error, error_size)) return 0;
+                    fused_attention_input_quantized = 0;
                 } else if (!enter_token_reduction(
                                dit, error, error_size)) return 0;
             }
@@ -1850,6 +1896,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 if (fused_token_adaln) {
                     if (!leave_token_reduction_adaln(
                             dit, block, step, error, error_size)) return 0;
+                    fused_attention_input_quantized = 0;
                 } else if (!leave_token_reduction(
                                dit, error, error_size)) return 0;
             }
@@ -1863,8 +1910,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 next_block < H3_DIT_BLOCKS &&
                 dit->block_active[next_block] && !next_is_token_boundary;
             if (!run_block(dit, block, step, fused_token_adaln,
+                           fused_attention_input_quantized,
                            fuse_next_attention, next_block,
                            &carried_attention_adaln,
+                           &carried_attention_input_quantized,
                            error, error_size)) return 0;
             completed_blocks++;
             if (command_blocks &&

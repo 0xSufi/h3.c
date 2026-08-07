@@ -455,6 +455,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
+            [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
@@ -2883,7 +2884,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          const h3_gpu_tensor *fc2_bf16, uint32_t rows,
                          uint32_t input_dim, uint32_t hidden_dim,
                          uint32_t output_dim,
-                         int use_slower_grouped_quantizer) {
+                         int use_slower_grouped_quantizer,
+                         int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
     uint32_t fc2_scale_groups = hidden_dim / 1024u;
@@ -2917,8 +2919,9 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         (!int8_fc2 && !h3_gpu_require_bf16(
             gpu, fc2_bf16, (size_t)output_dim * hidden_dim,
             @"diagnostic BF16 MLP FC2 weight")) ||
-        !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
-                             @"int8 MLP input") ||
+        (!input_is_quantized &&
+         !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                              @"int8 MLP input")) ||
         !h3_gpu_require_bf16(gpu, activated,
                              (size_t)rows * hidden_dim,
                              @"int8 MLP activated") ||
@@ -2966,7 +2969,13 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     BOOL int8_fc1_local = int8_fc1 &&
         getenv("H3_INT8_FC1_LOCAL") != NULL;
     uint32_t row_tiles = padded_rows / 128;
-    if (int8_fc1 && !h3_gpu_quantize_bf16_int8_rows(
+    if (input_is_quantized && !int8_fc1) {
+        h3_gpu_set_error(gpu,
+            @"prequantized MLP input requires the int8 FC1 path");
+        return 0;
+    }
+    if (int8_fc1 && !input_is_quantized &&
+        !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, input, rows,
             padded_rows, input_dim, activation_clip,
             @"int8 MLP input")) return 0;
@@ -3389,6 +3398,83 @@ int h3_gpu_gate_adaln_bf16(
     return 1;
 }
 
+int h3_gpu_gate_adaln_quantize_int8(
+                     h3_gpu *opaque, h3_gpu_tensor *gated_residual,
+                     h3_gpu_tensor *quantized_output,
+                     h3_gpu_tensor *quantized_scales,
+                     const h3_gpu_tensor *residual,
+                     const h3_gpu_tensor *branch,
+                     const h3_gpu_tensor *norm_weight,
+                     const h3_gpu_tensor *gate_modulation,
+                     const h3_gpu_tensor *norm_modulation,
+                     const h3_gpu_tensor *row_map, uint32_t rows,
+                     uint32_t padded_rows, uint32_t width, uint32_t slots,
+                     uint32_t gate_slot, uint32_t shift_slot,
+                     uint32_t scale_slot, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t elements = (size_t)rows * width;
+    size_t padded_elements = (size_t)padded_rows * width;
+    if (!gpu.tensorOpsEnabled || !rows || padded_rows < rows || !width ||
+        width > 5376 || gate_slot >= slots || shift_slot >= slots ||
+        scale_slot >= slots || elements > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, residual, elements,
+                             @"fused int8 gate AdaLN residual") ||
+        !h3_gpu_require_bf16(gpu, branch, elements,
+                             @"fused int8 gate AdaLN branch") ||
+        !h3_gpu_require_bf16(gpu, norm_weight, width,
+                             @"fused int8 gate AdaLN norm") ||
+        !h3_gpu_require_bf16(gpu, gate_modulation, 1,
+                             @"fused int8 gate modulation") ||
+        !h3_gpu_require_bf16(gpu, norm_modulation, 1,
+                             @"fused int8 norm modulation") ||
+        !h3_gpu_require_elements(gpu, row_map, rows,
+                                 @"fused int8 gate AdaLN row map") ||
+        TENSOR(row_map).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_bf16(gpu, gated_residual, elements,
+                             @"fused int8 gated residual") ||
+        !h3_gpu_require_i8(gpu, quantized_output, padded_elements,
+                           @"fused int8 AdaLN output") ||
+        !h3_gpu_require_f32(gpu, quantized_scales, padded_rows,
+                            @"fused int8 AdaLN scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    typedef struct {
+        uint32_t rows, width, slots, gate_slot, shift_slot, scale_slot;
+        float epsilon;
+    } gate_adaln_args;
+    gate_adaln_args args = {
+        rows, width, slots, gate_slot, shift_slot, scale_slot, epsilon
+    };
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_gate_adaln_quantize_int8");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+            @"fused M5 int8 gate AdaLN needs a 256-thread threadgroup");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(residual).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(branch).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(gate_modulation).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(norm_modulation).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(gated_residual).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(quantized_output).buffer offset:0 atIndex:7];
+        [encoder setBuffer:TENSOR(quantized_scales).buffer offset:0 atIndex:8];
+        [encoder setBytes:&args length:sizeof(args) atIndex:9];
+        [encoder dispatchThreadgroups:MTLSizeMake(padded_rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
                                        h3_gpu_tensor *key,
                                        h3_gpu_tensor *value,
@@ -3614,7 +3700,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  const h3_gpu_tensor *rope_sin,
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
-                                 uint32_t rope_half, float epsilon) {
+                                 uint32_t rope_half, float epsilon,
+                                 int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -3628,6 +3715,14 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                            @"int8 QKV projection weight") ||
         !h3_gpu_require_f32(gpu, weight_scales, inner * 3,
                             @"int8 QKV weight scales") ||
+        !h3_gpu_require_i8(gpu, quantized_input,
+                           (size_t)padded_rows * input_dim,
+                           @"int8 QKV input") ||
+        !h3_gpu_require_f32(gpu, input_scales, padded_rows,
+                            @"int8 QKV input scales") ||
+        (!input_is_quantized &&
+         !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                              @"BF16 QKV input")) ||
         !h3_gpu_require_bf16(gpu, q_norm, head_dim, @"int8 Q norm") ||
         !h3_gpu_require_bf16(gpu, k_norm, head_dim, @"int8 K norm") ||
         !h3_gpu_require_bf16(gpu, rope_cos, rope_count,
@@ -3638,7 +3733,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         !h3_gpu_require_bf16(gpu, key, projected, @"int8 key") ||
         !h3_gpu_require_bf16(gpu, value, projected, @"int8 value") ||
         !h3_gpu_require_command(gpu)) return 0;
-    if (!h3_gpu_quantize_bf16_int8_rows(
+    if (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
             input_dim, 1.0f, @"int8 QKV input")) return 0;
     id<MTLComputePipelineState> projection = h3_gpu_pipeline(

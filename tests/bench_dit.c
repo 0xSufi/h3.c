@@ -771,15 +771,31 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                                    float *video_velocity,
                                    float *audio_velocity) {
     char error[512];
-    int attention_out = getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
-    const char *disable = attention_out ? "H3_DISABLE_INT8_ATTENTION_OUT" :
-                                          "H3_DISABLE_INT8_QKV";
-    const char *name = attention_out ? "int8 attention output" : "int8 QKV";
+    int fused_inputs =
+        getenv("H3_BENCH_FUSED_INT8_INPUTS_AB") != NULL;
+    int fused_qkv_input = !fused_inputs &&
+        getenv("H3_BENCH_FUSED_INT8_QKV_INPUT_AB") != NULL;
+    int fused_mlp_input = !fused_qkv_input &&
+        getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
+    int attention_out = !fused_mlp_input &&
+        getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
+    const char *disable = fused_inputs ?
+        "H3_DISABLE_FUSED_INT8_MLP_INPUT" : fused_qkv_input ?
+        "H3_DISABLE_FUSED_INT8_QKV_INPUT" : fused_mlp_input ?
+        "H3_DISABLE_FUSED_INT8_MLP_INPUT" : attention_out ?
+        "H3_DISABLE_INT8_ATTENTION_OUT" : "H3_DISABLE_INT8_QKV";
+    const char *disable2 = fused_inputs ?
+        "H3_DISABLE_FUSED_INT8_QKV_INPUT" : NULL;
+    const char *name = fused_inputs ? "fused int8 projection inputs" :
+        fused_qkv_input ? "fused int8 QKV input" :
+        fused_mlp_input ? "fused int8 MLP input" :
+        attention_out ? "int8 attention output" : "int8 QKV";
     float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
     float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
     if (!video_reference || !audio_reference)
         die("out of memory allocating int8 projection AB references");
     setenv(disable, "1", 1);
+    if (disable2) setenv(disable2, "1", 1);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
     memcpy(video_reference, video_velocity,
@@ -787,6 +803,7 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
     memcpy(audio_reference, audio_velocity,
            AUDIO_ELEMENTS * sizeof(*audio_reference));
     unsetenv(disable);
+    if (disable2) unsetenv(disable2);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
     static const int candidate_pattern[] = {
@@ -799,8 +816,13 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
     for (size_t index = 0;
          index < sizeof(candidate_pattern) / sizeof(*candidate_pattern);
          index++) {
-        if (candidate_pattern[index]) unsetenv(disable);
-        else setenv(disable, "1", 1);
+        if (candidate_pattern[index]) {
+            unsetenv(disable);
+            if (disable2) unsetenv(disable2);
+        } else {
+            setenv(disable, "1", 1);
+            if (disable2) setenv(disable2, "1", 1);
+        }
         double start = seconds();
         if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
                             audio_velocity, error, sizeof(error))) die(error);
@@ -826,6 +848,7 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         }
     }
     unsetenv(disable);
+    if (disable2) unsetenv(disable2);
     printf("DiT %s AB baseline %.4fs, candidate %.4fs, ratio %.4f; "
            "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
            name, baseline_seconds / baseline_count,
@@ -1423,6 +1446,12 @@ int main(int argc, char **argv) {
     int int8_qkv_ab = getenv("H3_BENCH_INT8_QKV_AB") != NULL;
     int int8_attention_out_ab =
         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
+    int fused_int8_mlp_input_ab =
+        getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
+    int fused_int8_qkv_input_ab =
+        getenv("H3_BENCH_FUSED_INT8_QKV_INPUT_AB") != NULL;
+    int fused_int8_inputs_ab =
+        getenv("H3_BENCH_FUSED_INT8_INPUTS_AB") != NULL;
     const char *qkv_ab = getenv("H3_BENCH_QKV_AB");
     int qkv_denoise_ab = qkv_ab && !strcmp(qkv_ab, "denoise");
     int qkv_step_ab = qkv_ab && !strcmp(qkv_ab, "steps");
@@ -1481,7 +1510,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0,
+            0, 0, 0,
             use_slower_grouped_quantizer, video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
@@ -1491,7 +1520,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0,
+            0, 0, 0,
             use_slower_grouped_quantizer, NULL, NULL, error,
             sizeof(error));
     }
@@ -1504,7 +1533,8 @@ int main(int argc, char **argv) {
     }
     double load_seconds = seconds() - load_start;
 
-    if (int8_qkv_ab || int8_attention_out_ab) {
+    if (int8_qkv_ab || int8_attention_out_ab || fused_int8_mlp_input_ab ||
+        fused_int8_qkv_input_ab || fused_int8_inputs_ab) {
         run_int8_projection_ab(
             dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before int8 projection AB\n",

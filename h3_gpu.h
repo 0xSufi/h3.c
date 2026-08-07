@@ -329,7 +329,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *fc2_bf16, uint32_t rows,
                          uint32_t input_dim, uint32_t hidden_dim,
                          uint32_t output_dim,
-                         int use_slower_grouped_quantizer);
+                         int use_slower_grouped_quantizer,
+                         int input_is_quantized);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -396,6 +397,19 @@ int h3_gpu_gate_adaln_bf16(
                      uint32_t width, uint32_t slots, uint32_t gate_slot,
                      uint32_t shift_slot, uint32_t scale_slot,
                      float epsilon);
+int h3_gpu_gate_adaln_quantize_int8(
+                     h3_gpu *gpu, h3_gpu_tensor *gated_residual,
+                     h3_gpu_tensor *quantized_output,
+                     h3_gpu_tensor *quantized_scales,
+                     const h3_gpu_tensor *residual,
+                     const h3_gpu_tensor *branch,
+                     const h3_gpu_tensor *norm_weight,
+                     const h3_gpu_tensor *gate_modulation,
+                     const h3_gpu_tensor *norm_modulation,
+                     const h3_gpu_tensor *row_map, uint32_t rows,
+                     uint32_t padded_rows, uint32_t width, uint32_t slots,
+                     uint32_t gate_slot, uint32_t shift_slot,
+                     uint32_t scale_slot, float epsilon);
 int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          h3_gpu_tensor *key, h3_gpu_tensor *value,
                          const h3_gpu_tensor *qkv,
@@ -451,7 +465,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  const h3_gpu_tensor *rope_sin,
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
-                                 uint32_t rope_half, float epsilon);
+                                 uint32_t rope_half, float epsilon,
+                                 int input_is_quantized);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

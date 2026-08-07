@@ -2517,6 +2517,94 @@ kernel void h3_gate_adaln_bf16_exact_simd(
     }
 }
 
+/* M5 int8 projections consume AdaLN through a dynamic per-row quantizer. Fold
+ * that quantizer into the preceding gated-residual/AdaLN pass. The rounded
+ * gated row is overwritten in-place by the rounded AdaLN row once its RMS is
+ * known, so exact standalone-quantizer bytes need only one 10.5 KiB row in
+ * threadgroup memory and never round-trip through device BF16 memory. */
+kernel void h3_gate_adaln_quantize_int8(
+                         device const ushort *residual [[buffer(0)]],
+                         device const ushort *branch [[buffer(1)]],
+                         device const ushort *gate_modulation [[buffer(2)]],
+                         device const uint *row_map [[buffer(3)]],
+                         device const ushort *weight [[buffer(4)]],
+                         device const ushort *norm_modulation [[buffer(5)]],
+                         device ushort *gated_residual [[buffer(6)]],
+                         device int8_t *quantized [[buffer(7)]],
+                         device float *quantized_scales [[buffer(8)]],
+                         constant h3_gate_adaln_args &args [[buffer(9)]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]],
+                         uint row [[threadgroup_position_in_grid]]) {
+    if (row >= args.rows) {
+        uint quantized_base = row * args.width;
+        for (uint column = tid; column < args.width; column += 256)
+            quantized[quantized_base + column] = 0;
+        if (tid == 0) quantized_scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float reductions[256];
+    threadgroup ushort gated_values[5376];
+    threadgroup float inverse_value;
+    threadgroup float max_scratch[8];
+    uint base = row_map[row] * args.slots * args.width;
+    uint row_base = row * args.width;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += 256) {
+        uint index = row_base + column;
+        float gate = h3_bf16_to_f32(
+            gate_modulation[base + args.gate_slot * args.width + column]);
+        ushort gated = h3_f32_to_bf16(
+            h3_bf16_to_f32(residual[index]) +
+            h3_bf16_to_f32(branch[index]) * gate);
+        gated_residual[index] = gated;
+        gated_values[column] = gated;
+        float value = h3_bf16_to_f32(gated);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride >= 32; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < 32) {
+        float sum = reductions[tid];
+        for (uint stride = 16; stride; stride >>= 1) {
+            float partner = simd_shuffle_down(sum, stride);
+            if (tid < stride) sum += partner;
+        }
+        if (tid == 0)
+            inverse_value = rsqrt(sum / float(args.width) + args.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inverse = inverse_value;
+    float local_max = 0.0f;
+    for (uint column = tid; column < args.width; column += 256) {
+        float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
+            h3_bf16_to_f32(weight[column]);
+        float shift = h3_bf16_to_f32(
+            norm_modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_to_f32(
+            norm_modulation[base + args.scale_slot * args.width + column]);
+        ushort value = h3_f32_to_bf16(
+            normalized * (1.0f + scale) + shift);
+        gated_values[column] = value;
+        local_max = max(local_max, fabs(h3_bf16_to_f32(value)));
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, max_scratch, simdgroup, lane);
+    float output_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    float quantize_scale = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0) quantized_scales[row] = output_scale;
+    for (uint column = tid; column < args.width; column += 256) {
+        int value = (int)rint(
+            h3_bf16_to_f32(gated_values[column]) * quantize_scale);
+        quantized[row_base + column] = (int8_t)clamp(value, -127, 127);
+    }
+}
+
 kernel void h3_qkv_rope_bf16(device const ushort *qkv [[buffer(0)]],
                              device const ushort *q_weight [[buffer(1)]],
                              device const ushort *k_weight [[buffer(2)]],

@@ -592,6 +592,12 @@ at 512 and 864. A decoded fox render remained clean and closely matched the
 int8-QKV-only composition; its thermally hot denoise measured 19.18 seconds.
 Use `--use-slower-bf16-attention-output` to retain that projection in BF16.
 
+The M5 path also folds QKV and MLP activation quantization into the preceding
+gated AdaLN kernel. This removes 99 standalone quantizer dispatches per
+50-layer forward while preserving the previous output bytes, improving crossed
+512/864 measurements by about 0.3-0.6%. Use
+`--use-slower-unfused-int8-inputs` to restore the standalone quantizers.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \
