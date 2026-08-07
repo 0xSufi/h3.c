@@ -1618,6 +1618,123 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
     }
 }
 
+/* Keep each projected Q/K 128x128 tile resident in its owning threadgroup.
+ * After the TensorOps epilogue has rounded to BF16, one thread computes each
+ * row's exact scalar RMS order; all threads then normalize and apply RoPE in
+ * disjoint dimension pairs. The temporary device tile is the final head-major
+ * output itself, so this adds only 512 bytes of threadgroup storage and removes
+ * the separate per-row/per-four-head Q/K kernel dispatch. */
+kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *query [[buffer(4)]],
+                           device bfloat *key [[buffer(5)]],
+                           device bfloat *value [[buffer(6)]],
+                           device const bfloat *q_weight [[buffer(7)]],
+                           device const bfloat *k_weight [[buffer(8)]],
+                           device const bfloat *rope_cos [[buffer(9)]],
+                           device const bfloat *rope_sin [[buffer(10)]],
+                           constant h3_qkv_project_rope_args &args
+                               [[buffer(11)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint TILE = 128;
+    constexpr uint STREAMS = 3;
+    constexpr uint ROPE_PAIRS = 48;
+    constexpr uint NORMALIZED_UNITS = ROPE_PAIRS +
+        (TILE - ROPE_PAIRS * 2);
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.heads * STREAMS;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint checkpoint_column = group.y * TILE;
+    uint head = group.y / STREAMS;
+    uint stream = group.y - head * STREAMS;
+    device bfloat *destination = stream == 0 ? query :
+        stream == 1 ? key : value;
+    destination += head * args.rows * TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>(
+            (int)args.input_dim, (int)args.heads * (int)TILE * 3));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+    auto first_b = w.slice<TILE, TILE>(0, (int)checkpoint_column);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+        auto b = w.slice<TILE, TILE>((int)k, (int)checkpoint_column);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = (uint)index[0];
+        if (row < args.rows)
+            destination[row * TILE + column] =
+                (bfloat)((float)accum[element] * input_scales[row] *
+                         weight_scales[checkpoint_column + column]);
+    }
+    if (stream < 2) {
+        threadgroup float inverse[TILE];
+        threadgroup_barrier(mem_flags::mem_device);
+        uint row = row_start + tid;
+        if (tid < TILE && row < args.rows) {
+            float sum = 0.0f;
+            for (uint dimension = 0; dimension < TILE; dimension++) {
+                float element = (float)destination[row * TILE + dimension];
+                sum = fma(element, element, sum);
+            }
+            inverse[tid] = rsqrt(sum / float(TILE) + args.epsilon);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
+        for (uint unit = tid; unit < TILE * NORMALIZED_UNITS; unit += 256) {
+            uint local_row = unit / NORMALIZED_UNITS;
+            uint part = unit - local_row * NORMALIZED_UNITS;
+            uint global_row = row_start + local_row;
+            if (global_row >= args.rows) continue;
+            uint base = global_row * TILE;
+            float inv = inverse[local_row];
+            if (part < ROPE_PAIRS) {
+                uint upper = part + ROPE_PAIRS;
+                float lower_value = (float)destination[base + part] * inv *
+                                    (float)norm_weight[part];
+                float upper_value = (float)destination[base + upper] * inv *
+                                    (float)norm_weight[upper];
+                float c = (float)rope_cos[
+                    global_row * args.rope_half + part];
+                float s = (float)rope_sin[
+                    global_row * args.rope_half + part];
+                destination[base + part] =
+                    (bfloat)(lower_value * c - upper_value * s);
+                destination[base + upper] =
+                    (bfloat)(upper_value * c + lower_value * s);
+            } else {
+                uint dimension = part + ROPE_PAIRS;
+                destination[base + dimension] = (bfloat)(
+                    (float)destination[base + dimension] * inv *
+                    (float)norm_weight[dimension]);
+            }
+        }
+    }
+}
+
 kernel void h3_fc1_swiglu_int8_nax_r128(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],

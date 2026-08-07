@@ -452,6 +452,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
             [names addObject:
                 @"h3_qkv_project_split_int8_nax_r128_morton4"];
+            [names addObject:
+                @"h3_qkv_project_split_int8_rope_nax_r128_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
@@ -3701,7 +3703,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  uint32_t rows, uint32_t input_dim,
                                  uint32_t heads, uint32_t head_dim,
                                  uint32_t rope_half, float epsilon,
-                                 int input_is_quantized) {
+                                 int input_is_quantized,
+                                 int use_slower_unfused_qkv_rope) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -3736,12 +3739,17 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     if (!input_is_quantized && !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_input, input_scales, input, rows, padded_rows,
             input_dim, 1.0f, @"int8 QKV input")) return 0;
+    BOOL fused_rope = !use_slower_unfused_qkv_rope &&
+        getenv("H3_DISABLE_FUSED_INT8_QKV_ROPE") == NULL;
     id<MTLComputePipelineState> projection = h3_gpu_pipeline(
-        gpu, @"h3_qkv_project_split_int8_nax_r128_morton4");
-    id<MTLComputePipelineState> rope = h3_gpu_pipeline(
+        gpu, fused_rope ?
+            @"h3_qkv_project_split_int8_rope_nax_r128_morton4" :
+            @"h3_qkv_project_split_int8_nax_r128_morton4");
+    id<MTLComputePipelineState> rope = fused_rope ? nil : h3_gpu_pipeline(
         gpu, @"h3_qk_rope_bf16_nax_inplace");
     if (!projection || projection.maxTotalThreadsPerThreadgroup < 256 ||
-        !rope || rope.maxTotalThreadsPerThreadgroup < 128) {
+        (!fused_rope &&
+         (!rope || rope.maxTotalThreadsPerThreadgroup < 128))) {
         h3_gpu_set_error(gpu, @"int8 M5 QKV projection is unavailable");
         return 0;
     }
@@ -3763,26 +3771,36 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:4];
         [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:5];
         [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:6];
-        [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        if (fused_rope) {
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:7];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:8];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:9];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:10];
+            [encoder setBytes:&args length:sizeof(args) atIndex:11];
+        } else {
+            [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        }
         NSUInteger groups = (NSUInteger)(padded_rows / 128u) * heads * 3u;
         [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
-        encoder = [gpu.command computeCommandEncoder];
-        [encoder setComputePipelineState:rope];
-        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
-        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
-        [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:2];
-        [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:3];
-        [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:4];
-        [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:5];
-        [encoder setBytes:&args length:sizeof(args) atIndex:6];
-        [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, rows, 1)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        [encoder endEncoding];
+        if (!fused_rope) {
+            encoder = [gpu.command computeCommandEncoder];
+            [encoder setComputePipelineState:rope];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+            [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, rows, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [encoder endEncoding];
+        }
     }
     h3_gpu_stats stats = gpu.stats;
-    stats.direct_dispatches += 2;
+    stats.direct_dispatches += fused_rope ? 1 : 2;
     gpu.stats = stats;
     gpu.headMajorSDPAInputs = YES;
     return 1;

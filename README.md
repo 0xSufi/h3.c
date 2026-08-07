@@ -598,6 +598,11 @@ gated AdaLN kernel. This removes 99 standalone quantizer dispatches per
 512/864 measurements by about 0.3-0.6%. Use
 `--use-slower-unfused-int8-inputs` to restore the standalone quantizers.
 
+Q/K RMS normalization and RoPE are performed inside the int8 QKV projection
+tile as well. The fused epilogue is byte-identical and improves complete
+forwards by 2.1-3.2% at 512 and 1.0-1.8% at 864 in crossed M5 measurements.
+Use `--use-slower-unfused-qkv-rope` to restore the separate Q/K kernel.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \
