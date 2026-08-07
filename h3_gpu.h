@@ -315,7 +315,8 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *weight_scales,
                             uint32_t rows, uint32_t input_dim,
-                            uint32_t output_dim);
+                            uint32_t output_dim,
+                            int use_slower_uncached_int8_scales);
 int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,

@@ -1971,6 +1971,67 @@ kernel void h3_linear_int8_nax_r128(
     }
 }
 
+/* Cache the two 128-value dequantization vectors once per projection tile.
+ * The cooperative output fragment otherwise rereads them for every element. */
+kernel void h3_linear_int8_local_scales_nax_r128(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint TILE = 128;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.output_dim / TILE;
+    uint2 group = h3_morton_decode_compact(code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint column_start = group.y * TILE;
+    threadgroup float local_input_scales[TILE];
+    threadgroup float local_weight_scales[TILE];
+    if (tid < TILE) {
+        local_input_scales[tid] = input_scales[row_start + tid];
+        local_weight_scales[tid] = weight_scales[column_start + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+    auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+        auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = column_start + (uint)index[0];
+        if (row < args.rows)
+            output[row * args.output_dim + column] =
+                (bfloat)((float)accum[element] *
+                         local_input_scales[(uint)index[1]] *
+                         local_weight_scales[(uint)index[0]]);
+    }
+}
+
 /* FC2 is more sensitive to a single scale spanning all 14336 activated
  * channels.  Retain one activation scale per 1024-wide K group, accumulate
  * each group's exact int32 product separately, then apply its scale before

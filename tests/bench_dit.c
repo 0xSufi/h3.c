@@ -771,7 +771,9 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                                    float *video_velocity,
                                    float *audio_velocity) {
     char error[512];
-    int vector_qkv_rms =
+    int local_linear_scales =
+        getenv("H3_BENCH_INT8_LOCAL_SCALES_AB") != NULL;
+    int vector_qkv_rms = !local_linear_scales &&
         getenv("H3_BENCH_VECTOR_QKV_RMS_AB") != NULL;
     int fused_qkv_rope = !vector_qkv_rms &&
         getenv("H3_BENCH_FUSED_INT8_QKV_ROPE_AB") != NULL;
@@ -783,7 +785,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
     int attention_out = !fused_mlp_input &&
         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
-    const char *disable = vector_qkv_rms ?
+    const char *disable = local_linear_scales ?
+        "H3_DISABLE_INT8_LOCAL_SCALES" : vector_qkv_rms ?
         "H3_DISABLE_VECTOR_QKV_RMS" : fused_qkv_rope ?
         "H3_DISABLE_FUSED_INT8_QKV_ROPE" : fused_inputs ?
         "H3_DISABLE_FUSED_INT8_MLP_INPUT" : fused_qkv_input ?
@@ -792,7 +795,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         "H3_DISABLE_INT8_ATTENTION_OUT" : "H3_DISABLE_INT8_QKV";
     const char *disable2 = fused_inputs ?
         "H3_DISABLE_FUSED_INT8_QKV_INPUT" : NULL;
-    const char *name = vector_qkv_rms ? "vector int8 QKV RMS" :
+    const char *name = local_linear_scales ? "local int8 linear scales" :
+        vector_qkv_rms ? "vector int8 QKV RMS" :
         fused_qkv_rope ? "fused int8 QKV norm/RoPE" :
         fused_inputs ? "fused int8 projection inputs" :
         fused_qkv_input ? "fused int8 QKV input" :
@@ -817,6 +821,7 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
     static const int candidate_pattern[] = {
         0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
     };
+    int invert = getenv("H3_BENCH_PROJECTION_INVERT") != NULL;
     double baseline_seconds = 0.0, candidate_seconds = 0.0;
     int baseline_count = 0, candidate_count = 0;
     double video_rel = 0.0, audio_rel = 0.0;
@@ -824,7 +829,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
     for (size_t index = 0;
          index < sizeof(candidate_pattern) / sizeof(*candidate_pattern);
          index++) {
-        if (candidate_pattern[index]) {
+        int candidate = candidate_pattern[index] ^ invert;
+        if (candidate) {
             unsetenv(disable);
             if (disable2) unsetenv(disable2);
         } else {
@@ -835,7 +841,7 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
-        if (candidate_pattern[index]) {
+        if (candidate) {
             video_rel = relative_l2(video_velocity, video_reference,
                                     VIDEO_ELEMENTS, &video_abs);
             audio_rel = relative_l2(audio_velocity, audio_reference,
@@ -1464,6 +1470,8 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_FUSED_INT8_QKV_ROPE_AB") != NULL;
     int vector_int8_qkv_rms_ab =
         getenv("H3_BENCH_VECTOR_QKV_RMS_AB") != NULL;
+    int local_int8_linear_scales_ab =
+        getenv("H3_BENCH_INT8_LOCAL_SCALES_AB") != NULL;
     const char *qkv_ab = getenv("H3_BENCH_QKV_AB");
     int qkv_denoise_ab = qkv_ab && !strcmp(qkv_ab, "denoise");
     int qkv_step_ab = qkv_ab && !strcmp(qkv_ab, "steps");
@@ -1522,7 +1530,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
@@ -1532,7 +1540,7 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
-            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, NULL, NULL, error,
             sizeof(error));
     }
@@ -1547,7 +1555,8 @@ int main(int argc, char **argv) {
 
     if (int8_qkv_ab || int8_attention_out_ab || fused_int8_mlp_input_ab ||
         fused_int8_qkv_input_ab || fused_int8_inputs_ab ||
-        fused_int8_qkv_rope_ab || vector_int8_qkv_rms_ab) {
+        fused_int8_qkv_rope_ab || vector_int8_qkv_rms_ab ||
+        local_int8_linear_scales_ab) {
         run_int8_projection_ab(
             dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before int8 projection AB\n",

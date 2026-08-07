@@ -33,6 +33,7 @@ static void usage(const char *program) {
         "      --use-slower-unfused-int8-inputs  Keep standalone quantizers\n"
         "      --use-slower-unfused-qkv-rope  Keep separate Q/K norm/RoPE\n"
         "      --use-slower-scalar-qkv-rms  Force scalar Q/K RMS loads\n"
+        "      --use-slower-uncached-int8-scales  Reread projection scales\n"
         "      --use-slower-grouped-quantizer  Force 256-thread FC2 quantizer\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
@@ -197,6 +198,7 @@ int main(int argc, char **argv) {
            OPT_USE_SLOWER_UNFUSED_INT8_INPUTS,
            OPT_USE_SLOWER_UNFUSED_QKV_ROPE,
            OPT_USE_SLOWER_SCALAR_QKV_RMS,
+           OPT_USE_SLOWER_UNCACHED_INT8_SCALES,
            OPT_USE_SLOWER_GROUPED_QUANTIZER,
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
@@ -228,6 +230,8 @@ int main(int argc, char **argv) {
          OPT_USE_SLOWER_UNFUSED_QKV_ROPE},
         {"use-slower-scalar-qkv-rms", no_argument, NULL,
          OPT_USE_SLOWER_SCALAR_QKV_RMS},
+        {"use-slower-uncached-int8-scales", no_argument, NULL,
+         OPT_USE_SLOWER_UNCACHED_INT8_SCALES},
         {"use-slower-grouped-quantizer", no_argument, NULL,
          OPT_USE_SLOWER_GROUPED_QUANTIZER},
         {"seed", required_argument, NULL, OPT_SEED},
@@ -300,6 +304,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_USE_SLOWER_SCALAR_QKV_RMS:
                 params.use_slower_scalar_qkv_rms = 1;
+                break;
+            case OPT_USE_SLOWER_UNCACHED_INT8_SCALES:
+                params.use_slower_uncached_int8_scales = 1;
                 break;
             case OPT_USE_SLOWER_GROUPED_QUANTIZER:
                 params.use_slower_grouped_quantizer = 1;

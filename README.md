@@ -608,6 +608,12 @@ explicit ordered FMAs. This preserves every output bit and improves 512-class
 forwards by another 0.5-0.6%; larger shapes retain scalar loads because the two
 forms tie there. Use `--use-slower-scalar-qkv-rms` to force scalar loads.
 
+The int8 attention-output projection caches its 128 row and column scales in
+1 KiB of threadgroup memory instead of rereading them for every cooperative
+fragment element. This is byte-identical and improves complete forwards by
+about 0.2-0.7% across the measured 512 and 864 shapes. Use
+`--use-slower-uncached-int8-scales` to restore direct device-scale loads.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \
