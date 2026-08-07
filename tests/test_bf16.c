@@ -251,6 +251,9 @@ static void test_token_reduction_kernels(test_context *test) {
     h3_gpu_tensor *gate_adaln_reference = fresh(test, FULL_ROWS * WIDTH);
     h3_gpu_tensor *fused_gate_residual = fresh(test, FULL_ROWS * WIDTH);
     h3_gpu_tensor *fused_gate_adaln = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *offset_slice = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *offset_adaln_reference = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *offset_adaln = fresh(test, FULL_ROWS * WIDTH);
     require_gpu(test, h3_gpu_begin(test->gpu),
                 "begin fused token AdaLN command stream");
     require_gpu(test, h3_gpu_adaln_bf16(
@@ -288,6 +291,17 @@ static void test_token_reduction_kernels(test_context *test) {
         FULL_ROWS, WIDTH,
         2, 0, 0, 1, 1e-5f),
         "encode fused gate AdaLN");
+    require_gpu(test, h3_gpu_copy_bf16(
+        test->gpu, offset_slice, 0, input, PADDING, FULL_ROWS * WIDTH),
+        "encode reference final slice");
+    require_gpu(test, h3_gpu_adaln_bf16(
+        test->gpu, offset_adaln_reference, offset_slice, norm, modulation,
+        gpu_row_map, FULL_ROWS, WIDTH, 2, 0, 1, 1e-5f),
+        "encode reference sliced AdaLN");
+    require_gpu(test, h3_gpu_adaln_bf16_offset(
+        test->gpu, offset_adaln, input, PADDING, norm, modulation,
+        gpu_row_map, FULL_ROWS, WIDTH, 2, 0, 1, 1e-5f),
+        "encode offset-bound AdaLN");
     require_gpu(test, h3_gpu_submit(test->gpu),
                 "submit fused token AdaLN command stream");
     uint16_t got_fused_pooled[(REDUCED_ROWS + BASELINE_ROWS) * WIDTH];
@@ -301,6 +315,8 @@ static void test_token_reduction_kernels(test_context *test) {
     uint16_t got_gate_adaln_reference[FULL_ROWS * WIDTH];
     uint16_t got_fused_gate_residual[FULL_ROWS * WIDTH];
     uint16_t got_fused_gate_adaln[FULL_ROWS * WIDTH];
+    uint16_t got_offset_adaln_reference[FULL_ROWS * WIDTH];
+    uint16_t got_offset_adaln[FULL_ROWS * WIDTH];
     require(h3_gpu_tensor_read_bf16(
                 fused_pooled, got_fused_pooled,
                 (REDUCED_ROWS + BASELINE_ROWS) * WIDTH),
@@ -340,6 +356,13 @@ static void test_token_reduction_kernels(test_context *test) {
     require(h3_gpu_tensor_read_bf16(
                 fused_gate_adaln, got_fused_gate_adaln, FULL_ROWS * WIDTH),
             "cannot read fused gate AdaLN");
+    require(h3_gpu_tensor_read_bf16(
+                offset_adaln_reference, got_offset_adaln_reference,
+                FULL_ROWS * WIDTH),
+            "cannot read reference sliced AdaLN");
+    require(h3_gpu_tensor_read_bf16(
+                offset_adaln, got_offset_adaln, FULL_ROWS * WIDTH),
+            "cannot read offset-bound AdaLN");
     require(memcmp(got_fused_pooled, got_baseline,
                    sizeof(got_fused_pooled)) == 0,
             "fused token pool AdaLN changed residual or baselines");
@@ -362,6 +385,9 @@ static void test_token_reduction_kernels(test_context *test) {
     require(memcmp(got_fused_gate_adaln, got_gate_adaln_reference,
                    sizeof(got_fused_gate_adaln)) == 0,
             "fused gate AdaLN differs from the exact two-kernel path");
+    require(memcmp(got_offset_adaln, got_offset_adaln_reference,
+                   sizeof(got_offset_adaln)) == 0,
+            "offset-bound AdaLN differs from copy plus AdaLN");
 }
 
 static double monotonic_seconds(void) {
@@ -454,6 +480,87 @@ static void bench_gate_adaln_shape(test_context *test, uint32_t rows,
     printf("gate AdaLN %s separate %.6fs, fused %.6fs, ratio %.4f\n",
            label, separate_average, fused_average,
            fused_average / separate_average);
+}
+
+static void bench_final_slice_adaln(test_context *test, uint32_t rows) {
+    enum {
+        PREFIX_ROWS = 300, WIDTH = 5376, SLOTS = 2, ITERATIONS = 64
+    };
+    size_t elements = (size_t)rows * WIDTH;
+    size_t prefix = (size_t)PREFIX_ROWS * WIDTH;
+    uint32_t *row_map = calloc(rows, sizeof(*row_map));
+    require(row_map != NULL,
+            "final slice AdaLN benchmark row-map allocation failed");
+    h3_gpu_tensor *source = fresh(test, prefix + elements);
+    h3_gpu_tensor *slice = fresh(test, elements);
+    h3_gpu_tensor *norm = fresh(test, WIDTH);
+    h3_gpu_tensor *modulation = fresh(test, (size_t)SLOTS * WIDTH);
+    h3_gpu_tensor *gpu_row_map = own(test, h3_gpu_tensor_from_u32(
+        test->gpu, row_map, rows));
+    h3_gpu_tensor *separate_output = fresh(test, elements);
+    h3_gpu_tensor *offset_output = fresh(test, elements);
+    free(row_map);
+
+    require_gpu(test, h3_gpu_begin(test->gpu),
+                "begin final slice AdaLN warmup");
+    for (int warm = 0; warm < 16; warm++) {
+        require_gpu(test, h3_gpu_copy_bf16(
+            test->gpu, slice, 0, source, prefix, elements),
+            "encode final slice warmup");
+        require_gpu(test, h3_gpu_adaln_bf16(
+            test->gpu, separate_output, slice, norm, modulation, gpu_row_map,
+            rows, WIDTH, SLOTS, 0, 1, 1e-5f),
+            "encode separate final AdaLN warmup");
+        require_gpu(test, h3_gpu_adaln_bf16_offset(
+            test->gpu, offset_output, source, prefix, norm, modulation,
+            gpu_row_map, rows, WIDTH, SLOTS, 0, 1, 1e-5f),
+            "encode offset-bound final AdaLN warmup");
+    }
+    require_gpu(test, h3_gpu_submit(test->gpu),
+                "submit final slice AdaLN warmup");
+
+    static const int offset_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double separate_seconds = 0.0, offset_seconds = 0.0;
+    int separate_count = 0, offset_count = 0;
+    for (size_t sample = 0;
+         sample < sizeof(offset_pattern) / sizeof(*offset_pattern); sample++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu),
+                    "begin final slice AdaLN microbenchmark");
+        for (int iteration = 0; iteration < ITERATIONS; iteration++) {
+            if (offset_pattern[sample]) {
+                require_gpu(test, h3_gpu_adaln_bf16_offset(
+                    test->gpu, offset_output, source, prefix, norm,
+                    modulation, gpu_row_map, rows, WIDTH, SLOTS,
+                    0, 1, 1e-5f),
+                    "encode offset-bound final AdaLN microbenchmark");
+            } else {
+                require_gpu(test, h3_gpu_copy_bf16(
+                    test->gpu, slice, 0, source, prefix, elements),
+                    "encode final slice microbenchmark");
+                require_gpu(test, h3_gpu_adaln_bf16(
+                    test->gpu, separate_output, slice, norm, modulation,
+                    gpu_row_map, rows, WIDTH, SLOTS, 0, 1, 1e-5f),
+                    "encode separate final AdaLN microbenchmark");
+            }
+        }
+        require_gpu(test, h3_gpu_submit(test->gpu),
+                    "submit final slice AdaLN microbenchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (offset_pattern[sample]) {
+            offset_seconds += elapsed;
+            offset_count++;
+        } else {
+            separate_seconds += elapsed;
+            separate_count++;
+        }
+    }
+    double separate = separate_seconds / separate_count / (double)ITERATIONS;
+    double offset = offset_seconds / offset_count / (double)ITERATIONS;
+    printf("final video slice/AdaLN %u rows separate %.6fs, offset %.6fs, "
+           "ratio %.4f\n", rows, separate, offset, offset / separate);
 }
 
 static void bench_token_pool_adaln(test_context *test) {
@@ -944,6 +1051,16 @@ int main(int argc, char **argv) {
         bench_gate_adaln_shape(&test, 2915, "2915 rows");
         bench_token_pool_adaln(&test);
         bench_token_expand_adaln(&test);
+        cleanup(&test);
+        return 0;
+    }
+    const char *final_rows = getenv("H3_BENCH_FINAL_SLICE_ADALN");
+    if (final_rows) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(final_rows, &end, 10);
+        if (end == final_rows || *end || !parsed || parsed > UINT32_MAX)
+            die("H3_BENCH_FINAL_SLICE_ADALN must be a row count");
+        bench_final_slice_adaln(&test, parsed == 1 ? 1792 : (uint32_t)parsed);
         cleanup(&test);
         return 0;
     }

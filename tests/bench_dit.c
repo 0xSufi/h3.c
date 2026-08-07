@@ -657,6 +657,30 @@ static void run_cross_adaln_ab(h3_dit *dit, float *video, float *audio,
            (unsigned long long)video_hash, (unsigned long long)audio_hash);
 }
 
+static void run_final_slice_ab(h3_dit *dit, float *video, float *audio,
+                               float *video_velocity,
+                               float *audio_velocity) {
+    char error[512];
+    setenv("H3_DISABLE_FUSED_FINAL_SLICE", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                        audio_velocity, error, sizeof(error))) die(error);
+    uint64_t video_hash = hash_bytes(
+        video_velocity, VIDEO_ELEMENTS * sizeof(*video_velocity));
+    uint64_t audio_hash = hash_bytes(
+        audio_velocity, AUDIO_ELEMENTS * sizeof(*audio_velocity));
+    unsetenv("H3_DISABLE_FUSED_FINAL_SLICE");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                        audio_velocity, error, sizeof(error))) die(error);
+    if (hash_bytes(video_velocity,
+                   VIDEO_ELEMENTS * sizeof(*video_velocity)) != video_hash ||
+        hash_bytes(audio_velocity,
+                   AUDIO_ELEMENTS * sizeof(*audio_velocity)) != audio_hash)
+        die("offset-bound final AdaLN changed output bytes");
+    printf("DiT final slice/AdaLN outputs byte-identical; hashes video "
+           "%016llx audio %016llx\n",
+           (unsigned long long)video_hash, (unsigned long long)audio_hash);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -687,8 +711,10 @@ int main(int argc, char **argv) {
     int token_reduction_ab =
         getenv("H3_BENCH_TOKEN_REDUCTION_AB") != NULL;
     int cross_adaln_ab = getenv("H3_BENCH_CROSS_ADALN_AB") != NULL;
+    int final_slice_ab = getenv("H3_BENCH_FINAL_SLICE_AB") != NULL;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
-        !((sampler_ab || token_reduction_ab || cross_adaln_ab)
+        !((sampler_ab || token_reduction_ab || cross_adaln_ab ||
+           final_slice_ab)
               ? h3_serving_schedule_build(20, &sigmas)
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
@@ -713,11 +739,13 @@ int main(int argc, char **argv) {
         reuse_interval = (int)parsed;
     }
     double load_start = seconds();
+    if (final_slice_ab) setenv("H3_DISABLE_FUSED_FINAL_SLICE", "1", 1);
     h3_dit *dit = h3_dit_load_t2va(
         weights, "h3_shaders.metal", &text, &layout, &sigmas, active_blocks, 1,
-        token_reduction_ab || cross_adaln_ab,
+        token_reduction_ab || cross_adaln_ab || final_slice_ab,
         NULL, NULL, error, sizeof(error));
     if (!dit) die(error);
+    if (final_slice_ab) unsetenv("H3_DISABLE_FUSED_FINAL_SLICE");
     double load_seconds = seconds() - load_start;
 
     const char *command_ab = getenv("H3_BENCH_COMMAND_AB");
@@ -785,6 +813,18 @@ int main(int argc, char **argv) {
         run_cross_adaln_ab(dit, video, audio, video_velocity,
                            audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before cross-block AdaLN AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (final_slice_ab) {
+        run_final_slice_ab(dit, video, audio, video_velocity,
+                           audio_velocity);
+        printf("DiT %ux%u/%u-layer load %.3fs before final slice AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);

@@ -983,8 +983,6 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         BF(attention_output, sequence * HIDDEN),
         BF(mod_mlp, sequence * HIDDEN),
         BF(mlp_output, sequence * HIDDEN),
-        BF(final_audio_input, audio * HIDDEN),
-        BF(final_video_input, video * HIDDEN),
         BF(final_audio_norm, audio * HIDDEN),
         BF(final_video_norm, video * HIDDEN),
         BF(audio_output_bf16, audio * AUDIO_CHANNELS),
@@ -995,6 +993,18 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
         if (!all[index]) {
             fail(error, error_size, "cannot allocate DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+        dit->final_audio_input = h3_gpu_tensor_new_bf16(
+            dit->gpu, audio * HIDDEN);
+        dit->final_video_input = h3_gpu_tensor_new_bf16(
+            dit->gpu, video * HIDDEN);
+        if (!dit->final_audio_input || !dit->final_video_input) {
+            fail(error, error_size,
+                 "cannot allocate separate final DiT slices: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1509,22 +1519,34 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
            "reuse DiT core residual");
     }
     dit->core_forward_count++;
-    OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
-        (size_t)dit->audio_target_start * HIDDEN,
-        (size_t)dit->audio_rows * HIDDEN),
-       "slice final audio");
-    OP(h3_gpu_copy_bf16(dit->gpu, dit->final_video_input, 0, dit->hidden,
-        (size_t)dit->video_target_start * HIDDEN,
-        (size_t)dit->video_rows * HIDDEN), "slice final video");
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
-    OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_audio_norm,
-        dit->final_audio_input, dit->final_norm, final,
-        dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
-        0, 1, 1e-5f), "final audio AdaLN");
-    OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_video_norm,
-        dit->final_video_input, dit->final_norm, final,
-        dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
-        0, 1, 1e-5f), "final video AdaLN");
+    if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+        OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
+            (size_t)dit->audio_target_start * HIDDEN,
+            (size_t)dit->audio_rows * HIDDEN), "slice final audio");
+        OP(h3_gpu_copy_bf16(dit->gpu, dit->final_video_input, 0, dit->hidden,
+            (size_t)dit->video_target_start * HIDDEN,
+            (size_t)dit->video_rows * HIDDEN), "slice final video");
+        OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_audio_norm,
+            dit->final_audio_input, dit->final_norm, final,
+            dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "final audio AdaLN");
+        OP(h3_gpu_adaln_bf16(dit->gpu, dit->final_video_norm,
+            dit->final_video_input, dit->final_norm, final,
+            dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "final video AdaLN");
+    } else {
+        OP(h3_gpu_adaln_bf16_offset(
+            dit->gpu, dit->final_audio_norm, dit->hidden,
+            (size_t)dit->audio_target_start * HIDDEN, dit->final_norm, final,
+            dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "fused final audio slice/AdaLN");
+        OP(h3_gpu_adaln_bf16_offset(
+            dit->gpu, dit->final_video_norm, dit->hidden,
+            (size_t)dit->video_target_start * HIDDEN, dit->final_norm, final,
+            dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "fused final video slice/AdaLN");
+    }
     if (dit->bf16_final) {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->audio_output_bf16,
             dit->final_audio_norm, dit->final_audio_w, dit->final_audio_b,

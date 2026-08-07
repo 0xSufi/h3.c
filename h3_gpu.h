@@ -308,6 +308,13 @@ int h3_gpu_adaln_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *row_map, uint32_t rows,
                       uint32_t width, uint32_t slots, uint32_t shift_slot,
                       uint32_t scale_slot, float epsilon);
+int h3_gpu_adaln_bf16_offset(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, size_t input_offset,
+                      const h3_gpu_tensor *norm_weight,
+                      const h3_gpu_tensor *modulation,
+                      const h3_gpu_tensor *row_map, uint32_t rows,
+                      uint32_t width, uint32_t slots, uint32_t shift_slot,
+                      uint32_t scale_slot, float epsilon);
 int h3_gpu_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *residual,
                      const h3_gpu_tensor *branch,

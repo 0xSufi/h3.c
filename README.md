@@ -99,6 +99,10 @@ global reread. Away from token-reduction boundaries, the MLP residual gate also
 produces the next block's attention AdaLN and carries that normalized state
 across the loop. `H3_DISABLE_FUSED_GATE_ADALN=1` and
 `H3_DISABLE_FUSED_CROSS_BLOCK_ADALN=1` restore the two-kernel oracles.
+The final audio/video AdaLN kernels bind directly to offsets in the residual
+stream, avoiding two slice blits and 37.5 MiB of scratch at 512x512 (58.9 MiB
+at the 864-class benchmark shape).
+`H3_DISABLE_FUSED_FINAL_SLICE=1` restores the copy-plus-AdaLN oracle at load.
 `--token-reduction` is an independent aggressive DiT mode. After block 3 it
 pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is
