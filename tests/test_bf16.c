@@ -399,6 +399,53 @@ static void bench_token_expand_adaln(test_context *test) {
            fused_average / old_average);
 }
 
+static void bench_h3_sdpa(test_context *test) {
+    enum { MAX_SEQUENCE = 1550, H3_HEADS = 56, DIMENSION = 128 };
+    size_t elements = (size_t)MAX_SEQUENCE * H3_HEADS * DIMENSION;
+    h3_gpu_tensor *query = fresh(test, elements);
+    h3_gpu_tensor *key = fresh(test, elements);
+    h3_gpu_tensor *value = fresh(test, elements);
+    h3_gpu_tensor *output = fresh(test, elements);
+    const float scale = 1.0f / sqrtf((float)DIMENSION);
+    const uint32_t shapes[] = {976, 1550};
+    require_gpu(test, h3_gpu_begin(test->gpu), "begin H3 SDPA warmup");
+    for (int warm = 0; warm < 8; warm++) {
+        for (size_t index = 0; index < sizeof(shapes) / sizeof(*shapes);
+             index++)
+            require_gpu(test, h3_gpu_sdpa_bf16(
+                test->gpu, output, query, key, value, shapes[index], H3_HEADS,
+                DIMENSION, scale), "encode H3 SDPA warmup");
+    }
+    require_gpu(test, h3_gpu_submit(test->gpu), "submit H3 SDPA warmup");
+
+    static const uint32_t pattern[] = {
+        976, 1550, 1550, 976, 1550, 976,
+        976, 1550, 976, 1550, 1550, 976
+    };
+    double small_seconds = 0.0, large_seconds = 0.0;
+    int small_count = 0, large_count = 0;
+    for (size_t sample = 0; sample < sizeof(pattern) / sizeof(*pattern);
+         sample++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu), "begin H3 SDPA benchmark");
+        require_gpu(test, h3_gpu_sdpa_bf16(
+            test->gpu, output, query, key, value, pattern[sample], H3_HEADS,
+            DIMENSION, scale), "encode H3 SDPA benchmark");
+        require_gpu(test, h3_gpu_submit(test->gpu), "submit H3 SDPA benchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (pattern[sample] == shapes[0]) {
+            small_seconds += elapsed;
+            small_count++;
+        } else {
+            large_seconds += elapsed;
+            large_count++;
+        }
+        printf("  H3 SDPA %u tokens %.6fs\n", pattern[sample], elapsed);
+    }
+    printf("H3 SDPA MPSGraph 976 %.6fs, 1550 %.6fs\n",
+           small_seconds / small_count, large_seconds / large_count);
+}
+
 static void test_euler_update(test_context *test) {
     float sample_values[] = {-7.0f, -8.0f, 10.0f, 20.0f,
                              30.0f, 40.0f, -9.0f};
@@ -499,6 +546,11 @@ int main(int argc, char **argv) {
     }
     if (getenv("H3_BENCH_TOKEN_ADALN")) {
         bench_token_expand_adaln(&test);
+        cleanup(&test);
+        return 0;
+    }
+    if (getenv("H3_BENCH_SDPA")) {
+        bench_h3_sdpa(&test);
         cleanup(&test);
         return 0;
     }
