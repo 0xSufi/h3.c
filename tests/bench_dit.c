@@ -260,6 +260,216 @@ static double relative_l2(const float *got, const float *want, size_t count,
                                  ? squared_reference : 1e-30));
 }
 
+static void run_qkv_ab(h3_dit *dit, float *video, float *audio,
+                       float *video_velocity, float *audio_velocity) {
+    char error[512];
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating cooperative QKV AB references");
+
+    setenv("H3_DISABLE_COOP_QKV", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    unsetenv("H3_DISABLE_COOP_QKV");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int candidate_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0;
+    double candidate_seconds = 0.0;
+    int baseline_count = 0;
+    int candidate_count = 0;
+    double video_rel = 0.0, audio_rel = 0.0;
+    double video_abs = 0.0, audio_abs = 0.0;
+    for (size_t index = 0;
+         index < sizeof(candidate_pattern) / sizeof(*candidate_pattern);
+         index++) {
+        if (candidate_pattern[index])
+            unsetenv("H3_DISABLE_COOP_QKV");
+        else
+            setenv("H3_DISABLE_COOP_QKV", "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (candidate_pattern[index]) {
+            video_rel = relative_l2(video_velocity, video_reference,
+                                    VIDEO_ELEMENTS, &video_abs);
+            audio_rel = relative_l2(audio_velocity, audio_reference,
+                                    AUDIO_ELEMENTS, &audio_abs);
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  cooperative QKV %.3fs video relL2 %.6g; "
+                   "audio relL2 %.6g\n", elapsed, video_rel, audio_rel);
+        } else {
+            if (memcmp(video_velocity, video_reference,
+                       VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+                memcmp(audio_velocity, audio_reference,
+                       AUDIO_ELEMENTS * sizeof(*audio_reference)))
+                die("repeated scalar QKV changed output bytes");
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  scalar QKV %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_COOP_QKV");
+    printf("DiT cooperative QKV AB scalar %.4fs, cooperative %.4fs, "
+           "ratio %.4f; video relL2 %.6g max %.6g; audio relL2 %.6g "
+           "max %.6g\n", baseline_seconds / baseline_count,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           video_rel, video_abs, audio_rel, audio_abs);
+    free(video_reference);
+    free(audio_reference);
+}
+
+static void run_qkv_denoise_ab(h3_dit *dit, float *video, float *audio,
+                               int reuse_interval) {
+    char error[512];
+    float *initial_video = malloc(VIDEO_ELEMENTS * sizeof(*initial_video));
+    float *initial_audio = malloc(AUDIO_ELEMENTS * sizeof(*initial_audio));
+    float *reference_video = malloc(VIDEO_ELEMENTS * sizeof(*reference_video));
+    float *reference_audio = malloc(AUDIO_ELEMENTS * sizeof(*reference_audio));
+    if (!initial_video || !initial_audio || !reference_video || !reference_audio)
+        die("out of memory allocating cooperative QKV denoise AB state");
+    memcpy(initial_video, video, VIDEO_ELEMENTS * sizeof(*initial_video));
+    memcpy(initial_audio, audio, AUDIO_ELEMENTS * sizeof(*initial_audio));
+
+    static const int candidate_pattern[] = {0, 1, 1, 0};
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0, have_reference = 0;
+    uint64_t video_hash = 0, audio_hash = 0;
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        memcpy(video, initial_video, VIDEO_ELEMENTS * sizeof(*video));
+        memcpy(audio, initial_audio, AUDIO_ELEMENTS * sizeof(*audio));
+        if (candidate_pattern[run])
+            unsetenv("H3_DISABLE_COOP_QKV");
+        else
+            setenv("H3_DISABLE_COOP_QKV", "1", 1);
+        double start = seconds();
+        if (!h3_dit_denoise_euler(dit, video, audio, reuse_interval, NULL, NULL,
+                                  error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (!have_reference) {
+            memcpy(reference_video, video,
+                   VIDEO_ELEMENTS * sizeof(*reference_video));
+            memcpy(reference_audio, audio,
+                   AUDIO_ELEMENTS * sizeof(*reference_audio));
+            video_hash = hash_bytes(video, VIDEO_ELEMENTS * sizeof(*video));
+            audio_hash = hash_bytes(audio, AUDIO_ELEMENTS * sizeof(*audio));
+            have_reference = 1;
+        } else if (memcmp(video, reference_video,
+                          VIDEO_ELEMENTS * sizeof(*reference_video)) ||
+                   memcmp(audio, reference_audio,
+                          AUDIO_ELEMENTS * sizeof(*reference_audio))) {
+            die("cooperative QKV changed denoised latent bytes");
+        }
+        if (candidate_pattern[run]) {
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  cooperative QKV denoise %.3fs\n", elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  scalar QKV denoise %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_COOP_QKV");
+    printf("DiT cooperative QKV denoise AB scalar %.4fs, cooperative %.4fs, "
+           "ratio %.4f; byte-identical hashes video %016llx audio %016llx\n",
+           baseline_seconds / baseline_count,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           (unsigned long long)video_hash, (unsigned long long)audio_hash);
+    free(initial_video); free(initial_audio);
+    free(reference_video); free(reference_audio);
+}
+
+typedef struct {
+    int waiting;
+    int step;
+    int invert;
+    int candidate_count;
+    int scalar_count;
+    double started;
+    double candidate_seconds;
+    double scalar_seconds;
+} qkv_step_ab_state;
+
+static void qkv_step_ab_progress(const char *phase, int completed, int total,
+                                 void *opaque) {
+    qkv_step_ab_state *state = opaque;
+    if (strcmp(phase, "denoise")) return;
+    if (!state->waiting) {
+        if (completed >= total) return;
+        static const int pattern[] = {0, 1, 1, 0};
+        int candidate = pattern[completed % 4] ^ state->invert;
+        if (candidate)
+            unsetenv("H3_DISABLE_COOP_QKV");
+        else
+            setenv("H3_DISABLE_COOP_QKV", "1", 1);
+        state->step = completed;
+        state->started = seconds();
+        state->waiting = 1;
+        return;
+    }
+    if (completed != state->step + 1) return;
+    double elapsed = seconds() - state->started;
+    static const int pattern[] = {0, 1, 1, 0};
+    int candidate = pattern[state->step % 4] ^ state->invert;
+    if (candidate) {
+        state->candidate_seconds += elapsed;
+        state->candidate_count++;
+        printf("  step %d cooperative QKV %.3fs\n", state->step, elapsed);
+    } else {
+        state->scalar_seconds += elapsed;
+        state->scalar_count++;
+        printf("  step %d scalar QKV %.3fs\n", state->step, elapsed);
+    }
+    state->waiting = 0;
+}
+
+static void run_qkv_step_ab(h3_dit *dit, float *video, float *audio,
+                            float *video_velocity, float *audio_velocity,
+                            int reuse_interval) {
+    char error[512];
+    setenv("H3_DISABLE_COOP_QKV", "1", 1);
+    if (!h3_dit_forward(dit, 0, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    unsetenv("H3_DISABLE_COOP_QKV");
+    if (!h3_dit_forward(dit, 0, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    qkv_step_ab_state state = {0};
+    state.invert = getenv("H3_BENCH_QKV_INVERT") != NULL;
+    setenv("H3_CPU_SAMPLER", "1", 1);
+    if (!h3_dit_denoise_euler(dit, video, audio, reuse_interval,
+                              qkv_step_ab_progress, &state,
+                              error, sizeof(error))) die(error);
+    unsetenv("H3_CPU_SAMPLER");
+    unsetenv("H3_DISABLE_COOP_QKV");
+    double scalar = state.scalar_seconds / state.scalar_count;
+    double candidate = state.candidate_seconds / state.candidate_count;
+    printf("DiT cooperative QKV per-step AB scalar %.4fs (%d), "
+           "cooperative %.4fs (%d), ratio %.4f; hashes video %016llx "
+           "audio %016llx\n", scalar, state.scalar_count, candidate,
+           state.candidate_count, candidate / scalar,
+           (unsigned long long)hash_bytes(
+               video, VIDEO_ELEMENTS * sizeof(*video)),
+           (unsigned long long)hash_bytes(
+               audio, AUDIO_ELEMENTS * sizeof(*audio)));
+}
+
 static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                            float *video_velocity, float *audio_velocity) {
     char error[512];
@@ -747,9 +957,12 @@ int main(int argc, char **argv) {
     int cross_adaln_ab = getenv("H3_BENCH_CROSS_ADALN_AB") != NULL;
     int final_slice_ab = getenv("H3_BENCH_FINAL_SLICE_AB") != NULL;
     int final_head_ab = getenv("H3_BENCH_FINAL_HEAD_AB") != NULL;
+    const char *qkv_ab = getenv("H3_BENCH_QKV_AB");
+    int qkv_denoise_ab = qkv_ab && !strcmp(qkv_ab, "denoise");
+    int qkv_step_ab = qkv_ab && !strcmp(qkv_ab, "steps");
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
         !((sampler_ab || token_reduction_ab || cross_adaln_ab ||
-           final_slice_ab || final_head_ab)
+           final_slice_ab || final_head_ab || qkv_denoise_ab || qkv_step_ab)
               ? h3_serving_schedule_build(20, &sigmas)
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
@@ -861,6 +1074,23 @@ int main(int argc, char **argv) {
     if (getenv("H3_BENCH_NAX_MLP_AB")) {
         run_nax_mlp_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before NAX MLP AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (qkv_ab) {
+        if (qkv_denoise_ab)
+            run_qkv_denoise_ab(dit, video, audio, reuse_interval);
+        else if (qkv_step_ab)
+            run_qkv_step_ab(dit, video, audio, video_velocity,
+                            audio_velocity, reuse_interval);
+        else
+            run_qkv_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT %ux%u/%u-layer load %.3fs before cooperative QKV AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);

@@ -1518,6 +1518,9 @@ int main(int argc, char **argv) {
     h3_gpu_tensor *plain_q = fresh(&test, SEQUENCE * INNER);
     h3_gpu_tensor *plain_k = fresh(&test, SEQUENCE * INNER);
     h3_gpu_tensor *plain_v = fresh(&test, SEQUENCE * INNER);
+    h3_gpu_tensor *oracle_q = fresh(&test, SEQUENCE * INNER);
+    h3_gpu_tensor *oracle_k = fresh(&test, SEQUENCE * INNER);
+    h3_gpu_tensor *oracle_v = fresh(&test, SEQUENCE * INNER);
     h3_gpu_tensor *plain_sdpa = fresh(&test, SEQUENCE * INNER);
     h3_gpu_tensor *plain_attn = fresh(&test, SEQUENCE * HIDDEN);
     h3_gpu_tensor *plain_fc1 = fresh(&test, SEQUENCE * FFN * 2);
@@ -1616,6 +1619,23 @@ int main(int argc, char **argv) {
 
     h3_gpu_stats stats;
     require(h3_gpu_get_stats(test.gpu, &stats), "cannot read Metal counters");
+
+    /* The cooperative production mapping must retain the scalar kernel's
+     * BF16 boundary exactly, not merely stay within the MLX error tolerance. */
+    setenv("H3_DISABLE_COOP_QKV", "1", 1);
+    require_gpu(&test, h3_gpu_begin(test.gpu), "begin scalar QKV oracle");
+    require_gpu(&test, h3_gpu_qkv_rope_bf16(
+        test.gpu, oracle_q, oracle_k, oracle_v, plain_qkv, q_norm, k_norm,
+        rope_cos, rope_sin, SEQUENCE, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+        "scalar QKV oracle");
+    unsetenv("H3_DISABLE_COOP_QKV");
+    require_gpu(&test, h3_gpu_submit(test.gpu), "submit scalar QKV oracle");
+    require_same_bf16(plain_q, oracle_q, SEQUENCE * INNER,
+                      "cooperative query differs from scalar oracle");
+    require_same_bf16(plain_k, oracle_k, SEQUENCE * INNER,
+                      "cooperative key differs from scalar oracle");
+    require_same_bf16(plain_v, oracle_v, SEQUENCE * INNER,
+                      "cooperative value differs from scalar oracle");
 
     /* The released H3 checkpoint emits QKV interleaved per head. Verify the
      * production deinterleaver against the conventional fixture layout. */

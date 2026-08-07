@@ -412,7 +412,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16",
-            @"h3_qkv_rope_bf16", @"h3_swiglu_bf16",
+            @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
+            @"h3_swiglu_bf16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
@@ -2919,6 +2920,38 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
         !h3_gpu_require_bf16(gpu, value, count, @"value") ||
         rope_half * 2 > head_dim) return 0;
     qkv_args args = {sequence, heads, head_dim, rope_half, grouped, epsilon};
+    if (head_dim == 128 && !(heads % 4) &&
+        !getenv("H3_DISABLE_COOP_QKV")) {
+        if (!h3_gpu_require_command(gpu)) return 0;
+        id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+            gpu, @"h3_qkv_rope_bf16_coop");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < head_dim) {
+            h3_gpu_set_error(gpu,
+                @"cooperative QKV/RoPE needs a 128-thread threadgroup");
+            return 0;
+        }
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder =
+                [gpu.command computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:7];
+            [encoder setBytes:&args length:sizeof(args) atIndex:8];
+            [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, sequence, 1)
+                     threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+            [encoder endEncoding];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+        return 1;
+    }
     return h3_gpu_dispatch_3d(gpu, @"h3_qkv_rope_bf16",
         MTLSizeMake(head_dim, heads, sequence),
         ^(id<MTLComputeCommandEncoder> encoder) {
