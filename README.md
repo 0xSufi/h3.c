@@ -107,7 +107,7 @@ canvases therefore add no activation arena at any token-grid width. Pooling
 also snapshots both source tokens while their BF16 values are already in
 registers, avoiding a separate full-hidden blit and redundant source read.
 At the restore boundary, the first full-resolution attention AdaLN is fused
-into expansion: an 8 KiB threadgroup row avoids a global residual reread while
+into expansion: a 10.5 KiB threadgroup row avoids a global residual reread while
 still writing the exact bypass needed by the following residual branch.
 On a thermal-balanced 512x512x22, 19-forward IT M5 Max A/B this reduced denoise
 time from 36.46 to 29.07 seconds (20.3%). Final video/audio latent relative L2

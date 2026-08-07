@@ -3111,7 +3111,7 @@ int h3_gpu_token_expand_adaln_bf16(
     size_t reduced_elements = (size_t)reduced_rows * width;
     size_t baseline_elements = (size_t)baseline_rows * width;
     if (!rows || !reduced_rows || reduced_rows > rows || !width ||
-        width > 4096 || baseline_rows > reduced_rows ||
+        width > 5376 || baseline_rows > reduced_rows ||
         exact_prefix_rows > reduced_rows || shift_slot >= slots ||
         scale_slot >= slots || elements > UINT32_MAX ||
         reduced_elements > UINT32_MAX || original_offset > UINT32_MAX ||

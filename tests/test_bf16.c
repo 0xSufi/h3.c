@@ -12,7 +12,7 @@ enum {
     SEQUENCE = 32, HIDDEN = 256, HEADS = 4, HEAD_DIM = 32,
     INNER = HEADS * HEAD_DIM, FFN = 128, T_ROWS = 2, T_DIM = 32,
     MODALITIES = 3, MODULATION_SLOTS = 6, ROPE_HALF = 12,
-    MAX_TENSORS = 80
+    MAX_TENSORS = 96
 };
 
 typedef struct {
@@ -280,7 +280,7 @@ static double monotonic_seconds(void) {
 static void bench_token_expand_adaln(test_context *test) {
     enum {
         ROWS = 2915, REDUCED_ROWS = 1550, PREFIX_ROWS = 80,
-        BASELINE_ROWS = 1365, WIDTH = 4096, SLOTS = 6, ITERATIONS = 64
+        BASELINE_ROWS = 1365, WIDTH = 5376, SLOTS = 6, ITERATIONS = 64
     };
     uint32_t *baseline_indices = malloc(
         REDUCED_ROWS * sizeof(*baseline_indices));
@@ -528,6 +528,86 @@ static void require_same_bf16(h3_gpu_tensor *left, h3_gpu_tensor *right,
     free(b);
 }
 
+static void test_wide_token_adaln(test_context *test) {
+    enum {
+        ROWS = 3, REDUCED_ROWS = 2, BASELINE_ROWS = 1,
+        WIDTH = 5376, SLOTS = 2
+    };
+    size_t full_elements = (size_t)ROWS * WIDTH;
+    size_t reduced_elements = (size_t)(REDUCED_ROWS + BASELINE_ROWS) * WIDTH;
+    uint16_t *original_values = malloc(full_elements * sizeof(*original_values));
+    uint16_t *reduced_values = malloc(
+        reduced_elements * sizeof(*reduced_values));
+    uint16_t *norm_values = malloc(WIDTH * sizeof(*norm_values));
+    uint16_t *modulation_values = malloc(
+        (size_t)SLOTS * WIDTH * sizeof(*modulation_values));
+    require(original_values && reduced_values && norm_values &&
+            modulation_values, "wide token AdaLN host allocation failed");
+    for (size_t index = 0; index < full_elements; index++)
+        original_values[index] = f32_to_bf16(
+            (float)((int)(index % 97) - 48) / 16.0f);
+    for (size_t index = 0; index < reduced_elements; index++)
+        reduced_values[index] = f32_to_bf16(
+            (float)((int)(index % 89) - 44) / 32.0f);
+    for (size_t column = 0; column < WIDTH; column++) {
+        norm_values[column] = f32_to_bf16(
+            0.5f + (float)(column % 11) / 16.0f);
+        modulation_values[column] = f32_to_bf16(
+            (float)((int)(column % 7) - 3) / 32.0f);
+        modulation_values[WIDTH + column] = f32_to_bf16(
+            (float)((int)(column % 5) - 2) / 64.0f);
+    }
+    const uint32_t baseline_indices[REDUCED_ROWS] = {UINT32_MAX, 0};
+    const uint32_t parents[ROWS] = {0, 1, 1};
+    const uint32_t row_map[ROWS] = {0, 0, 0};
+    h3_gpu_tensor *original = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, original_values, full_elements));
+    h3_gpu_tensor *reduced = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, reduced_values, reduced_elements));
+    h3_gpu_tensor *norm = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, norm_values, WIDTH));
+    h3_gpu_tensor *modulation = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, modulation_values, (size_t)SLOTS * WIDTH));
+    h3_gpu_tensor *gpu_baseline_indices = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, baseline_indices, REDUCED_ROWS));
+    h3_gpu_tensor *gpu_parents = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, parents, ROWS));
+    h3_gpu_tensor *gpu_row_map = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, row_map, ROWS));
+    h3_gpu_tensor *reference_residual = fresh(test, full_elements);
+    h3_gpu_tensor *reference_output = fresh(test, full_elements);
+    h3_gpu_tensor *fused_residual = fresh(test, full_elements);
+    h3_gpu_tensor *fused_output = fresh(test, full_elements);
+    free(original_values);
+    free(reduced_values);
+    free(norm_values);
+    free(modulation_values);
+
+    require_gpu(test, h3_gpu_begin(test->gpu),
+                "begin wide token AdaLN parity");
+    require_gpu(test, h3_gpu_token_expand_delta_bf16(
+        test->gpu, reference_residual, original, 0, reduced, reduced,
+        (size_t)REDUCED_ROWS * WIDTH, gpu_baseline_indices, gpu_parents,
+        ROWS, REDUCED_ROWS, BASELINE_ROWS, WIDTH, 1, 1.0f),
+        "encode wide token expansion reference");
+    require_gpu(test, h3_gpu_adaln_bf16(
+        test->gpu, reference_output, reference_residual, norm, modulation,
+        gpu_row_map, ROWS, WIDTH, SLOTS, 0, 1, 1e-5f),
+        "encode wide token AdaLN reference");
+    require_gpu(test, h3_gpu_token_expand_adaln_bf16(
+        test->gpu, fused_residual, fused_output, original, 0, reduced,
+        reduced, (size_t)REDUCED_ROWS * WIDTH, gpu_baseline_indices,
+        gpu_parents, norm, modulation, gpu_row_map, ROWS, REDUCED_ROWS,
+        BASELINE_ROWS, WIDTH, 1, 1.0f, SLOTS, 0, 1, 1e-5f),
+        "encode wide fused token AdaLN");
+    require_gpu(test, h3_gpu_submit(test->gpu),
+                "submit wide token AdaLN parity");
+    require_same_bf16(reference_residual, fused_residual, full_elements,
+                      "wide fused token residual differs");
+    require_same_bf16(reference_output, fused_output, full_elements,
+                      "wide fused token AdaLN differs");
+}
+
 static void cleanup(test_context *test) {
     for (size_t index = 0; index < test->owned_count; index++) {
         h3_gpu_tensor_free(test->owned[index]);
@@ -564,6 +644,7 @@ int main(int argc, char **argv) {
     }
     test_euler_update(&test);
     test_token_reduction_kernels(&test);
+    test_wide_token_adaln(&test);
 
     {
         enum { PATCH_ROWS = 16, PATCH_IN = 32, PATCH_OUT = 5376 };

@@ -1460,9 +1460,9 @@ struct h3_token_expand_adaln_args {
     float epsilon;
 };
 
-/* H3's hidden width is 4096. Keep the restored BF16 row in 8 KiB of
+/* H3's hidden width is 5376. Keep the restored BF16 row in 10.5 KiB of
  * threadgroup memory across the reduction instead of writing and then
- * rereading the residual globally. The host caps width at 4096. */
+ * rereading the residual globally. The host caps width at 5376. */
 kernel void h3_token_expand_adaln_bf16(
                          device const ushort *original [[buffer(0)]],
                          device const ushort *reduced [[buffer(1)]],
@@ -1485,7 +1485,7 @@ kernel void h3_token_expand_adaln_bf16(
     uint threads = threadgroup_size.x;
     if (row >= args.rows) return;
     threadgroup float reductions[256];
-    threadgroup ushort restored_values[4096];
+    threadgroup ushort restored_values[5376];
     uint parent = parents[row];
     uint baseline_row = baseline_indices[parent];
     bool direct = row < args.exact_prefix_rows ||
