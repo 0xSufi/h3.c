@@ -449,6 +449,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
+            [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
@@ -2755,7 +2756,8 @@ static int h3_gpu_quantize_bf16_int8_groups(
                         h3_gpu_tensor *scales,
                         const h3_gpu_tensor *input, uint32_t rows,
                         uint32_t dispatch_rows, uint32_t columns,
-                        uint32_t group_size) {
+                        uint32_t group_size,
+                        int use_slower_grouped_quantizer) {
     H3GPU *gpu = GPU(opaque);
     if (!group_size || (group_size % 4)) return 0;
     uint32_t groups = (columns + group_size - 1) / group_size;
@@ -2770,11 +2772,17 @@ static int h3_gpu_quantize_bf16_int8_groups(
                             (size_t)dispatch_rows * groups,
                             @"grouped int8 scales") ||
         !h3_gpu_require_command(gpu)) return 0;
+    BOOL scalar128 = !use_slower_grouped_quantizer && rows <= 2048;
+    const char *quantizer_override = getenv("H3_INT8_GROUP_QUANT_128");
+    if (quantizer_override)
+        scalar128 = *quantizer_override && strcmp(quantizer_override, "0");
     NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
-        @"h3_quantize_bf16_int8_groups" :
+        @"h3_quantize_bf16_int8_groups" : scalar128 ?
+        @"h3_quantize_bf16_int8_groups_scalar128" :
         @"h3_quantize_bf16_int8_groups_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
-    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+    NSUInteger threads = scalar128 ? 128u : 256u;
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < threads) {
         h3_gpu_set_error(gpu,
                          @"device cannot dispatch grouped M5 int8 quantizer");
         return 0;
@@ -2791,7 +2799,7 @@ static int h3_gpu_quantize_bf16_int8_groups(
         [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreadgroups:MTLSizeMake(dispatch_rows, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
@@ -2821,7 +2829,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          const h3_gpu_tensor *fc1_bf16,
                          const h3_gpu_tensor *fc2_bf16, uint32_t rows,
                          uint32_t input_dim, uint32_t hidden_dim,
-                         uint32_t output_dim) {
+                         uint32_t output_dim,
+                         int use_slower_grouped_quantizer) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
     uint32_t fc2_scale_groups = hidden_dim / 1024u;
@@ -2939,7 +2948,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (int8_fc2 && grouped_fc2 &&
         !h3_gpu_quantize_bf16_int8_groups(
             opaque, quantized_activation, activation_scales, activated, rows,
-            padded_rows, hidden_dim, 1024)) return 0;
+            padded_rows, hidden_dim, 1024,
+            use_slower_grouped_quantizer)) return 0;
     if (int8_fc2 && !grouped_fc2 &&
         !h3_gpu_quantize_bf16_int8_rows(
             opaque, quantized_activation, activation_scales, activated, rows,

@@ -892,6 +892,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->use_slower_bf16_mlp,
+            params->use_slower_grouped_quantizer,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -901,6 +902,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->use_slower_bf16_mlp,
+            params->use_slower_grouped_quantizer,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {

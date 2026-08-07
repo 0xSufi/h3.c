@@ -587,6 +587,10 @@ path's 36.4 GiB. Runtime weight quantization still adds startup time.
 Use `--use-slower-bf16-mlp` to force the portable close-reference MPS/BF16 MLP
 path for numerical comparison. Older Metal hardware selects that path
 automatically when the required native TensorOps kernels are unavailable.
+For FC2 activation quantization, sequences of at most 2,048 rows use an exact
+128-thread reduction; larger sequences retain the measured 256-thread kernel.
+`--use-slower-grouped-quantizer` forces the latter at every size for A/B
+comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

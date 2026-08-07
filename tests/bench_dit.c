@@ -598,7 +598,10 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     int local128_ab =
         getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") != NULL;
     int fc1local_ab = getenv("H3_BENCH_INT8_FC1_LOCAL_AB") != NULL;
+    int group_quant128_ab =
+        getenv("H3_BENCH_INT8_GROUP_QUANT128_AB") != NULL;
     int int8_ab = quant_ab || local_ab || local128_ab || fc1local_ab ||
+        group_quant128_ab ||
         getenv("H3_BENCH_INT8_MLP_AB") != NULL;
     const char *disable = int8_ab ? "H3_DISABLE_INT8_MLP" :
                                     "H3_DISABLE_NAX_MLP";
@@ -606,6 +609,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
         local_ab ? "local grouped FC2" :
         local128_ab ? "128x128 local grouped FC2" :
         fc1local_ab ? "local FC1" :
+        group_quant128_ab ? "128-thread grouped quantizer" :
         int8_ab ? "int8" : "NAX";
     char candidate_blocks[16] = {0};
     const char *blocks = getenv("H3_BENCH_NAX_COMMAND_BLOCKS");
@@ -615,8 +619,12 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
     if (!video_reference || !audio_reference)
         die("out of memory allocating NAX MLP AB references");
-    if (quant_ab || local_ab || local128_ab || fc1local_ab) {
+    if (quant_ab || local_ab || local128_ab || fc1local_ab ||
+        group_quant128_ab) {
         unsetenv("H3_INT8_FC1_LOCAL");
+        unsetenv("H3_INT8_GROUP_QUANT_128");
+        if (group_quant128_ab)
+            setenv("H3_INT8_GROUP_QUANT_128", "0", 1);
         if (!fc1local_ab) {
             unsetenv("H3_INT8_VECTOR_QUANT");
             unsetenv("H3_INT8_GROUP_FC2_LOCAL");
@@ -640,6 +648,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
         setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
     }
     else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+    else if (group_quant128_ab)
+        setenv("H3_INT8_GROUP_QUANT_128", "1", 1);
     else unsetenv(disable);
     if (candidate_blocks[0])
         setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
@@ -681,6 +691,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
             }
             else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+            else if (group_quant128_ab)
+                setenv("H3_INT8_GROUP_QUANT_128", "1", 1);
             else unsetenv(disable);
             if (candidate_blocks[0])
                 setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
@@ -693,6 +705,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
             }
             else if (fc1local_ab) unsetenv("H3_INT8_FC1_LOCAL");
+            else if (group_quant128_ab)
+                setenv("H3_INT8_GROUP_QUANT_128", "0", 1);
             else setenv(disable, "1", 1);
             unsetenv("H3_DIT_COMMAND_BLOCKS");
         }
@@ -701,7 +715,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (nax_pattern[index]) {
-            if ((quant_ab || local_ab || local128_ab || fc1local_ab) &&
+            if ((quant_ab || local_ab || local128_ab || fc1local_ab ||
+                 group_quant128_ab) &&
                 (memcmp(video_velocity, video_reference,
                         VIDEO_ELEMENTS * sizeof(*video_reference)) ||
                  memcmp(audio_velocity, audio_reference,
@@ -709,6 +724,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 die(quant_ab ? "vec4 int8 quantizer changed output bytes" :
                     local128_ab ? "128x128 grouped FC2 changed output bytes" :
                     fc1local_ab ? "local FC1 changed output bytes" :
+                    group_quant128_ab ?
+                        "128-thread grouped quantizer changed output bytes" :
                                   "local grouped FC2 changed output bytes");
             video_rel = relative_l2(video_velocity, video_reference,
                                     VIDEO_ELEMENTS, &video_abs);
@@ -724,7 +741,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                        VIDEO_ELEMENTS * sizeof(*video_reference)) ||
                 memcmp(audio_velocity, audio_reference,
                        AUDIO_ELEMENTS * sizeof(*audio_reference)))
-                die((quant_ab || local_ab || local128_ab || fc1local_ab) ?
+                die((quant_ab || local_ab || local128_ab || fc1local_ab ||
+                     group_quant128_ab) ?
                                "int8 kernel baseline changed output bytes" :
                                "repeated MPSGraph MLP changed output bytes");
             baseline_seconds += elapsed;
@@ -737,6 +755,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     unsetenv("H3_INT8_GROUP_FC2_LOCAL");
     unsetenv("H3_INT8_GROUP_FC2_LOCAL128");
     unsetenv("H3_INT8_FC1_LOCAL");
+    unsetenv("H3_INT8_GROUP_QUANT_128");
     unsetenv("H3_DIT_COMMAND_BLOCKS");
     printf("DiT %s MLP AB baseline %.4fs, candidate %.4fs, ratio %.4f; "
            "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
@@ -1370,6 +1389,8 @@ int main(int argc, char **argv) {
     }
     int enable_token_reduction = token_reduction_ab || cross_adaln_ab ||
         final_slice_ab || final_head_ab;
+    int use_slower_grouped_quantizer =
+        getenv("H3_BENCH_USE_SLOWER_GROUPED_QUANTIZER") != NULL;
     h3_dit *dit;
     if (ref_layout) {
         size_t video_condition_elements =
@@ -1386,7 +1407,8 @@ int main(int argc, char **argv) {
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 0, video_condition,
+            active_blocks, 1, enable_token_reduction, 0,
+            use_slower_grouped_quantizer, video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
         free(video_condition);
@@ -1394,7 +1416,8 @@ int main(int argc, char **argv) {
     } else {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 0, NULL, NULL, error,
+            active_blocks, 1, enable_token_reduction, 0,
+            use_slower_grouped_quantizer, NULL, NULL, error,
             sizeof(error));
     }
     if (!dit) die(error);
@@ -1450,7 +1473,8 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_INT8_QUANT_AB") ||
         getenv("H3_BENCH_INT8_GROUP_LOCAL_AB") ||
         getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") ||
-        getenv("H3_BENCH_INT8_FC1_LOCAL_AB")) {
+        getenv("H3_BENCH_INT8_FC1_LOCAL_AB") ||
+        getenv("H3_BENCH_INT8_GROUP_QUANT128_AB")) {
         run_nax_mlp_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before MLP AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,

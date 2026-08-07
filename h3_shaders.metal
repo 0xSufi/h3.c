@@ -1491,6 +1491,70 @@ kernel void h3_quantize_bf16_int8_groups_scalar(
     }
 }
 
+inline float h3_int8_reduce_max4(float value, threadgroup float *scratch,
+                                 ushort simdgroup, ushort lane) {
+    value = max(value, simd_shuffle_xor(value, 16));
+    value = max(value, simd_shuffle_xor(value, 8));
+    value = max(value, simd_shuffle_xor(value, 4));
+    value = max(value, simd_shuffle_xor(value, 2));
+    value = max(value, simd_shuffle_xor(value, 1));
+    if (lane == 0) scratch[simdgroup] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        value = lane < 4 ? scratch[lane] : 0.0f;
+        value = max(value, simd_shuffle_xor(value, 16));
+        value = max(value, simd_shuffle_xor(value, 8));
+        value = max(value, simd_shuffle_xor(value, 4));
+        value = max(value, simd_shuffle_xor(value, 2));
+        value = max(value, simd_shuffle_xor(value, 1));
+        if (lane == 0) scratch[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
+/* Exact 128-thread form of the selected scalar grouped quantizer. */
+kernel void h3_quantize_bf16_int8_groups_scalar128(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint THREADS = 128;
+    uint row_base = row * args.columns;
+    if (row >= args.rows) {
+        for (uint column = tid; column < args.columns; column += THREADS)
+            output[row_base + column] = 0;
+        for (uint group = tid; group < args.groups; group += THREADS)
+            scales[row * args.groups + group] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[4];
+    for (uint group = 0; group < args.groups; group++) {
+        uint start = group * args.group_size;
+        float local_max = 0.0f;
+        for (uint local = tid; local < args.group_size; local += THREADS)
+            local_max = max(local_max,
+                fabs((float)input[row_base + start + local]));
+        float max_abs = h3_int8_reduce_max4(
+            local_max, scratch, simdgroup, lane);
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0) scales[row * args.groups + group] = scale;
+        for (uint local = tid; local < args.group_size; local += THREADS) {
+            int quantized = (int)rint(
+                (float)input[row_base + start + local] * inverse);
+            output[row_base + start + local] =
+                (int8_t)clamp(quantized, -127, 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void h3_fc1_swiglu_int8_nax_r128(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
