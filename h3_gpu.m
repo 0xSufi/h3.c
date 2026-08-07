@@ -433,7 +433,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
+            [names addObject:@"h3_linear_bf16_nax_r128_morton"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128"];
+            [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton"];
         }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -2483,8 +2485,11 @@ static int h3_gpu_fc1_swiglu_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                              @"NAX FC1 output") ||
         !rows || (input_dim % 32) || (hidden_dim % 64) ||
         !h3_gpu_require_command(gpu)) return 0;
+    BOOL morton = getenv("H3_DISABLE_NAX_MORTON") == NULL &&
+                  getenv("H3_DISABLE_NAX_MORTON_FC1") == NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_fc1_swiglu_bf16_nax_r128");
+        gpu, morton ? @"h3_fc1_swiglu_bf16_nax_r128_morton" :
+                      @"h3_fc1_swiglu_bf16_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
         h3_gpu_set_error(gpu, @"device cannot dispatch fused M5 FC1/SwiGLU");
         return 0;
@@ -2500,9 +2505,20 @@ static int h3_gpu_fc1_swiglu_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder setThreadgroupMemoryLength:128 * 64 * 2 * sizeof(uint16_t)
                                    atIndex:0];
-        [encoder dispatchThreadgroups:
-            MTLSizeMake((rows + 127) / 128, (hidden_dim + 63) / 64, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        uint32_t row_tiles = (rows + 127) / 128;
+        uint32_t column_tiles = (hidden_dim + 63) / 64;
+        if (morton) {
+            uint32_t row_codes = 1, column_codes = 1;
+            while (row_codes < row_tiles) row_codes <<= 1;
+            while (column_codes < column_tiles) column_codes <<= 1;
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((NSUInteger)row_codes * column_codes, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:
+                MTLSizeMake(row_tiles, column_tiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
@@ -2528,8 +2544,11 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                              @"NAX FC2 output") ||
         !h3_gpu_fc1_swiglu_nax_bf16(opaque, activated, input, fc1_weight,
                                      rows, input_dim, hidden_dim)) return 0;
+    BOOL morton = getenv("H3_DISABLE_NAX_MORTON") == NULL &&
+                  getenv("H3_DISABLE_NAX_MORTON_FC2") == NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_linear_bf16_nax_r128");
+        gpu, morton ? @"h3_linear_bf16_nax_r128_morton" :
+                      @"h3_linear_bf16_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
         h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps FC2");
         return 0;
@@ -2543,9 +2562,20 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(fc2_weight).buffer offset:0 atIndex:1];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
         [encoder setBytes:&args length:sizeof(args) atIndex:4];
-        [encoder dispatchThreadgroups:
-            MTLSizeMake((rows + 127) / 128, (output_dim + 63) / 64, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        uint32_t row_tiles = (rows + 127) / 128;
+        uint32_t column_tiles = (output_dim + 63) / 64;
+        if (morton) {
+            uint32_t row_codes = 1, column_codes = 1;
+            while (row_codes < row_tiles) row_codes <<= 1;
+            while (column_codes < column_tiles) column_codes <<= 1;
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((NSUInteger)row_codes * column_codes, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:
+                MTLSizeMake(row_tiles, column_tiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;

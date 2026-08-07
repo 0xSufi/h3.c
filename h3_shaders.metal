@@ -791,6 +791,39 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
 }
 
 #ifdef H3_METAL_HAS_TENSOR
+/* Draw Things' Metal 4 matmul schedules neighboring row/column tiles in
+ * Morton order. The decoder is adapted from ccv's BSD-3-Clause NAMatMul;
+ * see THIRD_PARTY_NOTICES.md. Keep it local so the ordinary Metal path stays
+ * buildable on pre-Metal-4 systems. */
+inline uint h3_compact_morton_even_bits(uint value) {
+    value &= 0x55555555u;
+    value = (value | (value >> 1)) & 0x33333333u;
+    value = (value | (value >> 2)) & 0x0f0f0f0fu;
+    value = (value | (value >> 4)) & 0x00ff00ffu;
+    value = (value | (value >> 8)) & 0x0000ffffu;
+    return value;
+}
+
+inline uint h3_lower_bits_mask(uint bits) {
+    return bits ? (1u << bits) - 1u : 0u;
+}
+
+inline uint2 h3_morton_decode_rectangular(uint code, uint x_bits,
+                                          uint y_bits) {
+    uint paired_bits = min(x_bits, y_bits);
+    uint paired_code = code & h3_lower_bits_mask(paired_bits * 2);
+    uint2 tile = uint2(h3_compact_morton_even_bits(paired_code),
+                       h3_compact_morton_even_bits(paired_code >> 1));
+    uint tail = code >> (paired_bits * 2);
+    if (x_bits > paired_bits) {
+        uint extra = x_bits - paired_bits;
+        tile.x |= (tail & h3_lower_bits_mask(extra)) << paired_bits;
+        tail >>= extra;
+    }
+    if (y_bits > paired_bits) tile.y |= tail << paired_bits;
+    return tile;
+}
+
 /*
  * M5 Metal 4/TensorOps path for the large H3 matrices.  This follows the
  * retained direct-RHS design in ds4.c: the contiguous dimension comes first
@@ -821,6 +854,36 @@ kernel void h3_linear_bf16_nax_r128(
     mm.run(mx, mw, my);
 }
 
+kernel void h3_linear_bf16_nax_r128_morton(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *output [[buffer(3)]],
+                           constant linear_args &args [[buffer(4)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    uint row_tiles = (args.rows + 127) / 128;
+    uint column_tiles = (args.output_dim + 63) / 64;
+    uint row_bits = row_tiles <= 1 ? 0 : 32 - clz(row_tiles - 1);
+    uint column_bits = column_tiles <= 1 ? 0 : 32 - clz(column_tiles - 1);
+    uint2 group = h3_morton_decode_rectangular(
+        code, row_bits, column_bits);
+    if (group.x >= row_tiles || group.y >= column_tiles) return;
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim, (int)args.output_dim));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        output,
+        dextents<int32_t, 2>((int)args.output_dim, (int)args.rows));
+    auto mx = x.slice(0, (int)group.x * 128);
+    auto mw = w.slice(0, (int)group.y * 64);
+    auto my = y.slice((int)group.y * 64, (int)group.x * 128);
+    matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    mm.run(mx, mw, my);
+}
+
 /* Pair the two FC1 halves while the TensorOps accumulators are still local.
  * Only the post-SwiGLU [rows, hidden_dim] tensor reaches device memory. */
 kernel void h3_fc1_swiglu_bf16_nax_r128(
@@ -833,6 +896,70 @@ kernel void h3_fc1_swiglu_bf16_nax_r128(
                            ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int ROW_TILE = 128;
     constexpr int COLUMN_TILE = 64;
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim,
+                             (int)args.output_dim * 2));
+    auto mx = x.slice(0, (int)group.x * ROW_TILE);
+    auto mw_gate = w.slice(0, (int)group.y * COLUMN_TILE);
+    auto mw_up = w.slice(0, (int)args.output_dim +
+                            (int)group.y * COLUMN_TILE);
+    threadgroup bfloat *gate_tile = tiles;
+    threadgroup bfloat *up_tile = tiles + ROW_TILE * COLUMN_TILE;
+    auto tg_gate = tensor(gate_tile,
+        dextents<int32_t, 2>(COLUMN_TILE, ROW_TILE));
+    auto tg_up = tensor(up_tile,
+        dextents<int32_t, 2>(COLUMN_TILE, ROW_TILE));
+    matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    {
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(x), decltype(w), bfloat>();
+        mm.run(mx, mw_gate, accum);
+        accum.store(tg_gate);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(x), decltype(w), bfloat>();
+        mm.run(mx, mw_up, accum);
+        accum.store(tg_up);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint row_base = group.x * ROW_TILE;
+    uint column_base = group.y * COLUMN_TILE;
+    for (uint index = tid; index < ROW_TILE * COLUMN_TILE; index += 128) {
+        uint row = row_base + index / COLUMN_TILE;
+        uint column = column_base + index % COLUMN_TILE;
+        if (row < args.rows && column < args.output_dim) {
+            float gate = (float)gate_tile[index];
+            float up = (float)up_tile[index];
+            float activated = gate / (1.0f + exp(-gate)) * up;
+            output[row * args.output_dim + column] = (bfloat)activated;
+        }
+    }
+}
+
+kernel void h3_fc1_swiglu_bf16_nax_r128_morton(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *output [[buffer(2)]],
+                           constant linear_args &args [[buffer(3)]],
+                           threadgroup bfloat *tiles [[threadgroup(0)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int ROW_TILE = 128;
+    constexpr int COLUMN_TILE = 64;
+    uint row_tiles = (args.rows + ROW_TILE - 1) / ROW_TILE;
+    uint column_tiles = (args.output_dim + COLUMN_TILE - 1) / COLUMN_TILE;
+    uint row_bits = row_tiles <= 1 ? 0 : 32 - clz(row_tiles - 1);
+    uint column_bits = column_tiles <= 1 ? 0 : 32 - clz(column_tiles - 1);
+    uint2 group = h3_morton_decode_rectangular(
+        code, row_bits, column_bits);
+    if (group.x >= row_tiles || group.y >= column_tiles) return;
     auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
     auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
