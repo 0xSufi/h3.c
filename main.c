@@ -25,6 +25,7 @@ static void usage(const char *program) {
         "      --steps N          Sigma points (default: 50; 49 forwards)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
+        "      --mlp-layers N     MLP branches: layers exact, 41 with 45 fast\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --seed N           Random seed (default: 42)\n"
@@ -182,6 +183,7 @@ int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
+           OPT_MLP_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
            OPT_SEED,
@@ -200,6 +202,7 @@ int main(int argc, char **argv) {
         {"steps", required_argument, NULL, OPT_STEPS},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
+        {"mlp-layers", required_argument, NULL, OPT_MLP_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"seed", required_argument, NULL, OPT_SEED},
@@ -250,6 +253,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_LAYERS:
                 params.dit_layers = parse_int(optarg, "layers");
+                break;
+            case OPT_MLP_LAYERS:
+                params.mlp_layers = parse_int(optarg, "MLP layers");
                 break;
             case OPT_CORE_REUSE:
                 params.core_reuse = parse_int(optarg, "core reuse");

@@ -59,7 +59,9 @@ struct h3_dit {
     unsigned core_forward_count;
     int core_residual_ready;
     unsigned active_block_count;
+    unsigned active_mlp_count;
     uint8_t block_active[H3_DIT_BLOCKS];
+    uint8_t mlp_rank[H3_DIT_BLOCKS];
     h3_layout layout;
     h3_sigma_schedule sigmas;
     int latent_t;
@@ -446,7 +448,7 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
 }
 
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
-                      char *error, size_t error_size) {
+                      int load_mlp, char *error, size_t error_size) {
     char name[160];
 #define LOAD1(field, suffix, width) do {                                       \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
@@ -459,13 +461,15 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     if (!block->field) return 0;                                                \
 } while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
-    LOAD1(norm2, "norm2.weight", HIDDEN);
     LOAD2(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
     LOAD2(out, "attn.out_proj.weight", HIDDEN, INNER);
-    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    if (load_mlp) {
+        LOAD1(norm2, "norm2.weight", HIDDEN);
+        LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+        LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    }
 #undef LOAD1
 #undef LOAD2
     return 1;
@@ -538,9 +542,9 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     h3_gpu_tensor *value = NULL, *heads = NULL, *branch = NULL, *fc1 = NULL;
     h3_gpu_tensor *activated = NULL;
     int ok = source && condition_w && condition_b &&
-        load_block(dit, &refiner[0], "token_refiner.blocks.0.",
+        load_block(dit, &refiner[0], "token_refiner.blocks.0.", 1,
                    error, error_size) &&
-        load_block(dit, &refiner[1], "token_refiner.blocks.1.",
+        load_block(dit, &refiner[1], "token_refiner.blocks.1.", 1,
                    error, error_size);
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
@@ -947,6 +951,88 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+static int configure_mlp_ranks(h3_dit *dit) {
+    typedef struct { unsigned block; double score; } mlp_score;
+    if (dit->active_mlp_count == dit->active_block_count &&
+        !getenv("H3_DIT_PREPARE_MLP_RANKS")) {
+        uint8_t rank = 0;
+        memset(dit->mlp_rank, UINT8_MAX, sizeof(dit->mlp_rank));
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+            if (dit->block_active[block]) dit->mlp_rank[block] = rank++;
+        return 1;
+    }
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    memset(dit->mlp_rank, UINT8_MAX, sizeof(dit->mlp_rank));
+    double global_scores[H3_DIT_BLOCKS] = {0};
+    for (int step = 0; step < steps; step++) {
+        double raw[H3_DIT_BLOCKS][2][H3_DIT_MODALITIES] = {{{0}}};
+        double modality_mean[H3_DIT_MODALITIES] = {0};
+        unsigned branch_count = 0;
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            if (!dit->block_active[block]) continue;
+            for (unsigned branch = 0; branch < 2; branch++)
+                for (unsigned modality = 0;
+                     modality < H3_DIT_MODALITIES; modality++) {
+                    double score = h3_dit_schedule_step_modality_gate_score(
+                        dit->schedule, block, step, branch, modality);
+                    if (score < 0.0) return 0;
+                    raw[block][branch][modality] = score;
+                    modality_mean[modality] += score;
+                }
+            branch_count += 2;
+        }
+        if (!branch_count) return 0;
+        for (unsigned modality = 0; modality < H3_DIT_MODALITIES; modality++)
+            modality_mean[modality] /= branch_count;
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            if (!dit->block_active[block]) continue;
+            double score = 0.0;
+            for (unsigned modality = 0;
+                 modality < H3_DIT_MODALITIES; modality++) {
+                double normalized = raw[block][1][modality] /
+                    (modality_mean[modality] > 1e-30 ?
+                     modality_mean[modality] : 1e-30);
+                if (normalized > score) score = normalized;
+            }
+            global_scores[block] += score;
+        }
+    }
+    mlp_score scores[H3_DIT_BLOCKS];
+    unsigned count = 0;
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        if (!dit->block_active[block]) continue;
+        double score = steps ? global_scores[block] / steps : 0.0;
+        if (block < 2 || block + 1 == H3_DIT_BLOCKS) score = HUGE_VAL;
+        scores[count++] = (mlp_score){block, score};
+    }
+    for (unsigned left = 0; left < count; left++) {
+        unsigned greatest = left;
+        for (unsigned right = left + 1; right < count; right++)
+            if (scores[right].score > scores[greatest].score)
+                greatest = right;
+        mlp_score temporary = scores[left];
+        scores[left] = scores[greatest];
+        scores[greatest] = temporary;
+        dit->mlp_rank[scores[left].block] = (uint8_t)left;
+    }
+    return 1;
+}
+
+static unsigned active_mlp_count(const h3_dit *dit) {
+    const char *value = getenv("H3_DIT_MLP_LAYERS");
+    if (!value || !*value) return dit->active_mlp_count;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end || parsed < 3 ||
+        parsed > (long)dit->active_mlp_count) return dit->active_mlp_count;
+    return (unsigned)parsed;
+}
+
+static int mlp_block_active(const h3_dit *dit, unsigned block,
+                            unsigned mlp_count) {
+    return dit->block_active[block] && dit->mlp_rank[block] < mlp_count;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -957,7 +1043,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
-        if (!load_block(dit, &dit->blocks[index], prefix, error, error_size))
+        if (!load_block(dit, &dit->blocks[index], prefix,
+                        dit->mlp_rank[index] < dit->active_mlp_count,
+                        error, error_size))
             return 0;
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1219,6 +1307,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         const h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
                         unsigned active_blocks,
+                        unsigned active_mlps,
                         unsigned core_reuse_interval,
                         int token_reduction,
                         const float *condition_video_rows,
@@ -1230,7 +1319,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         active_blocks < H3_DIT_BLOCKS / 2 ||
-        active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
+        active_blocks > H3_DIT_BLOCKS || active_mlps < 3 ||
+        active_mlps > active_blocks || core_reuse_interval < 1 ||
         core_reuse_interval > 6) {
         fail(error, error_size, "invalid DiT load arguments");
         return NULL;
@@ -1247,6 +1337,7 @@ static h3_dit *load_dit(const char *weight_directory,
      * Keep the old path available for close-reference diagnosis. */
     dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
+    dit->active_mlp_count = active_mlps;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
@@ -1281,6 +1372,10 @@ static h3_dit *load_dit(const char *weight_directory,
         error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
+        if (!configure_mlp_ranks(dit)) {
+            fail(error, error_size, "cannot rank DiT MLP residual gates");
+            goto failed;
+        }
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
@@ -1312,12 +1407,14 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
+                         unsigned active_mlps,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks, core_reuse_interval, token_reduction,
+                    active_blocks, active_mlps, core_reuse_interval,
+                    token_reduction,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1329,6 +1426,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
+                         unsigned active_mlps,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          const float *condition_video_rows,
@@ -1338,7 +1436,8 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks, core_reuse_interval, token_reduction,
+                    active_blocks, active_mlps, core_reuse_interval,
+                    token_reduction,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -1433,7 +1532,8 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
 
 static int run_block(h3_dit *dit, unsigned index, int step,
                      int attention_adaln_ready, int fuse_next_attention,
-                     unsigned next_index, int *next_attention_adaln_ready,
+                     unsigned next_index, int mlp_active,
+                     int *next_attention_adaln_ready,
                      char *error, size_t error_size) {
     h3_dit_block *weight = &dit->blocks[index];
     const h3_gpu_tensor *modulation = h3_dit_schedule_block(dit->schedule,
@@ -1459,60 +1559,63 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         dit->gpu, dit->query, dit->key, dit->value,
         dit->qkv, weight->q_norm, weight->k_norm, rope_cos, rope_sin,
         rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f), "DiT QK norm/RoPE");
-    OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
-        dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-       "DiT full attention");
+    OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query,
+        dit->key, dit->value, rows, HEADS, HEAD_DIM,
+        1.0f / sqrtf((float)HEAD_DIM)), "DiT full attention");
     OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
         dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
        "DiT attention output");
-    if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
+    if (mlp_active && !getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_gate_adaln_bf16(
             dit->gpu, dit->hidden, dit->mod_mlp, dit->hidden,
             dit->attention_output, weight->norm2, modulation, modulation,
-            row_map,
-            rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
+            row_map, rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
            "DiT fused attention gate and MLP AdaLN");
     } else {
         OP(h3_gpu_gate_bf16(dit->gpu, dit->hidden, dit->hidden,
             dit->attention_output, modulation, row_map, rows, HIDDEN,
             SLOTS, 2), "DiT attention gate");
+    }
+    if (mlp_active && getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_adaln_bf16(
             dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
     }
-    h3_gpu_tensor *mlp_output = dit->activation_aliases ?
-        dit->attention_output : dit->mlp_output;
-    if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
-        OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
-            dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
-            HIDDEN), "DiT NAX fused MLP");
-    } else if (dit->fused_mlp) {
-        OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
-            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
-           "DiT fused MLP");
-    } else {
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
-            NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
-        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
-           "DiT SwiGLU");
-        OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
-            weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
-    }
-    if (fuse_next_attention) {
-        h3_dit_block *next_weight = &dit->blocks[next_index];
-        const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
-            dit->schedule, next_index);
-        OP(h3_gpu_gate_adaln_bf16(
-            dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
-            mlp_output, next_weight->norm1, modulation,
-            next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
-           "DiT fused MLP gate and next attention AdaLN");
-        *next_attention_adaln_ready = 1;
-    } else {
-        OP(h3_gpu_gate_bf16(
-            dit->gpu, dit->hidden, dit->hidden, mlp_output,
-            modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+    if (mlp_active) {
+        h3_gpu_tensor *mlp_output = dit->activation_aliases ?
+            dit->attention_output : dit->mlp_output;
+        if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
+            OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
+                dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
+                HIDDEN), "DiT NAX fused MLP");
+        } else if (dit->fused_mlp) {
+            OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
+                weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+               "DiT fused MLP");
+        } else {
+            OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp,
+                weight->fc1, NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+            OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows,
+                FFN), "DiT SwiGLU");
+            OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
+                weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+        }
+        if (fuse_next_attention) {
+            h3_dit_block *next_weight = &dit->blocks[next_index];
+            const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
+                dit->schedule, next_index);
+            OP(h3_gpu_gate_adaln_bf16(
+                dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
+                mlp_output, next_weight->norm1, modulation,
+                next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1,
+                1e-5f), "DiT fused MLP gate and next attention AdaLN");
+            *next_attention_adaln_ready = 1;
+        } else {
+            OP(h3_gpu_gate_bf16(
+                dit->gpu, dit->hidden, dit->hidden, mlp_output,
+                modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+        }
     }
 #undef OP
     return 1;
@@ -1644,6 +1747,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
     if (evaluate_core) {
+        unsigned mlp_count = active_mlp_count(dit);
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
@@ -1671,6 +1775,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                                dit, error, error_size)) return 0;
             }
             if (!dit->block_active[block]) continue;
+            int mlp_active = mlp_block_active(dit, block, mlp_count);
             unsigned next_block = block + 1;
             int next_is_token_boundary = use_token_reduction &&
                 (next_block == dit->token_reduction_begin ||
@@ -1678,9 +1783,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             int fuse_next_attention =
                 !getenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN") &&
                 next_block < H3_DIT_BLOCKS &&
-                dit->block_active[next_block] && !next_is_token_boundary;
+                mlp_active && dit->block_active[next_block] &&
+                !next_is_token_boundary;
             if (!run_block(dit, block, step, fused_token_adaln,
-                           fuse_next_attention, next_block,
+                           fuse_next_attention, next_block, mlp_active,
                            &carried_attention_adaln,
                            error, error_size)) return 0;
             completed_blocks++;

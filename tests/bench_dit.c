@@ -595,6 +595,96 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
     free(reference_video); free(reference_audio);
 }
 
+static void run_mlp_layers_denoise_ab(h3_dit *dit, float *video,
+                                      float *audio, int reuse_interval,
+                                      const char *mlp_layers) {
+    char error[512];
+    float *initial_video = malloc(VIDEO_ELEMENTS * sizeof(*initial_video));
+    float *initial_audio = malloc(AUDIO_ELEMENTS * sizeof(*initial_audio));
+    float *reference_video = malloc(VIDEO_ELEMENTS * sizeof(*reference_video));
+    float *reference_audio = malloc(AUDIO_ELEMENTS * sizeof(*reference_audio));
+    if (!initial_video || !initial_audio || !reference_video || !reference_audio)
+        die("out of memory allocating MLP-layer denoise AB state");
+    memcpy(initial_video, video, VIDEO_ELEMENTS * sizeof(*initial_video));
+    memcpy(initial_audio, audio, AUDIO_ELEMENTS * sizeof(*initial_audio));
+    /* Compile every retained graph before timing either side. The candidate
+     * is a strict subset of these shapes, so no separate warmup is needed. */
+    unsetenv("H3_DIT_MLP_LAYERS");
+    if (!h3_dit_denoise_euler(dit, video, audio, reuse_interval, NULL, NULL,
+                              error, sizeof(error))) die(error);
+    static const int candidate_pattern[] = {0, 1, 1, 0};
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0, have_reference = 0;
+    uint64_t candidate_video_hash = 0, candidate_audio_hash = 0;
+    double video_relative = 0.0, audio_relative = 0.0;
+    double video_absolute = 0.0, audio_absolute = 0.0;
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        memcpy(video, initial_video, VIDEO_ELEMENTS * sizeof(*video));
+        memcpy(audio, initial_audio, AUDIO_ELEMENTS * sizeof(*audio));
+        if (candidate_pattern[run])
+            setenv("H3_DIT_MLP_LAYERS", mlp_layers, 1);
+        else
+            unsetenv("H3_DIT_MLP_LAYERS");
+        double start = seconds();
+        if (!h3_dit_denoise_euler(dit, video, audio, reuse_interval, NULL, NULL,
+                                  error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (!have_reference && !candidate_pattern[run]) {
+            memcpy(reference_video, video,
+                   VIDEO_ELEMENTS * sizeof(*reference_video));
+            memcpy(reference_audio, audio,
+                   AUDIO_ELEMENTS * sizeof(*reference_audio));
+            have_reference = 1;
+        }
+        if (candidate_pattern[run]) {
+            uint64_t video_hash = hash_bytes(
+                video, VIDEO_ELEMENTS * sizeof(*video));
+            uint64_t audio_hash = hash_bytes(
+                audio, AUDIO_ELEMENTS * sizeof(*audio));
+            if (candidate_count &&
+                (video_hash != candidate_video_hash ||
+                 audio_hash != candidate_audio_hash))
+                die("MLP-layer denoise candidate changed output bytes");
+            candidate_video_hash = video_hash;
+            candidate_audio_hash = audio_hash;
+            video_relative = relative_l2(video, reference_video,
+                                         VIDEO_ELEMENTS, &video_absolute);
+            audio_relative = relative_l2(audio, reference_audio,
+                                         AUDIO_ELEMENTS, &audio_absolute);
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  MLP layers %s candidate %.3fs video relL2 %.6g; "
+                   "audio relL2 %.6g\n", mlp_layers, elapsed,
+                   video_relative, audio_relative);
+        } else {
+            if (have_reference &&
+                (memcmp(video, reference_video,
+                        VIDEO_ELEMENTS * sizeof(*reference_video)) ||
+                 memcmp(audio, reference_audio,
+                        AUDIO_ELEMENTS * sizeof(*reference_audio))))
+                die("MLP-layer denoise baseline changed output bytes");
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  MLP layers baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DIT_MLP_LAYERS");
+    printf("DiT MLP-layer denoise AB baseline %.4fs, MLP-layers-%s %.4fs, "
+           "ratio %.4f; video relL2 %.6g max %.6g; audio relL2 %.6g max "
+           "%.6g\n", baseline_seconds / baseline_count, mlp_layers,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           video_relative, video_absolute, audio_relative, audio_absolute);
+    printf("MLP-layer denoise reuse-%d hashes video %016llx audio "
+           "%016llx\n", reuse_interval,
+           (unsigned long long)candidate_video_hash,
+           (unsigned long long)candidate_audio_hash);
+    free(initial_video); free(initial_audio);
+    free(reference_video); free(reference_audio);
+}
+
 static void run_cross_adaln_ab(h3_dit *dit, float *video, float *audio,
                                float *video_velocity,
                                float *audio_velocity) {
@@ -744,12 +834,13 @@ int main(int argc, char **argv) {
     int sampler_ab = getenv("H3_BENCH_SAMPLER_AB") != NULL;
     int token_reduction_ab =
         getenv("H3_BENCH_TOKEN_REDUCTION_AB") != NULL;
+    const char *mlp_layers_ab = getenv("H3_BENCH_MLP_LAYERS_AB");
     int cross_adaln_ab = getenv("H3_BENCH_CROSS_ADALN_AB") != NULL;
     int final_slice_ab = getenv("H3_BENCH_FINAL_SLICE_AB") != NULL;
     int final_head_ab = getenv("H3_BENCH_FINAL_HEAD_AB") != NULL;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
-        !((sampler_ab || token_reduction_ab || cross_adaln_ab ||
-           final_slice_ab || final_head_ab)
+        !((sampler_ab || token_reduction_ab || mlp_layers_ab ||
+           cross_adaln_ab || final_slice_ab || final_head_ab)
               ? h3_serving_schedule_build(20, &sigmas)
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
@@ -781,8 +872,9 @@ int main(int argc, char **argv) {
     } else if (final_head_ab) {
         setenv("H3_DISABLE_FUSED_FINAL_HEAD", "1", 1);
     }
-    int enable_token_reduction = token_reduction_ab || cross_adaln_ab ||
-        final_slice_ab || final_head_ab;
+    if (mlp_layers_ab) setenv("H3_DIT_PREPARE_MLP_RANKS", "1", 1);
+    int enable_token_reduction = token_reduction_ab || mlp_layers_ab ||
+        cross_adaln_ab || final_slice_ab || final_head_ab;
     h3_dit *dit;
     if (ref_layout) {
         size_t video_condition_elements =
@@ -799,7 +891,8 @@ int main(int argc, char **argv) {
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, video_condition,
+            active_blocks, active_blocks, 1, enable_token_reduction,
+            video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
         free(video_condition);
@@ -807,10 +900,12 @@ int main(int argc, char **argv) {
     } else {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, NULL, NULL, error,
+            active_blocks, active_blocks, 1, enable_token_reduction,
+            NULL, NULL, error,
             sizeof(error));
     }
     if (!dit) die(error);
+    unsetenv("H3_DIT_PREPARE_MLP_RANKS");
     if (final_slice_ab) {
         unsetenv("H3_DISABLE_FUSED_FINAL_HEAD");
         unsetenv("H3_DISABLE_FUSED_FINAL_SLICE");
@@ -924,6 +1019,18 @@ int main(int argc, char **argv) {
             run_token_reduction_ab(dit, video, audio, video_velocity,
                                    audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before token reduction AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (mlp_layers_ab) {
+        run_mlp_layers_denoise_ab(dit, video, audio, reuse_interval,
+                                  mlp_layers_ab);
+        printf("DiT %ux%u/%u-layer load %.3fs before MLP-layer AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
