@@ -15,7 +15,6 @@ extern "C" {
 #define H3_DEFAULT_FRAMES 56
 #define H3_DEFAULT_STEPS 50
 #define H3_DEFAULT_DIT_LAYERS 50
-#define H3_DEFAULT_MLP_LAYERS 0
 #define H3_MIN_DIT_LAYERS 35
 
 typedef struct h3_ctx h3_ctx;
@@ -71,9 +70,6 @@ typedef struct {
     /* Number of gate-ranked DiT residual blocks to retain. 50 is exact,
      * 45 is the validated fast setting, and 40 is more aggressive. */
     int dit_layers;
-    /* Number of gate-ranked MLP residual branches to retain among the active
-     * DiT blocks. Zero follows dit_layers; matching dit_layers is exact. */
-    int mlp_layers;
     /* Recompute the transformer core every N denoiser steps while refreshing
      * the timestep head each step. 1 is exact, 4 fast, and 6 aggressive. */
     int core_reuse;
@@ -93,8 +89,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, H3_DEFAULT_MLP_LAYERS, 1, 0, 0, 0, \
-    NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

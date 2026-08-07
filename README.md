@@ -50,8 +50,7 @@ This is deliberately not the most aggressive configuration:
 - `--reuse 2` computes 10 fresh denoiser velocities instead of all 19 and
   extrapolates the skipped transitions.
 - `--layers 45` runs 45 of the 50 transformer blocks, reducing both time and
-  unified-memory use. All 45 MLP branches remain active unless
-  `--mlp-layers` is also set.
+  unified-memory use.
 - `--show` is optional. It supports Kitty/Ghostty and
   iTerm2/WezTerm/Konsole graphical protocols.
 - `--profile` is optional and does not select a different generation path.
@@ -76,11 +75,10 @@ then all denoiser evaluations, and finally the released 50-point schedule:
   -o outputs/fox-close.mp4
 ```
 
-The defaults are `--steps 50 --layers 50 --reuse 1`; when omitted,
-`--mlp-layers` follows `--layers`. This close path performs 49 complete
-50-block denoiser forwards. It is much more expensive than the first command,
-but is the right oracle when a fast mode changes the subject, anatomy, motion,
-or composition.
+The defaults are `--steps 50 --layers 50 --reuse 1`, so those three options may
+also be omitted. This close path performs 49 complete 50-block denoiser
+forwards. It is much more expensive than the first command, but is the right
+oracle when a fast mode changes the subject, anatomy, motion, or composition.
 Numerical pixel identity with MLX is not expected because the random-number and
 execution engines differ; the depicted content and motion should agree.
 
@@ -93,7 +91,6 @@ These controls are independent unless noted otherwise:
 | Sigma points | `--steps 50` | `--steps 20` | below 20 is not validated | More points mean more denoiser transitions. |
 | Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 points: 19, 10, or 6 fresh DiT evaluations. |
 | Active DiT blocks | `--layers 50` | `--layers 45` | `--layers 40` | Fewer blocks reduce compute and resident transformer weights. |
-| Active MLP branches | same as `--layers` | `--mlp-layers 41` with 45 blocks | below 41 is not validated | Keeps every attention branch but removes low-gate MLP compute and weights. |
 | Core residual reuse | `--core-reuse 1` | `--core-reuse 4` | `--core-reuse 6` | Refreshes patch/head work every step but runs the expensive core less often. |
 | Token reduction | off | optional | `--token-reduction` | Pairs horizontal video tokens inside middle blocks; faster but may change composition. |
 | Internal canvas | output size | `384x384` for 512 square output | `320x320` | Runs DiT/VAE smaller, then upscales with vImage. |
@@ -117,31 +114,6 @@ At the validated 512 square shape, token reduction cut the `45 layers + reuse
 2` denoise profile from 16.69 to 12.60 seconds on the IT M5 Max. Independent
 fox and surfer renders stayed coherent, but composition can diverge more from
 the close path.
-
-To remove more denoiser work without dropping any additional attention, retain
-only 41 of those 45 MLP branches:
-
-```sh
-./h3 --profile \
-  -d ./MiniMax-H3 \
-  -p "A surfer riding inside a sharp blue ocean wave, one rider and one white board, realistic spray." \
-  --width 512 --height 512 --frames 22 --steps 20 \
-  --layers 45 --mlp-layers 41 --reuse 2 --token-reduction \
-  -o outputs/surfer-mlp-fast.mp4
-```
-
-The four omitted MLP branches are ranked from the checkpoint's precomputed
-video, text, and audio residual gates; all 45 attention branches still run.
-After warming all retained MPS graphs, simultaneous same-context M5 A/Bs
-measured 4.5% and 4.9% lower denoise wall time on IT/US. Final video/audio
-latent drift
-against the otherwise identical 45-MLP path was 5.29%/10.54%. Independent fox
-and surfer clips kept coherent anatomy, identity, and motion. The production
-loader also omits the unused MLP weights, reducing peak DiT residency from
-32.816 to 31.093 GiB at 512 square. Treat composition changes as expected for
-this opt-in approximation. `--mlp-layers` must be between 35 and `--layers`;
-41 is the validated point for `--layers 45`. The conditioned Ref2VA benchmark
-also passed with 3.41%/6.61% video/audio latent drift.
 
 For an aggressive preview, render internally at 320 square and upscale to the
 requested 512 square output:
@@ -348,16 +320,6 @@ tensors are not retained, so `--layers 45` and `--layers 40` reduce both
 transformer time and unified-memory use. Core reuse holds the previous full
 transformer residual while refreshing the patch projection and timestep-aware
 head; it remains mutually exclusive with whole-velocity reuse.
-
-`--mlp-layers` is a finer gate-ranked approximation. It retains attention in
-every active block and ranks only the MLP residuals using per-timestep gate
-magnitudes normalized across video, text, and audio modalities. Blocks 0, 1,
-and 49 are protected. A skipped MLP still applies that block's attention
-residual, then proceeds directly to the next attention AdaLN. Its norm and two
-large projection weights are never mapped. With `--layers 45`, the validated
-`--mlp-layers 41` path removes 80 linear dispatches over the ten denoiser
-evaluations selected by `--reuse 2`, while saving 1.723 GiB of resident weights.
-Set `--mlp-layers` equal to `--layers` for the exact MLP set.
 
 ### Exact DiT fusions
 

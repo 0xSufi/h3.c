@@ -22,7 +22,6 @@ struct h3_dit_schedule {
     uint32_t *visual_condition_rows;
     uint32_t *audio_condition_rows;
     h3_gpu_tensor *blocks[H3_DIT_BLOCKS];
-    double *gate_scores[H3_DIT_BLOCKS];
     h3_gpu_tensor *final;
 };
 
@@ -339,10 +338,8 @@ failed:
 
 void h3_dit_schedule_free(h3_dit_schedule *schedule) {
     if (!schedule) return;
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
         h3_gpu_tensor_free(schedule->blocks[block]);
-        free(schedule->gate_scores[block]);
-    }
     h3_gpu_tensor_free(schedule->final);
     free(schedule->video_rows);
     free(schedule->audio_rows);
@@ -388,85 +385,36 @@ const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
     return schedule && block < H3_DIT_BLOCKS ? schedule->blocks[block] : NULL;
 }
 
-static int cache_gate_scores(h3_dit_schedule *schedule, unsigned block) {
+double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
+                                  unsigned block) {
     if (!schedule || block >= H3_DIT_BLOCKS || !schedule->blocks[block])
-        return 0;
-    if (schedule->gate_scores[block]) return 1;
+        return -1.0;
     size_t count = (size_t)schedule->time_rows * BLOCK_OUTPUT;
     uint16_t *values = malloc(count * sizeof(*values));
-    size_t score_count = (size_t)schedule->time_rows *
-        H3_DIT_MODALITIES * 2;
-    double *scores = calloc(score_count, sizeof(*scores));
-    if (!values || !scores ||
-        !h3_gpu_tensor_read_bf16(schedule->blocks[block], values, count)) {
+    if (!values || !h3_gpu_tensor_read_bf16(schedule->blocks[block], values,
+                                             count)) {
         free(values);
-        free(scores);
-        return 0;
+        return -1.0;
     }
+    double total = 0.0;
+    size_t samples = 0;
     for (uint32_t row = 0; row < schedule->time_rows; row++)
         for (uint32_t modality = 0; modality < H3_DIT_MODALITIES; modality++)
-            for (uint32_t branch = 0; branch < 2; branch++) {
-                uint32_t slot = branch ? 5u : 2u;
+            for (uint32_t slot = 2; slot <= 5; slot += 3) {
                 size_t base = ((size_t)row * H3_DIT_MODALITIES *
                                H3_DIT_ADALN_SLOTS +
                                (size_t)modality * H3_DIT_ADALN_SLOTS + slot) *
                               H3_DIT_HIDDEN;
-                double total = 0.0;
                 for (uint32_t column = 0; column < H3_DIT_HIDDEN; column++) {
                     uint32_t bits = (uint32_t)values[base + column] << 16;
                     float value;
                     memcpy(&value, &bits, sizeof(value));
                     total += fabs((double)value);
                 }
-                size_t score_index = ((size_t)row * H3_DIT_MODALITIES +
-                                      modality) * 2 + branch;
-                scores[score_index] = total / H3_DIT_HIDDEN;
+                samples += H3_DIT_HIDDEN;
             }
     free(values);
-    schedule->gate_scores[block] = scores;
-    return 1;
-}
-
-static double cached_gate_score(const h3_dit_schedule *schedule,
-                                unsigned block, uint32_t row,
-                                uint32_t modality, unsigned branch) {
-    size_t index = ((size_t)row * H3_DIT_MODALITIES + modality) * 2 + branch;
-    return schedule->gate_scores[block][index];
-}
-
-double h3_dit_schedule_gate_score(h3_dit_schedule *schedule,
-                                  unsigned block) {
-    if (!cache_gate_scores(schedule, block)) return -1.0;
-    size_t count = (size_t)schedule->time_rows * H3_DIT_MODALITIES * 2;
-    double total = 0.0;
-    for (size_t index = 0; index < count; index++)
-        total += schedule->gate_scores[block][index];
-    return count ? total / (double)count : -1.0;
-}
-
-double h3_dit_schedule_step_modality_gate_score(
-    h3_dit_schedule *schedule, unsigned block, int step,
-    unsigned branch, unsigned modality) {
-    if (!schedule || step < 0 || step >= schedule->steps || branch >= 2 ||
-        modality >= H3_DIT_MODALITIES ||
-        !cache_gate_scores(schedule, block)) return -1.0;
-    if (modality == 0) {
-        double score = cached_gate_score(
-            schedule, block, schedule->video_rows[step], 0, branch);
-        if (!schedule->visual_condition_rows) return score;
-        return (score + cached_gate_score(
-            schedule, block, schedule->visual_condition_rows[step], 0,
-            branch)) * 0.5;
-    }
-    if (modality == 1)
-        return cached_gate_score(
-            schedule, block, schedule->video_rows[step], 1, branch);
-    double score = cached_gate_score(
-        schedule, block, schedule->audio_rows[step], 2, branch);
-    if (!schedule->audio_condition_rows) return score;
-    return (score + cached_gate_score(
-        schedule, block, schedule->audio_condition_rows[step], 2,
-        branch)) * 0.5;
+    return samples ? total / (double)samples : -1.0;
 }
 
 void h3_dit_schedule_prune(h3_dit_schedule *schedule,
