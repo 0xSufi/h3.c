@@ -413,6 +413,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
+            @"h3_qkv_rope_bf16_coop_uncached",
             @"h3_swiglu_bf16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
@@ -2923,8 +2924,11 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
     if (head_dim == 128 && !(heads % 4) &&
         !getenv("H3_DISABLE_COOP_QKV")) {
         if (!h3_gpu_require_command(gpu)) return 0;
+        NSString *pipeline_name = getenv("H3_DISABLE_CACHED_QKV") ?
+            @"h3_qkv_rope_bf16_coop_uncached" :
+            @"h3_qkv_rope_bf16_coop";
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-            gpu, @"h3_qkv_rope_bf16_coop");
+            gpu, pipeline_name);
         if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < head_dim) {
             h3_gpu_set_error(gpu,
                 @"cooperative QKV/RoPE needs a 128-thread threadgroup");
