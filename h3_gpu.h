@@ -469,7 +469,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  uint32_t rope_half, float epsilon,
                                  int input_is_quantized,
                                  int use_slower_unfused_qkv_rope,
-                                 int use_slower_scalar_qkv_rms);
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

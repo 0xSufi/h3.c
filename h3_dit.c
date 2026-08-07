@@ -1650,7 +1650,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f,
             attention_input_quantized,
             dit->use_slower_unfused_qkv_rope,
-            dit->use_slower_scalar_qkv_rms),
+            dit->use_slower_scalar_qkv_rms,
+            dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(

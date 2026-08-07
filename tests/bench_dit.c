@@ -771,7 +771,9 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                                    float *video_velocity,
                                    float *audio_velocity) {
     char error[512];
-    int local_linear_scales =
+    int local_qkv_scales =
+        getenv("H3_BENCH_QKV_LOCAL_SCALES_AB") != NULL;
+    int local_linear_scales = !local_qkv_scales &&
         getenv("H3_BENCH_INT8_LOCAL_SCALES_AB") != NULL;
     int vector_qkv_rms = !local_linear_scales &&
         getenv("H3_BENCH_VECTOR_QKV_RMS_AB") != NULL;
@@ -785,7 +787,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
     int attention_out = !fused_mlp_input &&
         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
-    const char *disable = local_linear_scales ?
+    const char *disable = local_qkv_scales ?
+        "H3_DISABLE_QKV_LOCAL_SCALES" : local_linear_scales ?
         "H3_DISABLE_INT8_LOCAL_SCALES" : vector_qkv_rms ?
         "H3_DISABLE_VECTOR_QKV_RMS" : fused_qkv_rope ?
         "H3_DISABLE_FUSED_INT8_QKV_ROPE" : fused_inputs ?
@@ -795,7 +798,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         "H3_DISABLE_INT8_ATTENTION_OUT" : "H3_DISABLE_INT8_QKV";
     const char *disable2 = fused_inputs ?
         "H3_DISABLE_FUSED_INT8_QKV_INPUT" : NULL;
-    const char *name = local_linear_scales ? "local int8 linear scales" :
+    const char *name = local_qkv_scales ? "local int8 QKV scales" :
+        local_linear_scales ? "local int8 linear scales" :
         vector_qkv_rms ? "vector int8 QKV RMS" :
         fused_qkv_rope ? "fused int8 QKV norm/RoPE" :
         fused_inputs ? "fused int8 projection inputs" :
@@ -1472,6 +1476,8 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_VECTOR_QKV_RMS_AB") != NULL;
     int local_int8_linear_scales_ab =
         getenv("H3_BENCH_INT8_LOCAL_SCALES_AB") != NULL;
+    int local_int8_qkv_scales_ab =
+        getenv("H3_BENCH_QKV_LOCAL_SCALES_AB") != NULL;
     const char *qkv_ab = getenv("H3_BENCH_QKV_AB");
     int qkv_denoise_ab = qkv_ab && !strcmp(qkv_ab, "denoise");
     int qkv_step_ab = qkv_ab && !strcmp(qkv_ab, "steps");
@@ -1556,7 +1562,7 @@ int main(int argc, char **argv) {
     if (int8_qkv_ab || int8_attention_out_ab || fused_int8_mlp_input_ab ||
         fused_int8_qkv_input_ab || fused_int8_inputs_ab ||
         fused_int8_qkv_rope_ab || vector_int8_qkv_rms_ab ||
-        local_int8_linear_scales_ab) {
+        local_int8_linear_scales_ab || local_int8_qkv_scales_ab) {
         run_int8_projection_ab(
             dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before int8 projection AB\n",

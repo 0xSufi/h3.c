@@ -454,6 +454,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_qkv_project_split_int8_nax_r128_morton4"];
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_nax_r128_morton4"];
+            [names addObject:
+                @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
@@ -3710,7 +3712,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  uint32_t rope_half, float epsilon,
                                  int input_is_quantized,
                                  int use_slower_unfused_qkv_rope,
-                                 int use_slower_scalar_qkv_rms) {
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -3747,8 +3750,13 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
             input_dim, 1.0f, @"int8 QKV input")) return 0;
     BOOL fused_rope = !use_slower_unfused_qkv_rope &&
         getenv("H3_DISABLE_FUSED_INT8_QKV_ROPE") == NULL;
+    BOOL local_scales = fused_rope && rows > 2048 &&
+        !use_slower_uncached_int8_scales &&
+        getenv("H3_DISABLE_QKV_LOCAL_SCALES") == NULL;
     id<MTLComputePipelineState> projection = h3_gpu_pipeline(
-        gpu, fused_rope ?
+        gpu, local_scales ?
+            @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4" :
+            fused_rope ?
             @"h3_qkv_project_split_int8_rope_nax_r128_morton4" :
             @"h3_qkv_project_split_int8_nax_r128_morton4");
     id<MTLComputePipelineState> rope = fused_rope ? nil : h3_gpu_pipeline(
