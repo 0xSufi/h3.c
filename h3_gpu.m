@@ -414,7 +414,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
-            @"h3_token_pool_bf16", @"h3_token_expand_delta_bf16",
+            @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
+            @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
             @"h3_euler_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
@@ -3024,6 +3025,104 @@ int h3_gpu_token_pool_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(original).buffer offset:0 atIndex:5];
             [encoder setBytes:&args length:sizeof(args) atIndex:6];
         });
+}
+
+int h3_gpu_token_pool_adaln_bf16(
+                           h3_gpu *opaque, h3_gpu_tensor *residual,
+                           h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, size_t input_offset,
+                           h3_gpu_tensor *original, size_t original_offset,
+                           h3_gpu_tensor *baseline, size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *pairs,
+                           const h3_gpu_tensor *norm_weight,
+                           const h3_gpu_tensor *modulation,
+                           const h3_gpu_tensor *row_map,
+                           uint32_t input_rows, uint32_t rows,
+                           uint32_t baseline_rows, uint32_t width,
+                           uint32_t slots, uint32_t shift_slot,
+                           uint32_t scale_slot, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t elements = (size_t)rows * width;
+    size_t input_elements = (size_t)input_rows * width;
+    size_t baseline_elements = (size_t)baseline_rows * width;
+    if (!input_rows || !rows || rows > input_rows || !width || width > 5376 ||
+        baseline_rows > rows || shift_slot >= slots || scale_slot >= slots ||
+        elements > UINT32_MAX || input_offset > UINT32_MAX ||
+        input_elements > UINT32_MAX - input_offset ||
+        original_offset > UINT32_MAX ||
+        input_elements > UINT32_MAX - original_offset ||
+        baseline_offset > UINT32_MAX ||
+        baseline_elements > UINT32_MAX - baseline_offset ||
+        !input || TENSOR(input).dtype != H3_GPU_BF16 ||
+        input_offset > TENSOR(input).elements ||
+        input_elements > TENSOR(input).elements - input_offset ||
+        !original || TENSOR(original).dtype != H3_GPU_BF16 ||
+        original_offset > TENSOR(original).elements ||
+        input_elements > TENSOR(original).elements - original_offset ||
+        !h3_gpu_require_bf16(gpu, residual, elements,
+                             @"fused token pool residual") ||
+        !baseline || TENSOR(baseline).dtype != H3_GPU_BF16 ||
+        baseline_offset > TENSOR(baseline).elements ||
+        baseline_elements > TENSOR(baseline).elements - baseline_offset ||
+        !h3_gpu_require_elements(gpu, baseline_indices, rows,
+                                 @"fused token pool baseline indices") ||
+        TENSOR(baseline_indices).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_elements(gpu, pairs, (size_t)rows * 2,
+                                 @"fused token pool pairs") ||
+        TENSOR(pairs).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_bf16(gpu, norm_weight, width,
+                             @"fused token pool norm") ||
+        !h3_gpu_require_bf16(gpu, modulation, 1,
+                             @"fused token pool modulation") ||
+        !h3_gpu_require_elements(gpu, row_map, rows,
+                                 @"fused token pool row map") ||
+        TENSOR(row_map).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_bf16(gpu, output, elements,
+                             @"fused token pool AdaLN output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    typedef struct {
+        uint32_t input_offset, original_offset, baseline_offset;
+        uint32_t rows, width, slots, shift_slot, scale_slot;
+        float epsilon;
+    } token_pool_adaln_args;
+    token_pool_adaln_args args = {
+        (uint32_t)input_offset, (uint32_t)original_offset,
+        (uint32_t)baseline_offset, rows, width, slots, shift_slot,
+        scale_slot, epsilon
+    };
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_token_pool_adaln_bf16");
+    if (!pipeline) return 0;
+    const NSUInteger threads = 256;
+    if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+        h3_gpu_set_error(gpu,
+            @"fused token pool AdaLN needs a 256-thread threadgroup");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(pairs).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(residual).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(baseline).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(baseline_indices).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(original).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:7];
+        [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:8];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:9];
+        [encoder setBytes:&args length:sizeof(args) atIndex:10];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_token_expand_delta_bf16(

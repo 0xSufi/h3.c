@@ -1232,6 +1232,30 @@ static int enter_token_reduction(h3_dit *dit, char *error,
     return 1;
 }
 
+static int enter_token_reduction_adaln(h3_dit *dit, unsigned block,
+                                       int step, char *error,
+                                       size_t error_size) {
+    h3_gpu_tensor *original = dit->token_original_in_qkv ?
+        dit->qkv : dit->token_original;
+    h3_dit_block *weight = &dit->blocks[block];
+    const h3_gpu_tensor *modulation = h3_dit_schedule_block(
+        dit->schedule, block);
+    if (!gpu_op(dit, h3_gpu_token_pool_adaln_bf16(
+            dit->gpu, dit->attention_output, dit->mod_attention,
+            dit->hidden, 0, original, dit->token_original_offset,
+            dit->attention_output, dit->token_baseline_offset,
+            dit->token_baseline_indices, dit->token_pool_pairs,
+            weight->norm1, modulation, dit->reduced_row_maps[step],
+            dit->sequence, dit->reduced_sequence, dit->token_baseline_rows,
+            HIDDEN, SLOTS, 0, 1, 1e-5f), error, error_size,
+            "snapshot, pool, and apply attention AdaLN")) return 0;
+    h3_gpu_tensor *swap = dit->hidden;
+    dit->hidden = dit->attention_output;
+    dit->attention_output = swap;
+    dit->token_reduction_active = 1;
+    return 1;
+}
+
 static int leave_token_reduction(h3_dit *dit, char *error,
                                  size_t error_size) {
     h3_gpu_tensor *original = dit->token_original_in_qkv ?
@@ -1407,8 +1431,15 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             int fused_token_adaln = 0;
             if (use_token_reduction &&
-                block == dit->token_reduction_begin &&
-                !enter_token_reduction(dit, error, error_size)) return 0;
+                block == dit->token_reduction_begin) {
+                fused_token_adaln = dit->block_active[block] &&
+                    !getenv("H3_DISABLE_FUSED_TOKEN_POOL_ADALN");
+                if (fused_token_adaln) {
+                    if (!enter_token_reduction_adaln(
+                            dit, block, step, error, error_size)) return 0;
+                } else if (!enter_token_reduction(
+                               dit, error, error_size)) return 0;
+            }
             if (use_token_reduction && block == token_reduction_end) {
                 fused_token_adaln = dit->block_active[block] &&
                     !getenv("H3_DISABLE_FUSED_TOKEN_ADALN");

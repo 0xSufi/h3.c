@@ -105,7 +105,9 @@ baseline. The full bypass uses the oversized QKV tail when it fits, with a
 guarded dedicated fallback only for reference-heavy layouts. Common text-only
 canvases therefore add no activation arena at any token-grid width. Pooling
 also snapshots both source tokens while their BF16 values are already in
-registers, avoiding a separate full-hidden blit and redundant source read.
+registers, avoiding a separate full-hidden blit and redundant source read. The
+same entry kernel keeps each pooled row in threadgroup memory and emits the
+first reduced block's attention AdaLN, eliminating another global residual read.
 At the restore boundary, the first full-resolution attention AdaLN is fused
 into expansion: a 10.5 KiB threadgroup row avoids a global residual reread while
 still writing the exact bypass needed by the following residual branch.
@@ -118,6 +120,9 @@ therefore opt-in rather than the close-reference default.
 `H3_TOKEN_REDUCTION_BLOCKS` can override the later `4:30` interval;
 `H3_TOKEN_REDUCTION_EARLY=STEPS:END` overrides the early schedule and `0`
 disables it. `H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
+`H3_DISABLE_FUSED_TOKEN_POOL_ADALN=1` and
+`H3_DISABLE_FUSED_TOKEN_ADALN=1` independently restore the two-kernel entry and
+exit boundaries for diagnosis.
 Token reduction composes cleanly with the validated `--layers 45 --reuse 2`
 settings: on the same 512 benchmark it reduced that profile from 16.69 to
 12.60 seconds (24.5% marginal), and independent fox and surfer renders stayed
