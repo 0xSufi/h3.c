@@ -331,6 +331,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          uint32_t input_dim, uint32_t hidden_dim,
                          uint32_t output_dim,
                          int use_slower_grouped_quantizer,
+                         int use_slower_dynamic_fc1_k,
                          int input_is_quantized);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);

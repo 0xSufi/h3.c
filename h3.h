@@ -96,6 +96,8 @@ typedef struct {
     int use_slower_scalar_qkv_rms;
     /* Reread int8 dequantization scales from device memory per output. */
     int use_slower_uncached_int8_scales;
+    /* Use the generic runtime-bound FC1 TensorOps K loop. */
+    int use_slower_dynamic_fc1_k;
     /* Force the original 256-thread FC2 grouped activation quantizer. */
     int use_slower_grouped_quantizer;
     h3_frame_callback on_frame;
@@ -106,7 +108,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

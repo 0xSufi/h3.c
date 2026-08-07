@@ -61,6 +61,7 @@ struct h3_dit {
     int use_slower_unfused_qkv_rope;
     int use_slower_scalar_qkv_rms;
     int use_slower_uncached_int8_scales;
+    int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -1350,6 +1351,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_unfused_qkv_rope,
                         int use_slower_scalar_qkv_rms,
                         int use_slower_uncached_int8_scales,
+                        int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
@@ -1414,6 +1416,7 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->use_slower_scalar_qkv_rms = use_slower_scalar_qkv_rms;
     dit->use_slower_uncached_int8_scales =
         use_slower_uncached_int8_scales;
+    dit->use_slower_dynamic_fc1_k = use_slower_dynamic_fc1_k;
     dit->keep_bf16_attention_out = dit->int8_attention_out &&
         (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
          getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
@@ -1476,6 +1479,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_unfused_qkv_rope,
                          int use_slower_scalar_qkv_rms,
                          int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
@@ -1487,6 +1491,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_unfused_qkv_rope,
                     use_slower_scalar_qkv_rms,
                     use_slower_uncached_int8_scales,
+                    use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
@@ -1508,6 +1513,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_unfused_qkv_rope,
                          int use_slower_scalar_qkv_rms,
                          int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
@@ -1523,6 +1529,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_unfused_qkv_rope,
                     use_slower_scalar_qkv_rms,
                     use_slower_uncached_int8_scales,
+                    use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
@@ -1716,7 +1723,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->fc2_int8, weight->fc2_scales,
             weight->fc1, weight->fc2,
             rows, HIDDEN, FFN, HIDDEN,
-            dit->use_slower_grouped_quantizer, fused_int8_mlp_input),
+            dit->use_slower_grouped_quantizer,
+            dit->use_slower_dynamic_fc1_k, fused_int8_mlp_input),
            "DiT int8 fused MLP");
     } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,

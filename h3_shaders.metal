@@ -1886,7 +1886,10 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
     }
 }
 
-kernel void h3_fc1_swiglu_int8_nax_r128(
+/* INPUT_DIM=5376 lets Metal schedule H3's fixed FC1 K loop without unrolling
+ * its 42 TensorOps slices; zero retains the generic runtime-bound fallback. */
+template<uint INPUT_DIM>
+kernel void h3_fc1_swiglu_int8_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -1902,11 +1905,12 @@ kernel void h3_fc1_swiglu_int8_nax_r128(
         code, row_tiles, column_tiles);
     uint row_start = group.x * TILE;
     uint column_start = group.y * TILE;
+    uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        input, dextents<int32_t, 2>((int)args.input_dim,
+        input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
     auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        weight, dextents<int32_t, 2>((int)args.input_dim,
+        weight, dextents<int32_t, 2>((int)input_dim,
                                      (int)args.output_dim * 2));
     constexpr auto descriptor = matmul2d_descriptor(
         TILE, TILE, TILE, false, true, true,
@@ -1921,10 +1925,18 @@ kernel void h3_fc1_swiglu_int8_nax_r128(
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++)
             if (accum.is_valid_element(element)) accum[element] = 0;
-        for (uint k = 0; k < args.input_dim; k += TILE) {
-            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
-            mm.run(a, b, accum);
+        if (INPUT_DIM) {
+            for (uint k = 0; k < INPUT_DIM; k += TILE) {
+                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+                auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+                mm.run(a, b, accum);
+            }
+        } else {
+            for (uint k = 0; k < input_dim; k += TILE) {
+                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+                auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+                mm.run(a, b, accum);
+            }
         }
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++) {
@@ -1948,11 +1960,20 @@ kernel void h3_fc1_swiglu_int8_nax_r128(
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++)
             if (accum.is_valid_element(element)) accum[element] = 0;
-        for (uint k = 0; k < args.input_dim; k += TILE) {
-            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-            auto b = w.slice<TILE, TILE>(
-                (int)k, (int)args.output_dim + (int)column_start);
-            mm.run(a, b, accum);
+        if (INPUT_DIM) {
+            for (uint k = 0; k < INPUT_DIM; k += TILE) {
+                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+                auto b = w.slice<TILE, TILE>(
+                    (int)k, (int)args.output_dim + (int)column_start);
+                mm.run(a, b, accum);
+            }
+        } else {
+            for (uint k = 0; k < input_dim; k += TILE) {
+                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+                auto b = w.slice<TILE, TILE>(
+                    (int)k, (int)args.output_dim + (int)column_start);
+                mm.run(a, b, accum);
+            }
         }
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++) {
@@ -1970,6 +1991,15 @@ kernel void h3_fc1_swiglu_int8_nax_r128(
         }
     }
 }
+
+typedef decltype(h3_fc1_swiglu_int8_nax_r128_impl<0>)
+    h3_fc1_swiglu_int8_nax_r128_t;
+template [[host_name("h3_fc1_swiglu_int8_nax_r128")]]
+kernel h3_fc1_swiglu_int8_nax_r128_t
+    h3_fc1_swiglu_int8_nax_r128_impl<0>;
+template [[host_name("h3_fc1_swiglu_int8_nax_r128_k5376")]]
+kernel h3_fc1_swiglu_int8_nax_r128_t
+    h3_fc1_swiglu_int8_nax_r128_impl<5376>;
 
 /* Gate and up use the same cooperative-fragment mapping. Preserve the gate's
  * existing BF16 rounding point in thread-private storage, then consume it

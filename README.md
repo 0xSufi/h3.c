@@ -616,6 +616,10 @@ direct loads because the two forms tie there. Both are byte-identical and
 improve complete forwards by about 0.2-0.7% where selected. Use
 `--use-slower-uncached-int8-scales` to restore direct device-scale loads.
 
+FC1 also uses an H3-specialized, compile-time 5,376-wide TensorOps loop. It is
+byte-identical to the generic loop and saves about 0.1-0.4% in crossed complete
+forwards. Use `--use-slower-dynamic-fc1-k` to restore the runtime-bound loop.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \

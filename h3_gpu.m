@@ -457,6 +457,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
+            [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
@@ -2894,6 +2895,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          uint32_t input_dim, uint32_t hidden_dim,
                          uint32_t output_dim,
                          int use_slower_grouped_quantizer,
+                         int use_slower_dynamic_fc1_k,
                          int input_is_quantized) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
@@ -2941,6 +2943,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
 
     id<MTLComputePipelineState> fc1 = h3_gpu_pipeline(
         gpu, @"h3_fc1_swiglu_int8_nax_r128");
+    id<MTLComputePipelineState> fc1_known = h3_gpu_pipeline(
+        gpu, @"h3_fc1_swiglu_int8_nax_r128_k5376");
     id<MTLComputePipelineState> fc1_local = h3_gpu_pipeline(
         gpu, @"h3_fc1_swiglu_int8_local_nax_r128");
     id<MTLComputePipelineState> fc2 = h3_gpu_pipeline(
@@ -2951,8 +2955,9 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         gpu, @"h3_linear_int8_grouped_local_nax_r128x64");
     id<MTLComputePipelineState> fc2_grouped_local128 = h3_gpu_pipeline(
         gpu, @"h3_linear_int8_grouped_local_nax_r128x128");
-    if (!fc1 || !fc1_local || !fc2 ||
+    if (!fc1 || !fc1_known || !fc1_local || !fc2 ||
         fc1.maxTotalThreadsPerThreadgroup < 256 ||
+        fc1_known.maxTotalThreadsPerThreadgroup < 256 ||
         fc1_local.maxTotalThreadsPerThreadgroup < 256 ||
         fc2.maxTotalThreadsPerThreadgroup < 256 || !fc2_grouped ||
         fc2_grouped.maxTotalThreadsPerThreadgroup < 128 ||
@@ -2977,6 +2982,12 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         getenv("H3_INT8_GROUP_FC2_LOCAL128") != NULL;
     BOOL int8_fc1_local = int8_fc1 &&
         getenv("H3_INT8_FC1_LOCAL") != NULL;
+    BOOL int8_fc1_known = int8_fc1 && input_dim == 5376 &&
+        !use_slower_dynamic_fc1_k;
+    const char *known_override = getenv("H3_INT8_FC1_KNOWN");
+    if (known_override)
+        int8_fc1_known = int8_fc1 && input_dim == 5376 &&
+            strcmp(known_override, "0") != 0;
     uint32_t row_tiles = padded_rows / 128;
     if (input_is_quantized && !int8_fc1) {
         h3_gpu_set_error(gpu,
@@ -2992,7 +3003,8 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
-        [encoder setComputePipelineState:int8_fc1_local ? fc1_local : fc1];
+        [encoder setComputePipelineState:int8_fc1_local ? fc1_local :
+            int8_fc1_known ? fc1_known : fc1];
         [encoder setBuffer:TENSOR(quantized_activation).buffer
                          offset:0 atIndex:0];
         [encoder setBuffer:TENSOR(fc1_weight).buffer offset:0 atIndex:1];
