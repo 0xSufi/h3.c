@@ -821,6 +821,30 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+/* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
+ * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
+inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
+                                ushort simdgroup, ushort lane) {
+    value = max(value, simd_shuffle_xor(value, 16));
+    value = max(value, simd_shuffle_xor(value, 8));
+    value = max(value, simd_shuffle_xor(value, 4));
+    value = max(value, simd_shuffle_xor(value, 2));
+    value = max(value, simd_shuffle_xor(value, 1));
+    if (lane == 0) scratch[simdgroup] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        value = lane < 8 ? scratch[lane] : 0.0f;
+        value = max(value, simd_shuffle_xor(value, 16));
+        value = max(value, simd_shuffle_xor(value, 8));
+        value = max(value, simd_shuffle_xor(value, 4));
+        value = max(value, simd_shuffle_xor(value, 2));
+        value = max(value, simd_shuffle_xor(value, 1));
+        if (lane == 0) scratch[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
 #ifdef H3_METAL_HAS_TENSOR
 /* Draw Things' Metal 4 matmul schedules neighboring row/column tiles in
  * Morton order. The decoder is adapted from ccv's BSD-3-Clause NAMatMul;
@@ -1293,28 +1317,6 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton4(
 /* Draw Things/ccv-style dynamic symmetric row quantization. Weight rows are
  * checkpoint output channels; activation rows include zero-padded M tails so
  * the int8 matmuls can keep a fully static 128x128x128 descriptor. */
-inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
-                                ushort simdgroup, ushort lane) {
-    value = max(value, simd_shuffle_xor(value, 16));
-    value = max(value, simd_shuffle_xor(value, 8));
-    value = max(value, simd_shuffle_xor(value, 4));
-    value = max(value, simd_shuffle_xor(value, 2));
-    value = max(value, simd_shuffle_xor(value, 1));
-    if (lane == 0) scratch[simdgroup] = value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simdgroup == 0) {
-        value = lane < 8 ? scratch[lane] : 0.0f;
-        value = max(value, simd_shuffle_xor(value, 16));
-        value = max(value, simd_shuffle_xor(value, 8));
-        value = max(value, simd_shuffle_xor(value, 4));
-        value = max(value, simd_shuffle_xor(value, 2));
-        value = max(value, simd_shuffle_xor(value, 1));
-        if (lane == 0) scratch[0] = value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return scratch[0];
-}
-
 kernel void h3_quantize_bf16_int8_rows(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],
@@ -3074,7 +3076,6 @@ kernel void h3_gate_adaln_bf16_exact_simd(
     if (row >= args.rows) return;
     threadgroup float reductions[256];
     threadgroup ushort gated_values[5376];
-    threadgroup float inverse_value;
     uint base = row_map[row] * args.slots * args.width;
     float local_sum = 0.0f;
     for (uint column = tid; column < args.width; column += threads) {
@@ -3102,10 +3103,10 @@ kernel void h3_gate_adaln_bf16_exact_simd(
             if (tid < stride) sum += partner;
         }
         if (tid == 0)
-            inverse_value = rsqrt(sum / float(args.width) + args.epsilon);
+            reductions[0] = rsqrt(sum / float(args.width) + args.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inverse = inverse_value;
+    float inverse = reductions[0];
     for (uint column = tid; column < args.width; column += threads) {
         float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
             h3_bf16_to_f32(weight[column]);
@@ -3147,7 +3148,6 @@ kernel void h3_gate_adaln_quantize_int8_scalar(
     }
     threadgroup float reductions[256];
     threadgroup ushort gated_values[5376];
-    threadgroup float inverse_value;
     threadgroup float max_scratch[8];
     uint base = row_map[row] * args.slots * args.width;
     uint row_base = row * args.width;
@@ -3177,10 +3177,10 @@ kernel void h3_gate_adaln_quantize_int8_scalar(
             if (tid < stride) sum += partner;
         }
         if (tid == 0)
-            inverse_value = rsqrt(sum / float(args.width) + args.epsilon);
+            reductions[0] = rsqrt(sum / float(args.width) + args.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inverse = inverse_value;
+    float inverse = reductions[0];
     float local_max = 0.0f;
     for (uint column = tid; column < args.width; column += 256) {
         float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
@@ -3236,7 +3236,6 @@ kernel void h3_gate_adaln_quantize_int8(
     }
     threadgroup float reductions[256];
     threadgroup ushort4 gated_values[VECTOR_WIDTH];
-    threadgroup float inverse_value;
     threadgroup float max_scratch[8];
     uint base = row_map[row] * args.slots * args.width;
     uint vector_base = row * VECTOR_WIDTH;
@@ -3281,14 +3280,14 @@ kernel void h3_gate_adaln_quantize_int8(
             if (tid < stride) sum += partner;
         }
         if (tid == 0)
-            inverse_value = rsqrt(sum / float(args.width) + args.epsilon);
+            reductions[0] = rsqrt(sum / float(args.width) + args.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const ushort4 *weight4 =
         reinterpret_cast<device const ushort4 *>(weight);
     device const ushort4 *norm_modulation4 =
         reinterpret_cast<device const ushort4 *>(norm_modulation);
-    float inverse = inverse_value;
+    float inverse = reductions[0];
     float local_max = 0.0f;
     for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
         ushort4 gated = gated_values[vector];
