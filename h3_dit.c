@@ -1216,20 +1216,15 @@ h3_dit *h3_dit_load_conditioned(
 
 static int enter_token_reduction(h3_dit *dit, char *error,
                                  size_t error_size) {
-    uint32_t full_elements = dit->sequence * HIDDEN;
     h3_gpu_tensor *original = dit->token_original_in_qkv ?
         dit->qkv : dit->token_original;
-    if (!gpu_op(dit, h3_gpu_copy_bf16(
-            dit->gpu, original, dit->token_original_offset,
-            dit->hidden, 0, full_elements),
-            error, error_size, "save full token residual") ||
-        !gpu_op(dit, h3_gpu_token_pool_bf16(
-            dit->gpu, dit->attention_output, original,
-            dit->token_original_offset, dit->hidden,
+    if (!gpu_op(dit, h3_gpu_token_pool_bf16(
+            dit->gpu, dit->attention_output, dit->hidden, 0,
+            original, dit->token_original_offset, dit->attention_output,
             dit->token_baseline_offset, dit->token_baseline_indices,
             dit->token_pool_pairs, dit->sequence, dit->reduced_sequence,
             dit->token_baseline_rows, HIDDEN),
-            error, error_size, "pool video tokens")) return 0;
+            error, error_size, "snapshot and pool video tokens")) return 0;
     h3_gpu_tensor *swap = dit->hidden;
     dit->hidden = dit->attention_output;
     dit->attention_output = swap;
@@ -1243,7 +1238,7 @@ static int leave_token_reduction(h3_dit *dit, char *error,
         dit->qkv : dit->token_original;
     if (!gpu_op(dit, h3_gpu_token_expand_delta_bf16(
             dit->gpu, dit->mod_attention, original,
-            dit->token_original_offset, dit->hidden, dit->attention_output,
+            dit->token_original_offset, dit->hidden, dit->hidden,
             dit->token_baseline_offset, dit->token_baseline_indices,
             dit->token_expand_parents, dit->sequence,
             dit->reduced_sequence, dit->token_baseline_rows, HIDDEN,

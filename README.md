@@ -103,7 +103,9 @@ The pooling kernel writes only true-pair baselines into a dense tail of the
 already allocated attention scratch buffer; odd-width singleton tokens need no
 baseline. The full bypass uses the oversized QKV tail when it fits, with a
 guarded dedicated fallback only for reference-heavy layouts. Common text-only
-canvases therefore add no activation arena at any token-grid width.
+canvases therefore add no activation arena at any token-grid width. Pooling
+also snapshots both source tokens while their BF16 values are already in
+registers, avoiding a separate full-hidden blit and redundant source read.
 On a thermal-balanced 512x512x22, 19-forward IT M5 Max A/B this reduced denoise
 time from 36.46 to 29.07 seconds (20.3%). Final video/audio latent relative L2
 was 5.13%/14.99%. First/middle/last fox frames retained one clean muzzle,
