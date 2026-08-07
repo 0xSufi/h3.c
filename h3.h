@@ -74,8 +74,8 @@ typedef struct {
      * the timestep head each step. 1 is exact, 4 fast, and 6 aggressive. */
     int core_reuse;
     /* Pair adjacent horizontal video tokens through middle DiT blocks while
-     * preserving their full-resolution residual. This is an approximate,
-     * validated aggressive speed mode. */
+     * preserving their full-resolution residual. Early noisy evaluations use
+     * a deeper reduced interval. This is a validated aggressive speed mode. */
     int token_reduction;
     /* Optional lower internal model canvas. Both must be zero (exact output
      * canvas) or valid same-aspect dimensions no larger than width/height. */

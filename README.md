@@ -92,18 +92,22 @@ and whole-velocity `--reuse` are intentionally mutually exclusive.
 `--token-reduction` is an independent aggressive DiT mode. After block 9 it
 pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is
-kept as a bypass; before block 30 each token is restored as its original value
-plus the update learned by its pair, so within-pair detail is not discarded.
+kept as a bypass. During the first ten noisy evaluations it restores before
+block 40; subsequent detail-forming evaluations restore before block 30. Each
+token returns as its original value plus the update learned by its pair, so
+within-pair detail is not discarded.
 At common even token-grid widths the bypass and pooled baseline occupy dormant
 tails of the already allocated QKV and attention scratch buffers, adding no
 activation arena; guarded dedicated buffers cover other layouts.
-On a thermal-balanced 512x512x22, 19-forward M5 Max A/B this reduced denoise
-time from 37.65 to 31.66 seconds (15.9%). Final video/audio latent relative L2
-was 4.90%/12.15%. Independent fox/snow and surfer/wave renders remained sharp,
-coherent, and semantically correct. It changes composition and is therefore
-opt-in rather than the close-reference default. `H3_TOKEN_REDUCTION_BLOCKS`
-can override the validated `10:30` block interval for development experiments;
-`H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
+On a thermal-balanced 512x512x22, 19-forward IT M5 Max A/B this reduced denoise
+time from 36.46 to 29.07 seconds (20.3%). Final video/audio latent relative L2
+was 5.13%/14.99%. First/middle/last fox frames retained one clean muzzle,
+coherent legs, and sharp fur; an independent surfer remained consistent while
+emerging with the same board from wave spray. It changes composition and is
+therefore opt-in rather than the close-reference default.
+`H3_TOKEN_REDUCTION_BLOCKS` can override the later `10:30` interval;
+`H3_TOKEN_REDUCTION_EARLY=STEPS:END` overrides the early schedule and `0`
+disables it. `H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
 `--render-width` and `--render-height` run the model and VAE on a lower
 same-aspect internal canvas, then high-quality vImage-scale RGB frames to the
 requested output size before callbacks, terminal display, and encoding. This is an

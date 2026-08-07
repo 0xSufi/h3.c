@@ -48,6 +48,8 @@ struct h3_dit {
     int token_reduction_active;
     unsigned token_reduction_begin;
     unsigned token_reduction_end;
+    unsigned token_reduction_early_steps;
+    unsigned token_reduction_early_end;
     float token_reduction_scale;
     int bf16_final;
     unsigned core_reuse_interval;
@@ -338,6 +340,37 @@ static int configure_token_reduction(h3_dit *dit, int requested,
         begin = (unsigned)parsed_begin;
         end = (unsigned)parsed_end;
     }
+    /* Coarse structure is tolerant of a deeper reduced stack while the first
+     * noisy samples form. Restore earlier once fine detail starts resolving. */
+    unsigned early_steps = end < 40 ? 10 : 0;
+    unsigned early_end = end < 40 ? 40 : end;
+    const char *early = getenv("H3_TOKEN_REDUCTION_EARLY");
+    if (early && *early) {
+        if (!strcmp(early, "0")) {
+            early_steps = 0;
+            early_end = end;
+        } else {
+            char *middle = NULL;
+            unsigned long parsed_steps = strtoul(early, &middle, 10);
+            if (middle == early || *middle != ':') {
+                fail(error, error_size,
+                     "H3_TOKEN_REDUCTION_EARLY must be STEPS:END");
+                return 0;
+            }
+            char *tail = NULL;
+            unsigned long parsed_end = strtoul(middle + 1, &tail, 10);
+            if (tail == middle + 1 || *tail || !parsed_steps ||
+                parsed_steps > 1000 || parsed_end <= end ||
+                parsed_end > H3_DIT_BLOCKS) {
+                fail(error, error_size,
+                     "early token reduction requires STEPS > 0 and "
+                     "base END < END <= 50");
+                return 0;
+            }
+            early_steps = (unsigned)parsed_steps;
+            early_end = (unsigned)parsed_end;
+        }
+    }
     float scale = 1.0f;
     const char *scale_text = getenv("H3_TOKEN_REDUCTION_SCALE");
     if (scale_text && *scale_text) {
@@ -368,6 +401,8 @@ static int configure_token_reduction(h3_dit *dit, int requested,
     dit->token_reduction = 1;
     dit->token_reduction_begin = begin;
     dit->token_reduction_end = end;
+    dit->token_reduction_early_steps = early_steps;
+    dit->token_reduction_early_end = early_end;
     dit->token_reduction_scale = scale;
     dit->reduced_video_rows = (uint32_t)reduced_video;
     dit->reduced_sequence = dit->video_target_start +
@@ -1327,6 +1362,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         step == h3_dit_schedule_steps(dit->schedule) - 1;
     int use_token_reduction = evaluate_core && dit->token_reduction &&
         !getenv("H3_DISABLE_TOKEN_REDUCTION");
+    unsigned token_reduction_end =
+        dit->token_reduction_early_steps &&
+        (unsigned)step < dit->token_reduction_early_steps ?
+            dit->token_reduction_early_end : dit->token_reduction_end;
     uint32_t hidden_elements = dit->sequence * HIDDEN;
     if (evaluate_core && dit->core_reuse_interval > 1)
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
@@ -1340,7 +1379,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 block == dit->token_reduction_begin &&
                 !enter_token_reduction(dit, error, error_size)) return 0;
             if (use_token_reduction &&
-                block == dit->token_reduction_end &&
+                block == token_reduction_end &&
                 !leave_token_reduction(dit, error, error_size)) return 0;
             if (!dit->block_active[block]) continue;
             if (!run_block(dit, block, step, error, error_size)) return 0;
@@ -1351,7 +1390,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
         }
         if (use_token_reduction &&
-            dit->token_reduction_end == H3_DIT_BLOCKS &&
+            token_reduction_end == H3_DIT_BLOCKS &&
             !leave_token_reduction(dit, error, error_size)) return 0;
         if (dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
