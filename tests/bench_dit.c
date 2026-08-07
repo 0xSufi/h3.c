@@ -391,6 +391,66 @@ static void run_qkv_cache_ab(h3_dit *dit, float *video, float *audio,
     free(audio_reference);
 }
 
+static void run_exact_simd_gate_adaln_ab(
+                             h3_dit *dit, float *video, float *audio,
+                             float *video_velocity, float *audio_velocity) {
+    char error[512];
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating exact SIMD gate AdaLN AB references");
+    setenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    unsetenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int candidate_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0;
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        if (candidate_pattern[run])
+            unsetenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN");
+        else
+            setenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN", "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (memcmp(video_velocity, video_reference,
+                   VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+            memcmp(audio_velocity, audio_reference,
+                   AUDIO_ELEMENTS * sizeof(*audio_reference)))
+            die("exact SIMD gate AdaLN changed output bytes");
+        if (candidate_pattern[run]) {
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  exact SIMD gate AdaLN %.3fs\n", elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  shared-tree gate AdaLN %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN");
+    printf("DiT exact SIMD gate AdaLN AB shared-tree %.4fs, SIMD %.4fs, "
+           "ratio %.4f; outputs byte-identical\n",
+           baseline_seconds / baseline_count,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count));
+    free(video_reference);
+    free(audio_reference);
+}
+
 static void run_qkv_denoise_ab(h3_dit *dit, float *video, float *audio,
                                int reuse_interval) {
     char error[512];
@@ -1146,6 +1206,18 @@ int main(int argc, char **argv) {
         run_qkv_cache_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before cached QKV AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (getenv("H3_BENCH_EXACT_SIMD_GATE_ADALN_AB")) {
+        run_exact_simd_gate_adaln_ab(
+            dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT %ux%u/%u-layer load %.3fs before exact SIMD gate AdaLN "
+               "AB\n", (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);

@@ -411,7 +411,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
-            @"h3_gate_adaln_bf16",
+            @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
             @"h3_qkv_rope_bf16_coop_uncached",
             @"h3_swiglu_bf16",
@@ -2864,8 +2864,10 @@ int h3_gpu_gate_adaln_bf16(
     gate_adaln_args args = {
         rows, width, slots, gate_slot, shift_slot, scale_slot, epsilon
     };
+    NSString *pipeline_name = getenv("H3_DISABLE_EXACT_SIMD_GATE_ADALN") ?
+        @"h3_gate_adaln_bf16" : @"h3_gate_adaln_bf16_exact_simd";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_gate_adaln_bf16");
+        gpu, pipeline_name);
     if (!pipeline) return 0;
     const NSUInteger threads = 256;
     if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
