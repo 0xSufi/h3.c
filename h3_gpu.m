@@ -372,11 +372,15 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             if (gpu.tensorOpsEnabled) {
                 gpu.tensorOpsMode = !strcmp(nax, "attn") ? 2u :
                                     !strcmp(nax, "qkv-attn") ? 3u :
-                                    !strcmp(nax, "qkv") ? 4u : 1u;
+                                    !strcmp(nax, "qkv") ? 4u :
+                                    !strcmp(nax, "mlp") ? 5u : 1u;
             }
             if (!gpu.library && wantsTensorOps) {
                 /* TensorOps is optional: an older runtime must retain the
                  * ordinary MPSGraph/direct Metal implementation. */
+                if (getenv("H3_NAX_DIAGNOSTIC"))
+                    fprintf(stderr, "h3: TensorOps compile failed: %s\n",
+                            libraryError.localizedDescription.UTF8String);
                 options.preprocessorMacros = @{};
                 libraryError = nil;
                 gpu.library = [gpu.device newLibraryWithSource:source
@@ -418,8 +422,10 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vae_encoder_pad_f32",
             @"h3_vae_encoder_group_norm_silu_f32"
         ] mutableCopy];
-        if (gpu.tensorOpsEnabled)
+        if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
+            [names addObject:@"h3_fc1_swiglu_bf16_nax_r128"];
+        }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
             id<MTLFunction> function = [gpu.library newFunctionWithName:name];
@@ -470,6 +476,12 @@ int h3_gpu_is_m5(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
     return [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+}
+
+int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
+    if (!opaque) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    return gpu.tensorOpsEnabled && gpu.tensorOpsMode == 5;
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
@@ -2303,6 +2315,94 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_linear_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
+static int h3_gpu_fc1_swiglu_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *input,
+                                      const h3_gpu_tensor *weight,
+                                      uint32_t rows, uint32_t input_dim,
+                                      uint32_t hidden_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu.tensorOpsEnabled ||
+        gpu.tensorOpsMode != 5 ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"NAX FC1 input") ||
+        !h3_gpu_require_bf16(gpu, weight,
+                             (size_t)hidden_dim * 2 * input_dim,
+                             @"NAX FC1 weight") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * hidden_dim,
+                             @"NAX FC1 output") ||
+        !rows || (input_dim % 32) || (hidden_dim % 64) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_fc1_swiglu_bf16_nax_r128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch fused M5 FC1/SwiGLU");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, hidden_dim, 0};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder setThreadgroupMemoryLength:128 * 64 * 2 * sizeof(uint16_t)
+                                   atIndex:0];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((rows + 127) / 128, (hidden_dim + 63) / 64, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_mlp_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                        h3_gpu_tensor *activated,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *fc1_weight,
+                        const h3_gpu_tensor *fc2_weight, uint32_t rows,
+                        uint32_t input_dim, uint32_t hidden_dim,
+                        uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu.tensorOpsEnabled || gpu.tensorOpsMode != 5 || rows < 128 ||
+        (hidden_dim % 32) || (output_dim % 64) ||
+        !h3_gpu_require_bf16(gpu, fc2_weight,
+                             (size_t)output_dim * hidden_dim,
+                             @"NAX FC2 weight") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"NAX FC2 output") ||
+        !h3_gpu_fc1_swiglu_nax_bf16(opaque, activated, input, fc1_weight,
+                                     rows, input_dim, hidden_dim)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_bf16_nax_r128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps FC2");
+        return 0;
+    }
+    linear_args args = {rows, hidden_dim, output_dim, 0};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(activated).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(fc2_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((rows + 127) / 128, (output_dim + 63) / 64, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
 }

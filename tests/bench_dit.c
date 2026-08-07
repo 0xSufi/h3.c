@@ -241,6 +241,86 @@ static double relative_l2(const float *got, const float *want, size_t count,
                                  ? squared_reference : 1e-30));
 }
 
+static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
+                           float *video_velocity, float *audio_velocity) {
+    char error[512];
+    char candidate_blocks[16] = {0};
+    const char *blocks = getenv("H3_BENCH_NAX_COMMAND_BLOCKS");
+    if (blocks) snprintf(candidate_blocks, sizeof(candidate_blocks), "%s",
+                         blocks);
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating NAX MLP AB references");
+    setenv("H3_DISABLE_NAX_MLP", "1", 1);
+    unsetenv("H3_DIT_COMMAND_BLOCKS");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    unsetenv("H3_DISABLE_NAX_MLP");
+    if (candidate_blocks[0])
+        setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int nax_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0;
+    double nax_seconds = 0.0;
+    int baseline_count = 0;
+    int nax_count = 0;
+    double video_rel = 0.0, audio_rel = 0.0;
+    double video_abs = 0.0, audio_abs = 0.0;
+    for (size_t index = 0;
+         index < sizeof(nax_pattern) / sizeof(*nax_pattern); index++) {
+        if (nax_pattern[index]) {
+            unsetenv("H3_DISABLE_NAX_MLP");
+            if (candidate_blocks[0])
+                setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
+            else unsetenv("H3_DIT_COMMAND_BLOCKS");
+        } else {
+            setenv("H3_DISABLE_NAX_MLP", "1", 1);
+            unsetenv("H3_DIT_COMMAND_BLOCKS");
+        }
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (nax_pattern[index]) {
+            video_rel = relative_l2(video_velocity, video_reference,
+                                    VIDEO_ELEMENTS, &video_abs);
+            audio_rel = relative_l2(audio_velocity, audio_reference,
+                                    AUDIO_ELEMENTS, &audio_abs);
+            nax_seconds += elapsed;
+            nax_count++;
+            printf("  NAX MLP AB candidate %.3fs video relL2 %.6g; "
+                   "audio relL2 %.6g\n", elapsed, video_rel, audio_rel);
+        } else {
+            if (memcmp(video_velocity, video_reference,
+                       VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+                memcmp(audio_velocity, audio_reference,
+                       AUDIO_ELEMENTS * sizeof(*audio_reference)))
+                die("repeated MPSGraph MLP changed output bytes");
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  NAX MLP AB baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_NAX_MLP");
+    unsetenv("H3_DIT_COMMAND_BLOCKS");
+    printf("DiT NAX MLP AB baseline %.4fs, NAX %.4fs, ratio %.4f; "
+           "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
+           baseline_seconds / baseline_count, nax_seconds / nax_count,
+           nax_seconds * baseline_count / (baseline_seconds * nax_count),
+           video_rel, video_abs, audio_rel, audio_abs);
+    free(video_reference);
+    free(audio_reference);
+}
+
 static void run_sampler_ab(h3_dit *dit, float *video, float *audio,
                            float *video_velocity, float *audio_velocity) {
     char error[512];
@@ -402,6 +482,16 @@ int main(int argc, char **argv) {
     if (getenv("H3_BENCH_MPS_COMMAND_AB")) {
         run_mps_command_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT 512/%u-layer load %.3fs before MPS-command AB\n",
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (getenv("H3_BENCH_NAX_MLP_AB")) {
+        run_nax_mlp_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT 512/%u-layer load %.3fs before NAX MLP AB\n",
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);

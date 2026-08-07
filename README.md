@@ -120,6 +120,16 @@ library if TensorOps compilation is unavailable. The path passes the complete
 128-row tile while full DiT runs currently favor MPSGraph scheduling. This
 keeps a working NAX integration available for later quantized/fused kernels
 without making a benchmark regression the default.
+`H3_NAX=mlp` selects a more specialized Metal 4 path: paired FC1 gate/up
+TensorOps tiles apply SwiGLU in threadgroup memory and write only the
+14,336-wide activated intermediate, then FC2 also stays on TensorOps.
+`H3_DISABLE_NAX_MLP=1` keeps the MPSGraph MLP in a context created this way for
+same-process A/B testing. The path is deliberately opt-in because scheduling
+depends on the OS GPU stack: the primary macOS 26.5.2 M5 Max gained 1.3-2.0%
+in isolated real-weight MLP runs but lost about 1-3% in a complete 50-block forward,
+while an otherwise identical macOS 26.5 M5 Max gained 1.4% in a same-context
+forward A/B. The resulting 50-block velocities were close (1.9% video and 2.4%
+audio relative L2), but not byte-identical.
 The narrow DiT audio/video output heads convert their small released F32
 weights to BF16 once and use the Iris-derived 16x16 tiled linear directly on
 BF16 activations. At the production 320-render geometry, isolated paired-head

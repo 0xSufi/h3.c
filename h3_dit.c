@@ -43,6 +43,7 @@ struct h3_dit {
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
     int fused_mlp;
+    int nax_mlp;
     int bf16_final;
     unsigned core_reuse_interval;
     unsigned core_forward_count;
@@ -744,8 +745,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     }
     if (!dit->fused_mlp) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
+    }
+    if (!dit->fused_mlp || dit->nax_mlp) {
         dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
-        if (!dit->fc1 || !dit->activated) {
+        if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
                  h3_gpu_error(dit->gpu));
@@ -830,6 +833,7 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -931,7 +935,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
         modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
        "DiT MLP AdaLN");
-    if (dit->fused_mlp) {
+    if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
+        OP(h3_gpu_mlp_nax_bf16(dit->gpu, dit->mlp_output, dit->activated,
+            dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
+            HIDDEN), "DiT NAX fused MLP");
+    } else if (dit->fused_mlp) {
         OP(h3_gpu_mlp_bf16(dit->gpu, dit->mlp_output, dit->mod_mlp,
             weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
            "DiT fused MLP");

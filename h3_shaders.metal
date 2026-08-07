@@ -748,6 +748,65 @@ kernel void h3_linear_bf16_nax_r128(
               execution_simdgroups<4>> mm;
     mm.run(mx, mw, my);
 }
+
+/* Pair the two FC1 halves while the TensorOps accumulators are still local.
+ * Only the post-SwiGLU [rows, hidden_dim] tensor reaches device memory. */
+kernel void h3_fc1_swiglu_bf16_nax_r128(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *output [[buffer(2)]],
+                           constant linear_args &args [[buffer(3)]],
+                           threadgroup bfloat *tiles [[threadgroup(0)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int ROW_TILE = 128;
+    constexpr int COLUMN_TILE = 64;
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim,
+                             (int)args.output_dim * 2));
+    auto mx = x.slice(0, (int)group.x * ROW_TILE);
+    auto mw_gate = w.slice(0, (int)group.y * COLUMN_TILE);
+    auto mw_up = w.slice(0, (int)args.output_dim +
+                            (int)group.y * COLUMN_TILE);
+    threadgroup bfloat *gate_tile = tiles;
+    threadgroup bfloat *up_tile = tiles + ROW_TILE * COLUMN_TILE;
+    auto tg_gate = tensor(gate_tile,
+        dextents<int32_t, 2>(COLUMN_TILE, ROW_TILE));
+    auto tg_up = tensor(up_tile,
+        dextents<int32_t, 2>(COLUMN_TILE, ROW_TILE));
+    matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    {
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(x), decltype(w), bfloat>();
+        mm.run(mx, mw_gate, accum);
+        accum.store(tg_gate);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(x), decltype(w), bfloat>();
+        mm.run(mx, mw_up, accum);
+        accum.store(tg_up);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint row_base = group.x * ROW_TILE;
+    uint column_base = group.y * COLUMN_TILE;
+    for (uint index = tid; index < ROW_TILE * COLUMN_TILE; index += 128) {
+        uint row = row_base + index / COLUMN_TILE;
+        uint column = column_base + index % COLUMN_TILE;
+        if (row < args.rows && column < args.output_dim) {
+            float gate = (float)gate_tile[index];
+            float up = (float)up_tile[index];
+            float activated = gate / (1.0f + exp(-gate)) * up;
+            output[row * args.output_dim + column] = (bfloat)activated;
+        }
+    }
+}
 #endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],

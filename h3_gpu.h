@@ -35,6 +35,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
+int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
@@ -269,6 +270,15 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *fc2_weight, uint32_t rows,
                     uint32_t input_dim, uint32_t hidden_dim,
                     uint32_t output_dim);
+/* Experimental M5 Metal 4 paired FC1/SwiGLU plus direct FC2 path. Available
+ * only when the context was created with H3_NAX=mlp. */
+int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        h3_gpu_tensor *activated,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *fc1_weight,
+                        const h3_gpu_tensor *fc2_weight, uint32_t rows,
+                        uint32_t input_dim, uint32_t hidden_dim,
+                        uint32_t output_dim);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
