@@ -505,7 +505,7 @@ static void run_token_reduction_ab(h3_dit *dit, float *video, float *audio,
 }
 
 static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
-                                   float *audio) {
+                                   float *audio, int reuse_interval) {
     char error[512];
     float *initial_video = malloc(VIDEO_ELEMENTS * sizeof(*initial_video));
     float *initial_audio = malloc(AUDIO_ELEMENTS * sizeof(*initial_audio));
@@ -518,6 +518,7 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
     static const int candidate_pattern[] = {0, 1, 1, 0};
     double baseline_seconds = 0.0, candidate_seconds = 0.0;
     int baseline_count = 0, candidate_count = 0, have_reference = 0;
+    uint64_t candidate_video_hash = 0, candidate_audio_hash = 0;
     double video_relative = 0.0, audio_relative = 0.0;
     double video_absolute = 0.0, audio_absolute = 0.0;
     for (size_t run = 0;
@@ -527,7 +528,7 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
         if (candidate_pattern[run]) unsetenv("H3_DISABLE_TOKEN_REDUCTION");
         else setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
         double start = seconds();
-        if (!h3_dit_denoise_euler(dit, video, audio, 1, NULL, NULL,
+        if (!h3_dit_denoise_euler(dit, video, audio, reuse_interval, NULL, NULL,
                                   error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (!have_reference && !candidate_pattern[run]) {
@@ -538,6 +539,16 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
             have_reference = 1;
         }
         if (candidate_pattern[run]) {
+            uint64_t video_hash = hash_bytes(
+                video, VIDEO_ELEMENTS * sizeof(*video));
+            uint64_t audio_hash = hash_bytes(
+                audio, AUDIO_ELEMENTS * sizeof(*audio));
+            if (candidate_count &&
+                (video_hash != candidate_video_hash ||
+                 audio_hash != candidate_audio_hash))
+                die("token-reduction denoise candidate changed output bytes");
+            candidate_video_hash = video_hash;
+            candidate_audio_hash = audio_hash;
             video_relative = relative_l2(video, reference_video,
                                          VIDEO_ELEMENTS, &video_absolute);
             audio_relative = relative_l2(audio, reference_audio,
@@ -567,6 +578,10 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
            candidate_seconds * baseline_count /
                (baseline_seconds * candidate_count),
            video_relative, video_absolute, audio_relative, audio_absolute);
+    printf("token reduction denoise reuse-%d hashes video %016llx audio "
+           "%016llx\n", reuse_interval,
+           (unsigned long long)candidate_video_hash,
+           (unsigned long long)candidate_audio_hash);
     free(initial_video); free(initial_audio);
     free(reference_video); free(reference_audio);
 }
@@ -608,6 +623,7 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
     unsigned active_blocks = 50;
+    int reuse_interval = 1;
     const char *layers = getenv("H3_BENCH_LAYERS");
     if (layers && *layers) {
         char *end = NULL;
@@ -615,6 +631,14 @@ int main(int argc, char **argv) {
         if (end == layers || *end || parsed < 25 || parsed > 50)
             die("H3_BENCH_LAYERS must be in [25, 50]");
         active_blocks = (unsigned)parsed;
+    }
+    const char *reuse = getenv("H3_BENCH_REUSE");
+    if (reuse && *reuse) {
+        char *end = NULL;
+        long parsed = strtol(reuse, &end, 10);
+        if (end == reuse || *end || parsed < 1 || parsed > 3)
+            die("H3_BENCH_REUSE must be in [1, 3]");
+        reuse_interval = (int)parsed;
     }
     double load_start = seconds();
     h3_dit *dit = h3_dit_load_t2va(
@@ -681,7 +705,8 @@ int main(int argc, char **argv) {
     }
     if (token_reduction_ab) {
         if (!strcmp(getenv("H3_BENCH_TOKEN_REDUCTION_AB"), "denoise"))
-            run_token_reduction_denoise_ab(dit, video, audio);
+            run_token_reduction_denoise_ab(dit, video, audio,
+                                           reuse_interval);
         else
             run_token_reduction_ab(dit, video, audio, video_velocity,
                                    audio_velocity);

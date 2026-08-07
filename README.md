@@ -41,6 +41,9 @@ make test
   --width 512 --height 512 --frames 22 --steps 20 --core-reuse 4 \
   -o outputs/fast-surfer.mp4
 ./h3 --profile -d MiniMax-H3 -p "A red fox walking through snow" \
+  --width 512 --height 512 --frames 22 --steps 20 \
+  --layers 45 --reuse 2 --token-reduction -o outputs/fast-fox.mp4
+./h3 --profile -d MiniMax-H3 -p "A red fox walking through snow" \
   --width 512 --height 512 --render-width 384 --render-height 384 \
   --frames 22 --steps 20 --reuse 3 -o outputs/fast-scaled-fox.mp4
 ```
@@ -108,6 +111,12 @@ therefore opt-in rather than the close-reference default.
 `H3_TOKEN_REDUCTION_BLOCKS` can override the later `10:30` interval;
 `H3_TOKEN_REDUCTION_EARLY=STEPS:END` overrides the early schedule and `0`
 disables it. `H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
+Token reduction composes cleanly with the validated `--layers 45 --reuse 2`
+settings: on the same 512 benchmark it reduced that profile from 16.69 to
+12.60 seconds (24.5% marginal), and independent fox and surfer renders stayed
+coherent. Do not combine it with both `--layers 40` and `--reuse 3`; that
+6.47-second experiment produced chromatic ringing and ghosted limbs despite
+acceptable latent norms.
 `--render-width` and `--render-height` run the model and VAE on a lower
 same-aspect internal canvas, then high-quality vImage-scale RGB frames to the
 requested output size before callbacks, terminal display, and encoding. This is an
