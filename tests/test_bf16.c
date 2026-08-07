@@ -6,12 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     SEQUENCE = 32, HIDDEN = 256, HEADS = 4, HEAD_DIM = 32,
     INNER = HEADS * HEAD_DIM, FFN = 128, T_ROWS = 2, T_DIM = 32,
     MODALITIES = 3, MODULATION_SLOTS = 6, ROPE_HALF = 12,
-    MAX_TENSORS = 64
+    MAX_TENSORS = 80
 };
 
 typedef struct {
@@ -211,6 +212,191 @@ static void test_token_reduction_kernels(test_context *test) {
     require(memcmp(got_expanded, expected_expanded,
                    sizeof(got_expanded)) == 0,
             "token expansion lost the full-grid residual");
+
+    const float norm_values[WIDTH] = {1.0f, 0.5f, 1.5f, 2.0f};
+    const float modulation_values[2 * 2 * WIDTH] = {
+         0.25f, -0.5f, 0.75f, -1.0f,
+         0.0f,   0.5f, 0.25f, -0.25f,
+        -0.75f,  0.5f, 0.25f,  1.0f,
+         0.25f,  0.0f, 0.75f, -0.5f
+    };
+    const uint32_t row_map[FULL_ROWS] = {0, 1, 0, 1, 0, 1};
+    uint16_t norm_bf16[WIDTH];
+    uint16_t modulation_bf16[2 * 2 * WIDTH];
+    for (size_t index = 0; index < WIDTH; index++)
+        norm_bf16[index] = f32_to_bf16(norm_values[index]);
+    for (size_t index = 0; index < 2 * 2 * WIDTH; index++)
+        modulation_bf16[index] = f32_to_bf16(modulation_values[index]);
+    h3_gpu_tensor *norm = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, norm_bf16, WIDTH));
+    h3_gpu_tensor *modulation = own(test, h3_gpu_tensor_from_bf16(
+        test->gpu, modulation_bf16, 2 * 2 * WIDTH));
+    h3_gpu_tensor *gpu_row_map = own(test, h3_gpu_tensor_from_u32(
+        test->gpu, row_map, FULL_ROWS));
+    h3_gpu_tensor *adaln_reference = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *fused_expanded = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *fused_adaln = fresh(test, FULL_ROWS * WIDTH);
+    require_gpu(test, h3_gpu_begin(test->gpu),
+                "begin fused token AdaLN command stream");
+    require_gpu(test, h3_gpu_adaln_bf16(
+        test->gpu, adaln_reference, expanded, norm, modulation, gpu_row_map,
+        FULL_ROWS, WIDTH, 2, 0, 1, 1e-5f),
+        "encode reference token AdaLN");
+    require_gpu(test, h3_gpu_token_expand_adaln_bf16(
+        test->gpu, fused_expanded, fused_adaln, original, PADDING,
+        processed, pooled, REDUCED_ROWS * WIDTH, gpu_baseline_indices,
+        gpu_parents, norm, modulation, gpu_row_map, FULL_ROWS, REDUCED_ROWS,
+        BASELINE_ROWS, WIDTH, 1, 1.0f, 2, 0, 1, 1e-5f),
+        "encode fused token expansion and AdaLN");
+    require_gpu(test, h3_gpu_submit(test->gpu),
+                "submit fused token AdaLN command stream");
+    uint16_t got_fused_expanded[FULL_ROWS * WIDTH];
+    uint16_t got_adaln_reference[FULL_ROWS * WIDTH];
+    uint16_t got_fused_adaln[FULL_ROWS * WIDTH];
+    require(h3_gpu_tensor_read_bf16(
+                fused_expanded, got_fused_expanded, FULL_ROWS * WIDTH),
+            "cannot read fused restored tokens");
+    require(h3_gpu_tensor_read_bf16(
+                adaln_reference, got_adaln_reference, FULL_ROWS * WIDTH),
+            "cannot read reference restored AdaLN");
+    require(h3_gpu_tensor_read_bf16(
+                fused_adaln, got_fused_adaln, FULL_ROWS * WIDTH),
+            "cannot read fused restored AdaLN");
+    require(memcmp(got_fused_expanded, expected_expanded,
+                   sizeof(got_fused_expanded)) == 0,
+            "fused token AdaLN changed the restored residual");
+    require(memcmp(got_fused_adaln, got_adaln_reference,
+                   sizeof(got_fused_adaln)) == 0,
+            "fused token AdaLN differs from the exact two-kernel path");
+}
+
+static double monotonic_seconds(void) {
+    struct timespec value;
+    require(clock_gettime(CLOCK_MONOTONIC, &value) == 0,
+            "cannot read monotonic clock");
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+static void bench_token_expand_adaln(test_context *test) {
+    enum {
+        ROWS = 2915, REDUCED_ROWS = 1550, PREFIX_ROWS = 80,
+        BASELINE_ROWS = 1365, WIDTH = 4096, SLOTS = 6, ITERATIONS = 64
+    };
+    uint32_t *baseline_indices = malloc(
+        REDUCED_ROWS * sizeof(*baseline_indices));
+    uint32_t *parents = malloc(ROWS * sizeof(*parents));
+    uint32_t *row_map = calloc(ROWS, sizeof(*row_map));
+    require(baseline_indices && parents && row_map,
+            "token AdaLN benchmark map allocation failed");
+    for (uint32_t row = 0; row < PREFIX_ROWS; row++) {
+        baseline_indices[row] = UINT32_MAX;
+        parents[row] = row;
+    }
+    uint32_t baseline_row = 0;
+    for (uint32_t local = 0; local < ROWS - PREFIX_ROWS; local++) {
+        uint32_t spatial_row = local / 27;
+        uint32_t column = local % 27;
+        parents[PREFIX_ROWS + local] = PREFIX_ROWS + spatial_row * 14 +
+                                      column / 2;
+    }
+    for (uint32_t local = 0; local < REDUCED_ROWS - PREFIX_ROWS; local++) {
+        uint32_t column = local % 14;
+        baseline_indices[PREFIX_ROWS + local] = column < 13 ?
+            baseline_row++ : UINT32_MAX;
+    }
+    require(baseline_row == BASELINE_ROWS,
+            "token AdaLN benchmark map is inconsistent");
+    h3_gpu_tensor *original = fresh(test, (size_t)ROWS * WIDTH);
+    h3_gpu_tensor *reduced = fresh(test,
+        (size_t)(REDUCED_ROWS + BASELINE_ROWS) * WIDTH);
+    h3_gpu_tensor *residual = fresh(test, (size_t)ROWS * WIDTH);
+    h3_gpu_tensor *output = fresh(test, (size_t)ROWS * WIDTH);
+    h3_gpu_tensor *norm = fresh(test, WIDTH);
+    h3_gpu_tensor *modulation = fresh(test, (size_t)SLOTS * WIDTH);
+    h3_gpu_tensor *gpu_baseline_indices = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, baseline_indices, REDUCED_ROWS));
+    h3_gpu_tensor *gpu_parents = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, parents, ROWS));
+    h3_gpu_tensor *gpu_row_map = own(test,
+        h3_gpu_tensor_from_u32(test->gpu, row_map, ROWS));
+    free(baseline_indices);
+    free(parents);
+    free(row_map);
+
+    require_gpu(test, h3_gpu_begin(test->gpu),
+                "begin token AdaLN microbenchmark warmup");
+    for (int warm = 0; warm < 16; warm++) {
+        require_gpu(test, h3_gpu_token_expand_delta_bf16(
+            test->gpu, residual, original, 0, reduced, reduced,
+            (size_t)REDUCED_ROWS * WIDTH, gpu_baseline_indices, gpu_parents,
+            ROWS, REDUCED_ROWS, BASELINE_ROWS, WIDTH, PREFIX_ROWS, 1.0f),
+            "encode token expansion warmup");
+        require_gpu(test, h3_gpu_adaln_bf16(
+            test->gpu, output, residual, norm, modulation, gpu_row_map,
+            ROWS, WIDTH, SLOTS, 0, 1, 1e-5f),
+            "encode token AdaLN warmup");
+        require_gpu(test, h3_gpu_token_expand_adaln_bf16(
+            test->gpu, residual, output, original, 0, reduced, reduced,
+            (size_t)REDUCED_ROWS * WIDTH, gpu_baseline_indices, gpu_parents,
+            norm, modulation, gpu_row_map, ROWS, REDUCED_ROWS, BASELINE_ROWS,
+            WIDTH, PREFIX_ROWS, 1.0f, SLOTS, 0, 1, 1e-5f),
+            "encode fused token AdaLN warmup");
+    }
+    require_gpu(test, h3_gpu_submit(test->gpu),
+                "submit token AdaLN microbenchmark warmup");
+
+    static const int fused_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double old_seconds = 0.0, fused_seconds = 0.0;
+    int old_count = 0, fused_count = 0;
+    for (size_t sample = 0;
+         sample < sizeof(fused_pattern) / sizeof(*fused_pattern); sample++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu),
+                    "begin token AdaLN microbenchmark");
+        for (int iteration = 0; iteration < ITERATIONS; iteration++) {
+            if (fused_pattern[sample]) {
+                require_gpu(test, h3_gpu_token_expand_adaln_bf16(
+                    test->gpu, residual, output, original, 0, reduced,
+                    reduced, (size_t)REDUCED_ROWS * WIDTH,
+                    gpu_baseline_indices, gpu_parents, norm, modulation,
+                    gpu_row_map, ROWS, REDUCED_ROWS, BASELINE_ROWS, WIDTH,
+                    PREFIX_ROWS, 1.0f, SLOTS, 0, 1, 1e-5f),
+                    "encode fused token AdaLN microbenchmark");
+            } else {
+                require_gpu(test, h3_gpu_token_expand_delta_bf16(
+                    test->gpu, residual, original, 0, reduced, reduced,
+                    (size_t)REDUCED_ROWS * WIDTH, gpu_baseline_indices,
+                    gpu_parents, ROWS, REDUCED_ROWS, BASELINE_ROWS, WIDTH,
+                    PREFIX_ROWS, 1.0f),
+                    "encode token expansion microbenchmark");
+                require_gpu(test, h3_gpu_adaln_bf16(
+                    test->gpu, output, residual, norm, modulation,
+                    gpu_row_map, ROWS, WIDTH, SLOTS, 0, 1, 1e-5f),
+                    "encode token AdaLN microbenchmark");
+            }
+        }
+        require_gpu(test, h3_gpu_submit(test->gpu),
+                    "submit token AdaLN microbenchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (fused_pattern[sample]) {
+            fused_seconds += elapsed;
+            fused_count++;
+            printf("  fused token AdaLN %.6fs\n",
+                   elapsed / (double)ITERATIONS);
+        } else {
+            old_seconds += elapsed;
+            old_count++;
+            printf("  separate token AdaLN %.6fs\n",
+                   elapsed / (double)ITERATIONS);
+        }
+    }
+    double old_average = old_seconds / old_count / (double)ITERATIONS;
+    double fused_average = fused_seconds / fused_count / (double)ITERATIONS;
+    printf("token AdaLN microbenchmark separate %.6fs, fused %.6fs, "
+           "ratio %.4f\n", old_average, fused_average,
+           fused_average / old_average);
 }
 
 static void test_euler_update(test_context *test) {
@@ -310,6 +496,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL tests/test_bf16.c: %s\n", error);
         h3_st_free_header(&test.fixture);
         return 1;
+    }
+    if (getenv("H3_BENCH_TOKEN_ADALN")) {
+        bench_token_expand_adaln(&test);
+        cleanup(&test);
+        return 0;
     }
     test_euler_update(&test);
     test_token_reduction_kernels(&test);

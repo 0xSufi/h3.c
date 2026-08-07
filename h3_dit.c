@@ -1252,7 +1252,33 @@ static int leave_token_reduction(h3_dit *dit, char *error,
     return 1;
 }
 
+static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
+                                       int step, char *error,
+                                       size_t error_size) {
+    h3_gpu_tensor *original = dit->token_original_in_qkv ?
+        dit->qkv : dit->token_original;
+    h3_dit_block *weight = &dit->blocks[block];
+    const h3_gpu_tensor *modulation = h3_dit_schedule_block(
+        dit->schedule, block);
+    if (!gpu_op(dit, h3_gpu_token_expand_adaln_bf16(
+            dit->gpu, dit->attention_output, dit->mod_attention,
+            original, dit->token_original_offset, dit->hidden, dit->hidden,
+            dit->token_baseline_offset, dit->token_baseline_indices,
+            dit->token_expand_parents, weight->norm1, modulation,
+            dit->row_maps[step], dit->sequence, dit->reduced_sequence,
+            dit->token_baseline_rows, HIDDEN, dit->video_target_start,
+            dit->token_reduction_scale, SLOTS, 0, 1, 1e-5f),
+            error, error_size, "restore tokens and apply attention AdaLN"))
+        return 0;
+    h3_gpu_tensor *reduced = dit->hidden;
+    dit->hidden = dit->attention_output;
+    dit->attention_output = reduced;
+    dit->token_reduction_active = 0;
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
+                     int attention_adaln_ready,
                      char *error, size_t error_size) {
     h3_dit_block *weight = &dit->blocks[index];
     const h3_gpu_tensor *modulation = h3_dit_schedule_block(dit->schedule,
@@ -1268,9 +1294,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
-    OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
-        weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS, 0, 1, 1e-5f),
-       "DiT attention AdaLN");
+    if (!attention_adaln_ready)
+        OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
+            weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
+            0, 1, 1e-5f), "DiT attention AdaLN");
     OP(h3_gpu_linear_bf16(dit->gpu, dit->qkv, dit->mod_attention,
         weight->qkv, NULL, rows, HIDDEN, INNER * 3), "DiT QKV");
     OP(h3_gpu_grouped_qkv_rope_bf16(
@@ -1378,14 +1405,22 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            int fused_token_adaln = 0;
             if (use_token_reduction &&
                 block == dit->token_reduction_begin &&
                 !enter_token_reduction(dit, error, error_size)) return 0;
-            if (use_token_reduction &&
-                block == token_reduction_end &&
-                !leave_token_reduction(dit, error, error_size)) return 0;
+            if (use_token_reduction && block == token_reduction_end) {
+                fused_token_adaln = dit->block_active[block] &&
+                    !getenv("H3_DISABLE_FUSED_TOKEN_ADALN");
+                if (fused_token_adaln) {
+                    if (!leave_token_reduction_adaln(
+                            dit, block, step, error, error_size)) return 0;
+                } else if (!leave_token_reduction(
+                               dit, error, error_size)) return 0;
+            }
             if (!dit->block_active[block]) continue;
-            if (!run_block(dit, block, step, error, error_size)) return 0;
+            if (!run_block(dit, block, step, fused_token_adaln,
+                           error, error_size)) return 0;
             completed_blocks++;
             if (command_blocks &&
                 completed_blocks < dit->active_block_count &&

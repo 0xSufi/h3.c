@@ -1447,6 +1447,89 @@ kernel void h3_token_expand_delta_bf16(
     }
 }
 
+struct h3_token_expand_adaln_args {
+    uint original_offset;
+    uint baseline_offset;
+    uint rows;
+    uint width;
+    uint exact_prefix_rows;
+    uint slots;
+    uint shift_slot;
+    uint scale_slot;
+    float update_scale;
+    float epsilon;
+};
+
+/* H3's hidden width is 4096. Keep the restored BF16 row in 8 KiB of
+ * threadgroup memory across the reduction instead of writing and then
+ * rereading the residual globally. The host caps width at 4096. */
+kernel void h3_token_expand_adaln_bf16(
+                         device const ushort *original [[buffer(0)]],
+                         device const ushort *reduced [[buffer(1)]],
+                         device const ushort *baseline [[buffer(2)]],
+                         device const uint *baseline_indices [[buffer(3)]],
+                         device const uint *parents [[buffer(4)]],
+                         device ushort *residual [[buffer(5)]],
+                         device const ushort *weight [[buffer(6)]],
+                         device const ushort *modulation [[buffer(7)]],
+                         device const uint *row_map [[buffer(8)]],
+                         device ushort *output [[buffer(9)]],
+                         constant h3_token_expand_adaln_args &args
+                             [[buffer(10)]],
+                         uint3 group [[threadgroup_position_in_grid]],
+                         uint3 thread_position
+                             [[thread_position_in_threadgroup]],
+                         uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    threadgroup ushort restored_values[4096];
+    uint parent = parents[row];
+    uint baseline_row = baseline_indices[parent];
+    bool direct = row < args.exact_prefix_rows ||
+                  baseline_row == 0xffffffffu;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += threads) {
+        uint destination = row * args.width + column;
+        uint reduced_index = parent * args.width + column;
+        ushort restored = reduced[reduced_index];
+        if (!direct) {
+            uint baseline_index = args.baseline_offset +
+                baseline_row * args.width + column;
+            float update = h3_bf16_to_f32(restored) -
+                           h3_bf16_to_f32(baseline[baseline_index]);
+            restored = h3_f32_to_bf16(
+                h3_bf16_to_f32(
+                    original[args.original_offset + destination]) +
+                args.update_scale * update);
+        }
+        restored_values[column] = restored;
+        residual[destination] = restored;
+        float value = h3_bf16_to_f32(restored);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    uint base = row_map[row] * args.slots * args.width;
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_to_f32(restored_values[column]) * inverse *
+            h3_bf16_to_f32(weight[column]);
+        float shift = h3_bf16_to_f32(
+            modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_to_f32(
+            modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] =
+            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+    }
+}
+
 struct h3_euler_args {
     uint sample_offset;
     uint elements;

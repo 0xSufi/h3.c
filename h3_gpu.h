@@ -405,6 +405,24 @@ int h3_gpu_token_expand_delta_bf16(
                            uint32_t width,
                            uint32_t exact_prefix_rows,
                            float update_scale);
+int h3_gpu_token_expand_adaln_bf16(
+                           h3_gpu *gpu, h3_gpu_tensor *residual,
+                           h3_gpu_tensor *output,
+                           const h3_gpu_tensor *original,
+                           size_t original_offset,
+                           const h3_gpu_tensor *reduced,
+                           const h3_gpu_tensor *baseline,
+                           size_t baseline_offset,
+                           const h3_gpu_tensor *baseline_indices,
+                           const h3_gpu_tensor *parents,
+                           const h3_gpu_tensor *norm_weight,
+                           const h3_gpu_tensor *modulation,
+                           const h3_gpu_tensor *row_map,
+                           uint32_t rows, uint32_t reduced_rows,
+                           uint32_t baseline_rows, uint32_t width,
+                           uint32_t exact_prefix_rows, float update_scale,
+                           uint32_t slots, uint32_t shift_slot,
+                           uint32_t scale_slot, float epsilon);
 /* Apply one Euler step to an F32 sample range from BF16 velocity caches:
  * sample += delta * (last + ratio * (last - previous)). */
 int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
