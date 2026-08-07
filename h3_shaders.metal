@@ -18,6 +18,16 @@ inline ushort h3_f32_to_bf16(float value) {
     return ushort(bits >> 16);
 }
 
+inline float4 h3_bf16x4_to_f32(ushort4 value) {
+    return as_type<float4>(uint4(value) << 16);
+}
+
+inline ushort4 h3_f32x4_to_bf16(float4 value) {
+    uint4 bits = as_type<uint4>(value);
+    bits += uint4(0x7fffu) + ((bits >> 16) & uint4(1u));
+    return ushort4(bits >> 16);
+}
+
 struct linear_args {
     uint rows;
     uint input_dim;
@@ -1811,7 +1821,7 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
         uint row = row_start + tid;
         if (tid < TILE && row < args.rows) {
             float sum = 0.0f;
-            if (args.head_major == 2) {
+            if (args.head_major & 2u) {
                 device const bfloat4 *destination4 =
                     reinterpret_cast<device const bfloat4 *>(destination);
                 uint vector_base = row * (TILE / 4);
@@ -1833,7 +1843,57 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
-        for (uint unit = tid; unit < TILE * NORMALIZED_UNITS; unit += 256) {
+        if (args.head_major & 4u) {
+            constexpr uint PACKED_UNITS = NORMALIZED_UNITS / 4;
+            device ushort4 *destination4 =
+                reinterpret_cast<device ushort4 *>(destination);
+            device const ushort4 *norm_weight4 =
+                reinterpret_cast<device const ushort4 *>(norm_weight);
+            device const ushort4 *rope_cos4 =
+                reinterpret_cast<device const ushort4 *>(rope_cos);
+            device const ushort4 *rope_sin4 =
+                reinterpret_cast<device const ushort4 *>(rope_sin);
+            for (uint unit = tid; unit < TILE * PACKED_UNITS; unit += 256) {
+                uint local_row = unit / PACKED_UNITS;
+                uint part = unit - local_row * PACKED_UNITS;
+                uint global_row = row_start + local_row;
+                if (global_row >= args.rows) continue;
+                uint base4 = global_row * (TILE / 4);
+                float inv = inverse[local_row];
+                if (part < ROPE_PAIRS / 4) {
+                    uint upper = part + ROPE_PAIRS / 4;
+                    ushort4 lower_bits = destination4[base4 + part];
+                    ushort4 upper_bits = destination4[base4 + upper];
+                    ushort4 lower_norm = norm_weight4[part];
+                    ushort4 upper_norm = norm_weight4[upper];
+                    float4 lower_value = h3_bf16x4_to_f32(lower_bits) * inv *
+                        h3_bf16x4_to_f32(lower_norm);
+                    float4 upper_value = h3_bf16x4_to_f32(upper_bits) * inv *
+                        h3_bf16x4_to_f32(upper_norm);
+                    uint rope_base = global_row * (args.rope_half / 4);
+                    ushort4 cosine_bits = rope_cos4[rope_base + part];
+                    ushort4 sine_bits = rope_sin4[rope_base + part];
+                    float4 cosine = h3_bf16x4_to_f32(cosine_bits);
+                    float4 sine = h3_bf16x4_to_f32(sine_bits);
+                    float4 lower_output = lower_value * cosine -
+                        upper_value * sine;
+                    float4 upper_output = upper_value * cosine +
+                        lower_value * sine;
+                    destination4[base4 + part] =
+                        h3_f32x4_to_bf16(lower_output);
+                    destination4[base4 + upper] =
+                        h3_f32x4_to_bf16(upper_output);
+                } else {
+                    uint dimension = part + ROPE_PAIRS / 4;
+                    ushort4 value_bits = destination4[base4 + dimension];
+                    ushort4 norm_bits = norm_weight4[dimension];
+                    destination4[base4 + dimension] = h3_f32x4_to_bf16(
+                        h3_bf16x4_to_f32(value_bits) * inv *
+                        h3_bf16x4_to_f32(norm_bits));
+                }
+            }
+        } else for (uint unit = tid; unit < TILE * NORMALIZED_UNITS;
+                    unit += 256) {
             uint local_row = unit / NORMALIZED_UNITS;
             uint part = unit - local_row * NORMALIZED_UNITS;
             uint global_row = row_start + local_row;
@@ -1947,7 +2007,7 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
             scratch[TILE + tid] = (float)norm_weight[tid];
             if (row < args.rows) {
                 float sum = 0.0f;
-                if (args.head_major == 2) {
+                if (args.head_major & 2u) {
                     device const bfloat4 *destination4 =
                         reinterpret_cast<device const bfloat4 *>(destination);
                     uint vector_base = row * (TILE / 4);
@@ -1970,7 +2030,54 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint unit = tid; unit < TILE * NORMALIZED_UNITS; unit += 256) {
+        if (args.head_major & 4u) {
+            constexpr uint PACKED_UNITS = NORMALIZED_UNITS / 4;
+            device ushort4 *destination4 =
+                reinterpret_cast<device ushort4 *>(destination);
+            device const ushort4 *rope_cos4 =
+                reinterpret_cast<device const ushort4 *>(rope_cos);
+            device const ushort4 *rope_sin4 =
+                reinterpret_cast<device const ushort4 *>(rope_sin);
+            threadgroup float4 *norm_weight4 =
+                reinterpret_cast<threadgroup float4 *>(scratch + TILE);
+            for (uint unit = tid; unit < TILE * PACKED_UNITS; unit += 256) {
+                uint local_row = unit / PACKED_UNITS;
+                uint part = unit - local_row * PACKED_UNITS;
+                uint global_row = row_start + local_row;
+                if (global_row >= args.rows) continue;
+                uint base4 = global_row * (TILE / 4);
+                float inv = scratch[local_row];
+                if (part < ROPE_PAIRS / 4) {
+                    uint upper = part + ROPE_PAIRS / 4;
+                    ushort4 lower_bits = destination4[base4 + part];
+                    ushort4 upper_bits = destination4[base4 + upper];
+                    float4 lower_value = h3_bf16x4_to_f32(lower_bits) * inv *
+                        norm_weight4[part];
+                    float4 upper_value = h3_bf16x4_to_f32(upper_bits) * inv *
+                        norm_weight4[upper];
+                    uint rope_base = global_row * (args.rope_half / 4);
+                    ushort4 cosine_bits = rope_cos4[rope_base + part];
+                    ushort4 sine_bits = rope_sin4[rope_base + part];
+                    float4 cosine = h3_bf16x4_to_f32(cosine_bits);
+                    float4 sine = h3_bf16x4_to_f32(sine_bits);
+                    float4 lower_output = lower_value * cosine -
+                        upper_value * sine;
+                    float4 upper_output = upper_value * cosine +
+                        lower_value * sine;
+                    destination4[base4 + part] =
+                        h3_f32x4_to_bf16(lower_output);
+                    destination4[base4 + upper] =
+                        h3_f32x4_to_bf16(upper_output);
+                } else {
+                    uint dimension = part + ROPE_PAIRS / 4;
+                    ushort4 value_bits = destination4[base4 + dimension];
+                    destination4[base4 + dimension] = h3_f32x4_to_bf16(
+                        h3_bf16x4_to_f32(value_bits) * inv *
+                        norm_weight4[dimension]);
+                }
+            }
+        } else for (uint unit = tid; unit < TILE * NORMALIZED_UNITS;
+                    unit += 256) {
             uint local_row = unit / NORMALIZED_UNITS;
             uint part = unit - local_row * NORMALIZED_UNITS;
             uint global_row = row_start + local_row;
@@ -3016,7 +3123,7 @@ kernel void h3_gate_adaln_bf16_exact_simd(
  * gated row is overwritten in-place by the rounded AdaLN row once its RMS is
  * known, so exact standalone-quantizer bytes need only one 10.5 KiB row in
  * threadgroup memory and never round-trip through device BF16 memory. */
-kernel void h3_gate_adaln_quantize_int8(
+kernel void h3_gate_adaln_quantize_int8_scalar(
                          device const ushort *residual [[buffer(0)]],
                          device const ushort *branch [[buffer(1)]],
                          device const ushort *gate_modulation [[buffer(2)]],
@@ -3096,6 +3203,124 @@ kernel void h3_gate_adaln_quantize_int8(
         int value = (int)rint(
             h3_bf16_to_f32(gated_values[column]) * quantize_scale);
         quantized[row_base + column] = (int8_t)clamp(value, -127, 127);
+    }
+}
+
+/* The full H3 width is a multiple of four. Load every row stream as four
+ * adjacent BF16 values so each pass issues a quarter as many memory
+ * instructions while retaining the same BF16 rounding boundaries. */
+kernel void h3_gate_adaln_quantize_int8(
+                         device const ushort *residual [[buffer(0)]],
+                         device const ushort *branch [[buffer(1)]],
+                         device const ushort *gate_modulation [[buffer(2)]],
+                         device const uint *row_map [[buffer(3)]],
+                         device const ushort *weight [[buffer(4)]],
+                         device const ushort *norm_modulation [[buffer(5)]],
+                         device ushort *gated_residual [[buffer(6)]],
+                         device int8_t *quantized [[buffer(7)]],
+                         device float *quantized_scales [[buffer(8)]],
+                         constant h3_gate_adaln_args &args [[buffer(9)]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]],
+                         uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint VECTOR_WIDTH = 5376 / 4;
+    if (row >= args.rows) {
+        device char4 *quantized4 =
+            reinterpret_cast<device char4 *>(quantized);
+        uint quantized_base = row * VECTOR_WIDTH;
+        for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256)
+            quantized4[quantized_base + vector] = char4(0);
+        if (tid == 0) quantized_scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float reductions[256];
+    threadgroup ushort4 gated_values[VECTOR_WIDTH];
+    threadgroup float inverse_value;
+    threadgroup float max_scratch[8];
+    uint base = row_map[row] * args.slots * args.width;
+    uint vector_base = row * VECTOR_WIDTH;
+    uint modulation_base = base / 4;
+    device const ushort4 *residual4 =
+        reinterpret_cast<device const ushort4 *>(residual);
+    device const ushort4 *branch4 =
+        reinterpret_cast<device const ushort4 *>(branch);
+    device const ushort4 *gate4 =
+        reinterpret_cast<device const ushort4 *>(gate_modulation);
+    device ushort4 *gated_residual4 =
+        reinterpret_cast<device ushort4 *>(gated_residual);
+    for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
+        ushort4 residual_bits = residual4[vector_base + vector];
+        ushort4 branch_bits = branch4[vector_base + vector];
+        ushort4 gate_bits = gate4[modulation_base +
+            args.gate_slot * VECTOR_WIDTH + vector];
+        float4 gated_float = h3_bf16x4_to_f32(residual_bits) +
+            h3_bf16x4_to_f32(branch_bits) * h3_bf16x4_to_f32(gate_bits);
+        ushort4 gated = h3_f32x4_to_bf16(gated_float);
+        gated_residual4[vector_base + vector] = gated;
+        gated_values[vector] = gated;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup ushort *gated_scalars =
+        reinterpret_cast<threadgroup ushort *>(gated_values);
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += 256) {
+        float value = h3_bf16_to_f32(gated_scalars[column]);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride >= 32; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < 32) {
+        float sum = reductions[tid];
+        for (uint stride = 16; stride; stride >>= 1) {
+            float partner = simd_shuffle_down(sum, stride);
+            if (tid < stride) sum += partner;
+        }
+        if (tid == 0)
+            inverse_value = rsqrt(sum / float(args.width) + args.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const ushort4 *weight4 =
+        reinterpret_cast<device const ushort4 *>(weight);
+    device const ushort4 *norm_modulation4 =
+        reinterpret_cast<device const ushort4 *>(norm_modulation);
+    float inverse = inverse_value;
+    float local_max = 0.0f;
+    for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
+        ushort4 gated = gated_values[vector];
+        ushort4 norm_bits = weight4[vector];
+        ushort4 shift_bits = norm_modulation4[modulation_base +
+            args.shift_slot * VECTOR_WIDTH + vector];
+        ushort4 scale_bits = norm_modulation4[modulation_base +
+            args.scale_slot * VECTOR_WIDTH + vector];
+        float4 normalized = h3_bf16x4_to_f32(gated) * inverse *
+            h3_bf16x4_to_f32(norm_bits);
+        float4 value_float = normalized *
+            (float4(1.0f) + h3_bf16x4_to_f32(scale_bits)) +
+            h3_bf16x4_to_f32(shift_bits);
+        ushort4 value = h3_f32x4_to_bf16(value_float);
+        gated_values[vector] = value;
+        float4 rounded = h3_bf16x4_to_f32(value);
+        local_max = max(local_max,
+            max(max(fabs(rounded.x), fabs(rounded.y)),
+                max(fabs(rounded.z), fabs(rounded.w))));
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, max_scratch, simdgroup, lane);
+    float output_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    float quantize_scale = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0) quantized_scales[row] = output_scale;
+    device char4 *quantized4 = reinterpret_cast<device char4 *>(quantized);
+    for (uint vector = tid; vector < VECTOR_WIDTH; vector += 256) {
+        ushort4 bits = gated_values[vector];
+        int4 value = int4(rint(
+            h3_bf16x4_to_f32(bits) * quantize_scale));
+        quantized4[vector_base + vector] =
+            char4(clamp(value, int4(-127), int4(127)));
     }
 }
 

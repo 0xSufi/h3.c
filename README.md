@@ -607,10 +607,23 @@ gated AdaLN kernel. This removes 99 standalone quantizer dispatches per
 512/864 measurements by about 0.3-0.6%. Use
 `--use-slower-unfused-int8-inputs` to restore the standalone quantizers.
 
+The fused gated-AdaLN path loads its full 5,376-wide H3 rows as BF16x4 vectors
+and writes int8x4. It stages the rounded values locally before computing the
+original per-thread RMS sequence, so the reduction tree and every output byte
+remain unchanged. Crossed measurements save roughly another 0.1-0.5%. The
+existing `--use-slower-unfused-int8-inputs` option retains the portable scalar
+and standalone-quantizer fallback.
+
 Q/K RMS normalization and RoPE are performed inside the int8 QKV projection
 tile as well. The fused epilogue is byte-identical and improves complete
 forwards by 2.1-3.2% at 512 and 1.0-1.8% at 864 in crossed M5 measurements.
 Use `--use-slower-unfused-qkv-rope` to restore the separate Q/K kernel.
+
+That epilogue processes four adjacent Q/K dimensions per work item with
+BF16x4 loads and stores. The per-element arithmetic and BF16 rounding order are
+unchanged, while crossed cool-state measurements improve complete forwards by
+about 0.4-1.0% at both 512 and 864. The same
+`--use-slower-unfused-qkv-rope` option restores the scalar standalone path.
 
 At up to 2,048 rows, the exact RMS loop uses BF16x4 loads followed by four
 explicit ordered FMAs. This preserves every output bit and improves 512-class

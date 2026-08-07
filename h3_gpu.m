@@ -467,6 +467,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
+            [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
@@ -3587,8 +3588,12 @@ int h3_gpu_gate_adaln_quantize_int8(
     gate_adaln_args args = {
         rows, width, slots, gate_slot, shift_slot, scale_slot, epsilon
     };
+    NSString *pipeline_name = width == 5376 &&
+        getenv("H3_DISABLE_VECTOR_GATE_ADALN") == NULL ?
+        @"h3_gate_adaln_quantize_int8" :
+        @"h3_gate_adaln_quantize_int8_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_gate_adaln_quantize_int8");
+        gpu, pipeline_name);
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
         h3_gpu_set_error(gpu,
             @"fused M5 int8 gate AdaLN needs a 256-thread threadgroup");
@@ -3905,9 +3910,14 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
         float epsilon;
     } qkv_project_rope_args;
-    uint32_t rms_mode = fused_rope && rows <= 2048 &&
-        !use_slower_scalar_qkv_rms &&
-        getenv("H3_DISABLE_VECTOR_QKV_RMS") == NULL ? 2u : 1u;
+    /* The historical layout field now carries fused-epilogue mode bits:
+     * bit 1 selects ordered BF16x4 RMS loads, bit 2 packs norm/RoPE by four. */
+    uint32_t rms_mode = 1u;
+    if (fused_rope && rows <= 2048 && !use_slower_scalar_qkv_rms &&
+        getenv("H3_DISABLE_VECTOR_QKV_RMS") == NULL)
+        rms_mode |= 2u;
+    if (fused_rope && getenv("H3_DISABLE_VECTOR_QKV_ROPE") == NULL)
+        rms_mode |= 4u;
     qkv_project_rope_args args = {
         rows, input_dim, heads, head_dim, rope_half, rms_mode, epsilon
     };
