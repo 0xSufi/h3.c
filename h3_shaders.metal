@@ -1030,6 +1030,70 @@ kernel void h3_gate_bf16(device const ushort *residual [[buffer(0)]],
     output[index] = h3_f32_to_bf16(value);
 }
 
+struct h3_gate_adaln_args {
+    uint rows;
+    uint width;
+    uint slots;
+    uint gate_slot;
+    uint shift_slot;
+    uint scale_slot;
+    float epsilon;
+};
+
+/* Preserve the gate's BF16 rounding boundary while retaining that rounded row
+ * in threadgroup memory for the immediately following AdaLN. */
+kernel void h3_gate_adaln_bf16(
+                         device const ushort *residual [[buffer(0)]],
+                         device const ushort *branch [[buffer(1)]],
+                         device const ushort *modulation [[buffer(2)]],
+                         device const uint *row_map [[buffer(3)]],
+                         device const ushort *weight [[buffer(4)]],
+                         device ushort *gated_residual [[buffer(5)]],
+                         device ushort *output [[buffer(6)]],
+                         constant h3_gate_adaln_args &args [[buffer(7)]],
+                         uint3 group [[threadgroup_position_in_grid]],
+                         uint3 thread_position
+                             [[thread_position_in_threadgroup]],
+                         uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    threadgroup ushort gated_values[5376];
+    uint base = row_map[row] * args.slots * args.width;
+    float local_sum = 0.0f;
+    for (uint column = tid; column < args.width; column += threads) {
+        uint index = row * args.width + column;
+        float gate = h3_bf16_to_f32(
+            modulation[base + args.gate_slot * args.width + column]);
+        ushort gated = h3_f32_to_bf16(
+            h3_bf16_to_f32(residual[index]) +
+            h3_bf16_to_f32(branch[index]) * gate);
+        gated_residual[index] = gated;
+        gated_values[column] = gated;
+        float value = h3_bf16_to_f32(gated);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
+            h3_bf16_to_f32(weight[column]);
+        float shift = h3_bf16_to_f32(
+            modulation[base + args.shift_slot * args.width + column]);
+        float scale = h3_bf16_to_f32(
+            modulation[base + args.scale_slot * args.width + column]);
+        output[row * args.width + column] =
+            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+    }
+}
+
 kernel void h3_qkv_rope_bf16(device const ushort *qkv [[buffer(0)]],
                              device const ushort *q_weight [[buffer(1)]],
                              device const ushort *k_weight [[buffer(2)]],

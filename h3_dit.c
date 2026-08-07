@@ -1334,12 +1334,21 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
         dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
        "DiT attention output");
-    OP(h3_gpu_gate_bf16(dit->gpu, dit->hidden, dit->hidden,
-        dit->attention_output, modulation, row_map, rows, HIDDEN, SLOTS, 2),
-       "DiT attention gate");
-    OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
-        modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
-       "DiT MLP AdaLN");
+    if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
+        OP(h3_gpu_gate_adaln_bf16(
+            dit->gpu, dit->hidden, dit->mod_mlp, dit->hidden,
+            dit->attention_output, weight->norm2, modulation, row_map,
+            rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
+           "DiT fused attention gate and MLP AdaLN");
+    } else {
+        OP(h3_gpu_gate_bf16(dit->gpu, dit->hidden, dit->hidden,
+            dit->attention_output, modulation, row_map, rows, HIDDEN,
+            SLOTS, 2), "DiT attention gate");
+        OP(h3_gpu_adaln_bf16(
+            dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
+            modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
+           "DiT MLP AdaLN");
+    }
     if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, dit->mlp_output, dit->activated,
             dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,

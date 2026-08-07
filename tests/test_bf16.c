@@ -247,6 +247,10 @@ static void test_token_reduction_kernels(test_context *test) {
     h3_gpu_tensor *adaln_reference = fresh(test, FULL_ROWS * WIDTH);
     h3_gpu_tensor *fused_expanded = fresh(test, FULL_ROWS * WIDTH);
     h3_gpu_tensor *fused_adaln = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *gate_reference = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *gate_adaln_reference = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *fused_gate_residual = fresh(test, FULL_ROWS * WIDTH);
+    h3_gpu_tensor *fused_gate_adaln = fresh(test, FULL_ROWS * WIDTH);
     require_gpu(test, h3_gpu_begin(test->gpu),
                 "begin fused token AdaLN command stream");
     require_gpu(test, h3_gpu_adaln_bf16(
@@ -270,6 +274,19 @@ static void test_token_reduction_kernels(test_context *test) {
         gpu_parents, norm, modulation, gpu_row_map, FULL_ROWS, REDUCED_ROWS,
         BASELINE_ROWS, WIDTH, 1, 1.0f, 2, 0, 1, 1e-5f),
         "encode fused token expansion and AdaLN");
+    require_gpu(test, h3_gpu_gate_bf16(
+        test->gpu, gate_reference, expanded, fused_expanded, modulation,
+        gpu_row_map, FULL_ROWS, WIDTH, 2, 0),
+        "encode gate reference for fused AdaLN");
+    require_gpu(test, h3_gpu_adaln_bf16(
+        test->gpu, gate_adaln_reference, gate_reference, norm, modulation,
+        gpu_row_map, FULL_ROWS, WIDTH, 2, 0, 1, 1e-5f),
+        "encode gate AdaLN reference");
+    require_gpu(test, h3_gpu_gate_adaln_bf16(
+        test->gpu, fused_gate_residual, fused_gate_adaln, expanded,
+        fused_expanded, norm, modulation, gpu_row_map, FULL_ROWS, WIDTH,
+        2, 0, 0, 1, 1e-5f),
+        "encode fused gate AdaLN");
     require_gpu(test, h3_gpu_submit(test->gpu),
                 "submit fused token AdaLN command stream");
     uint16_t got_fused_pooled[(REDUCED_ROWS + BASELINE_ROWS) * WIDTH];
@@ -279,6 +296,10 @@ static void test_token_reduction_kernels(test_context *test) {
     uint16_t got_fused_expanded[FULL_ROWS * WIDTH];
     uint16_t got_adaln_reference[FULL_ROWS * WIDTH];
     uint16_t got_fused_adaln[FULL_ROWS * WIDTH];
+    uint16_t got_gate_reference[FULL_ROWS * WIDTH];
+    uint16_t got_gate_adaln_reference[FULL_ROWS * WIDTH];
+    uint16_t got_fused_gate_residual[FULL_ROWS * WIDTH];
+    uint16_t got_fused_gate_adaln[FULL_ROWS * WIDTH];
     require(h3_gpu_tensor_read_bf16(
                 fused_pooled, got_fused_pooled,
                 (REDUCED_ROWS + BASELINE_ROWS) * WIDTH),
@@ -304,6 +325,20 @@ static void test_token_reduction_kernels(test_context *test) {
     require(h3_gpu_tensor_read_bf16(
                 fused_adaln, got_fused_adaln, FULL_ROWS * WIDTH),
             "cannot read fused restored AdaLN");
+    require(h3_gpu_tensor_read_bf16(
+                gate_reference, got_gate_reference, FULL_ROWS * WIDTH),
+            "cannot read gate reference");
+    require(h3_gpu_tensor_read_bf16(
+                gate_adaln_reference, got_gate_adaln_reference,
+                FULL_ROWS * WIDTH),
+            "cannot read gate AdaLN reference");
+    require(h3_gpu_tensor_read_bf16(
+                fused_gate_residual, got_fused_gate_residual,
+                FULL_ROWS * WIDTH),
+            "cannot read fused gated residual");
+    require(h3_gpu_tensor_read_bf16(
+                fused_gate_adaln, got_fused_gate_adaln, FULL_ROWS * WIDTH),
+            "cannot read fused gate AdaLN");
     require(memcmp(got_fused_pooled, got_baseline,
                    sizeof(got_fused_pooled)) == 0,
             "fused token pool AdaLN changed residual or baselines");
@@ -320,6 +355,12 @@ static void test_token_reduction_kernels(test_context *test) {
     require(memcmp(got_fused_adaln, got_adaln_reference,
                    sizeof(got_fused_adaln)) == 0,
             "fused token AdaLN differs from the exact two-kernel path");
+    require(memcmp(got_fused_gate_residual, got_gate_reference,
+                   sizeof(got_fused_gate_residual)) == 0,
+            "fused gate AdaLN changed the gated residual");
+    require(memcmp(got_fused_gate_adaln, got_gate_adaln_reference,
+                   sizeof(got_fused_gate_adaln)) == 0,
+            "fused gate AdaLN differs from the exact two-kernel path");
 }
 
 static double monotonic_seconds(void) {
@@ -327,6 +368,90 @@ static double monotonic_seconds(void) {
     require(clock_gettime(CLOCK_MONOTONIC, &value) == 0,
             "cannot read monotonic clock");
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+static void bench_gate_adaln_shape(test_context *test, uint32_t rows,
+                                   const char *label) {
+    enum { WIDTH = 5376, SLOTS = 6, ITERATIONS = 64 };
+    size_t elements = (size_t)rows * WIDTH;
+    uint32_t *row_map = calloc(rows, sizeof(*row_map));
+    require(row_map != NULL, "gate AdaLN benchmark row-map allocation failed");
+    h3_gpu_tensor *residual = fresh(test, elements);
+    h3_gpu_tensor *branch = fresh(test, elements);
+    h3_gpu_tensor *norm = fresh(test, WIDTH);
+    h3_gpu_tensor *modulation = fresh(test, (size_t)SLOTS * WIDTH);
+    h3_gpu_tensor *gpu_row_map = own(test, h3_gpu_tensor_from_u32(
+        test->gpu, row_map, rows));
+    h3_gpu_tensor *separate_residual = fresh(test, elements);
+    h3_gpu_tensor *separate_output = fresh(test, elements);
+    h3_gpu_tensor *fused_residual = fresh(test, elements);
+    h3_gpu_tensor *fused_output = fresh(test, elements);
+    free(row_map);
+
+    require_gpu(test, h3_gpu_begin(test->gpu),
+                "begin gate AdaLN microbenchmark warmup");
+    for (int warm = 0; warm < 16; warm++) {
+        require_gpu(test, h3_gpu_gate_bf16(
+            test->gpu, separate_residual, residual, branch, modulation,
+            gpu_row_map, rows, WIDTH, SLOTS, 2),
+            "encode gate AdaLN gate warmup");
+        require_gpu(test, h3_gpu_adaln_bf16(
+            test->gpu, separate_output, separate_residual, norm, modulation,
+            gpu_row_map, rows, WIDTH, SLOTS, 3, 4, 1e-5f),
+            "encode gate AdaLN norm warmup");
+        require_gpu(test, h3_gpu_gate_adaln_bf16(
+            test->gpu, fused_residual, fused_output, residual, branch, norm,
+            modulation, gpu_row_map, rows, WIDTH, SLOTS, 2, 3, 4, 1e-5f),
+            "encode fused gate AdaLN warmup");
+    }
+    require_gpu(test, h3_gpu_submit(test->gpu),
+                "submit gate AdaLN microbenchmark warmup");
+
+    static const int fused_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double separate_seconds = 0.0, fused_seconds = 0.0;
+    int separate_count = 0, fused_count = 0;
+    for (size_t sample = 0;
+         sample < sizeof(fused_pattern) / sizeof(*fused_pattern); sample++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu),
+                    "begin gate AdaLN microbenchmark");
+        for (int iteration = 0; iteration < ITERATIONS; iteration++) {
+            if (fused_pattern[sample]) {
+                require_gpu(test, h3_gpu_gate_adaln_bf16(
+                    test->gpu, fused_residual, fused_output, residual, branch,
+                    norm, modulation, gpu_row_map, rows, WIDTH, SLOTS,
+                    2, 3, 4, 1e-5f),
+                    "encode fused gate AdaLN microbenchmark");
+            } else {
+                require_gpu(test, h3_gpu_gate_bf16(
+                    test->gpu, separate_residual, residual, branch,
+                    modulation, gpu_row_map, rows, WIDTH, SLOTS, 2),
+                    "encode gate microbenchmark");
+                require_gpu(test, h3_gpu_adaln_bf16(
+                    test->gpu, separate_output, separate_residual, norm,
+                    modulation, gpu_row_map, rows, WIDTH, SLOTS, 3, 4,
+                    1e-5f), "encode gate AdaLN microbenchmark");
+            }
+        }
+        require_gpu(test, h3_gpu_submit(test->gpu),
+                    "submit gate AdaLN microbenchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (fused_pattern[sample]) {
+            fused_seconds += elapsed;
+            fused_count++;
+        } else {
+            separate_seconds += elapsed;
+            separate_count++;
+        }
+    }
+    double separate_average = separate_seconds / separate_count /
+                              (double)ITERATIONS;
+    double fused_average = fused_seconds / fused_count / (double)ITERATIONS;
+    printf("gate AdaLN %s separate %.6fs, fused %.6fs, ratio %.4f\n",
+           label, separate_average, fused_average,
+           fused_average / separate_average);
 }
 
 static void bench_token_pool_adaln(test_context *test) {
@@ -813,6 +938,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (getenv("H3_BENCH_TOKEN_ADALN")) {
+        bench_gate_adaln_shape(&test, 1550, "1550 rows");
+        bench_gate_adaln_shape(&test, 2915, "2915 rows");
         bench_token_pool_adaln(&test);
         bench_token_expand_adaln(&test);
         cleanup(&test);

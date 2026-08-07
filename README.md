@@ -92,6 +92,10 @@ transformer-core residual while still refreshing the patch projection and
 timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
 validated aggressive limit; values above 6 lose subject fidelity. Core reuse
 and whole-velocity `--reuse` are intentionally mutually exclusive.
+Every active DiT block fuses its attention residual gate with the following MLP
+AdaLN. The rounded BF16 residual is still written exactly, but the same row is
+kept in threadgroup memory for normalization, eliminating one dispatch and one
+global reread. `H3_DISABLE_FUSED_GATE_ADALN=1` restores the two-kernel oracle.
 `--token-reduction` is an independent aggressive DiT mode. After block 3 it
 pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is
