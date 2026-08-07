@@ -164,6 +164,13 @@ int h3_serving_schedule_build(int points, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_fast_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    if (evaluations < 4 || evaluations > 7) return 0;
+    /* At tiny budgets, the released linear base grid beat every tested tail
+     * warp. Add the terminal zero so --steps names actual model forwards. */
+    return h3_serving_schedule_build(evaluations + 1, schedule);
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;

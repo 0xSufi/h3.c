@@ -99,6 +99,19 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
+
+    CHECK(h3_fast_schedule_build(4, &schedule));
+    CHECK(schedule.steps == 4);
+    CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
+    CHECK(close_enough(schedule.video[1], 36.0 / 37.0, 1e-7));
+    CHECK(close_enough(schedule.audio[1], 9.0 / 10.0, 1e-7));
+    CHECK(schedule.video[4] == 0.0f && schedule.audio[4] == 0.0f);
+    for (int index = 0; index < schedule.steps; index++) {
+        CHECK(schedule.video[index] > schedule.video[index + 1]);
+        CHECK(schedule.audio[index] > schedule.audio[index + 1]);
+    }
+    CHECK(!h3_fast_schedule_build(3, &schedule));
+    CHECK(!h3_fast_schedule_build(8, &schedule));
 }
 
 static void test_dit_reuse_schedule(void) {

@@ -114,6 +114,8 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Current SGLang contract: endpoint-inclusive points, hence points-1 forwards. */
 int h3_serving_schedule_build(int points, h3_sigma_schedule *schedule);
+/* Validated low-step grid: evaluations model forwards plus terminal zero. */
+int h3_fast_schedule_build(int evaluations, h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);

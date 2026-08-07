@@ -182,8 +182,21 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "sigma points must be in [2, 1000]");
         return 0;
     }
+    if (params->fast_scheduler != 0 && params->fast_scheduler != 1) {
+        h3_set_error(ctx, "fast scheduler must be zero or one");
+        return 0;
+    }
+    if (params->fast_scheduler &&
+        (params->steps < 4 || params->steps > 7)) {
+        h3_set_error(ctx, "fast scheduler is tuned for 4..7 forwards");
+        return 0;
+    }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
+        return 0;
+    }
+    if (params->fast_scheduler && params->denoise_reuse != 1) {
+        h3_set_error(ctx, "fast scheduler cannot be combined with reuse");
         return 0;
     }
     if (params->dit_layers < H3_MIN_DIT_LAYERS ||
@@ -997,7 +1010,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    int schedule_ok = params->fast_scheduler ?
+        h3_fast_schedule_build(params->steps, &sigmas) :
+        h3_serving_schedule_build(params->steps, &sigmas);
+    if (!schedule_ok) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }

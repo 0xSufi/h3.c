@@ -64,6 +64,34 @@ costs. Compare performance using repeated runs, and alternate variants when
 the machines are warming up because this workload is sensitive to thermal
 throttling.
 
+For a very short iteration, use the separately validated low-step scheduler:
+
+```sh
+./h3 --profile \
+  -d ./MiniMax-H3 \
+  -p "A red fox walks through fresh snow in a pine forest. Medium tracking shot, natural winter light, realistic fur." \
+  --width 512 --height 512 --frames 22 \
+  --fast-scheduler --steps 4 --layers 50 --reuse 1 \
+  --show \
+  -o outputs/fox-four-step.mp4
+```
+
+With the ordinary scheduler, `--steps N` means N sigma points and therefore
+N-1 transformer forwards. With `--fast-scheduler`, it instead means an exact
+budget of N forwards, followed by terminal sigma zero. The mode is validated
+for 4 through 7 forwards and cannot be combined with `--reuse`; increasing
+from 4 to 7 progressively improves detail and motion. `--show` displays one
+preview after each of those forwards.
+
+Several tail-heavy schedules were evaluated because most visible cleanup
+happens late in a long run. They preserved too few early composition updates
+and produced woven texture, weak motion, or clipped colors. The retained mode
+uses the released linear base grid with one terminal point. On the 512-square,
+22-frame fox test, four forwards improved full-video SSIM against a 30-point
+reference from 0.509 to 0.556; on an independent surfer test it improved from
+0.537 to 0.547. The four-forward denoise took about 3.5 seconds on M5 Max,
+versus 26.4 seconds for the 29-forward reference.
+
 ### 3. Move toward reference quality
 
 Change one control at a time when evaluating quality. First restore all layers,
@@ -92,7 +120,7 @@ These controls are independent unless noted otherwise:
 
 | Control | Close/default | Fast-quality | Aggressive | Main impact |
 |---|---:|---:|---:|---|
-| Sigma points | `--steps 50` | `--steps 20` | below 20 is not validated | More points mean more denoiser transitions. |
+| Sigma points | `--steps 50` | `--steps 20` | `--fast-scheduler --steps 4..7` | Fast-scheduler steps are actual forwards; ordinary steps are points. |
 | Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 points: 19, 10, or 6 fresh DiT evaluations. |
 | Active DiT blocks | `--layers 50` | `--layers 45` | `--layers 40` | Fewer blocks reduce compute and resident transformer weights. |
 | Core residual reuse | `--core-reuse 1` | `--core-reuse 4` | `--core-reuse 6` | Refreshes patch/head work every step but runs the expensive core less often. |
@@ -324,6 +352,16 @@ The default sampler follows current SGLang serving: 50 shifted sigma points
 several which remained visually clean but changed the requested subject. Reuse
 extrapolates skipped video and audio velocities on their independent sigma
 grids.
+
+`--fast-scheduler` is a separate low-budget contract. It accepts 4 through 7
+and adds terminal zero, so the requested number is the number of DiT forwards.
+The released linear base grid won against actual-video-sigma linear spacing,
+quadratic and cubic warps, exact 30-point tail subsets, mild power warps,
+zero-order held full-grid velocities, linear velocity extrapolation, and RES.
+The more tail-heavy candidates often sharpened the subject but damaged motion
+or left a repetitive woven background; sparse RES and long extrapolation
+intervals failed much more visibly. Whole-denoiser reuse is therefore rejected
+in combination with this already-small evaluation budget.
 
 Layer thinning ranks the checkpoint's actual AdaLN gates while protecting
 structurally important first and final blocks. Unused weights and schedule
