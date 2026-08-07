@@ -180,6 +180,11 @@ requested output size.
 
 H3 emits 24 fps and aligns frame requests upward to `5 + 17*n`:
 
+Use `--seconds N` for a duration-oriented request, or `--frames N` for direct
+frame control; the two options are mutually exclusive. Fractional seconds are
+accepted. Seconds are converted at 24 fps and then rounded upward to the next
+legal H3 temporal shape, so `--seconds 10` produces 243 frames (10.125 seconds).
+
 | Frames | Approximate video duration |
 |---:|---:|
 | 22 | 0.917 seconds |

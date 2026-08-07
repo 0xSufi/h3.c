@@ -1,9 +1,11 @@
 #include "h3.h"
+#include "h3_host.h"
 #include "h3_terminal.h"
 
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +24,7 @@ static void usage(const char *program) {
         "      --render-width N   Lower internal model width (optional)\n"
         "      --render-height N  Lower internal model height (optional)\n"
         "      --frames N         Requested frames (default: 56)\n"
+        "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Sigma points (default: 50; 49 forwards)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
@@ -63,6 +66,24 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static int frames_from_seconds(const char *value) {
+    char *end = NULL;
+    errno = 0;
+    double seconds = strtod(value, &end);
+    double frames = seconds * (double)H3_FPS;
+    if (errno || !end || *end || !isfinite(seconds) || seconds <= 0.0 ||
+        !isfinite(frames) || frames > (double)INT32_MAX) {
+        fprintf(stderr, "h3: invalid seconds: %s\n", value);
+        exit(2);
+    }
+    long long rounded = llround(frames);
+    if (rounded < 1 || rounded > INT32_MAX) {
+        fprintf(stderr, "h3: invalid seconds: %s\n", value);
+        exit(2);
+    }
+    return (int)rounded;
 }
 
 static uint64_t parse_u64(const char *value, const char *label) {
@@ -190,7 +211,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
-           OPT_FRAMES, OPT_STEPS, OPT_REUSE,
+           OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -217,6 +238,7 @@ int main(int argc, char **argv) {
         {"render-width", required_argument, NULL, OPT_RENDER_WIDTH},
         {"render-height", required_argument, NULL, OPT_RENDER_HEIGHT},
         {"frames", required_argument, NULL, OPT_FRAMES},
+        {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
@@ -268,6 +290,8 @@ int main(int argc, char **argv) {
     int show = 0;
     int profile = 0;
     int info = 0;
+    int frames_given = 0;
+    int seconds_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
@@ -283,7 +307,14 @@ int main(int argc, char **argv) {
             case OPT_RENDER_HEIGHT:
                 params.render_height = parse_int(optarg, "render height");
                 break;
-            case OPT_FRAMES: params.frames = parse_int(optarg, "frames"); break;
+            case OPT_FRAMES:
+                params.frames = parse_int(optarg, "frames");
+                frames_given = 1;
+                break;
+            case OPT_SECONDS:
+                params.frames = frames_from_seconds(optarg);
+                seconds_given = 1;
+                break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
@@ -391,6 +422,10 @@ int main(int argc, char **argv) {
     }
     if (!model_dir || (!info && !prompt)) {
         usage(argv[0]);
+        return 2;
+    }
+    if (frames_given && seconds_given) {
+        fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
         return 2;
     }
     params.references = references;
