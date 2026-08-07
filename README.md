@@ -415,11 +415,17 @@ M5, where the target machine has 128 GiB. `H3_QWEN_PREFETCH=0` restores the
 single-layer synchronous reference path; values 1-8 select the worker count,
 and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
 
-### Experimental Metal 4 and TensorOps paths
+### Metal 4 and TensorOps paths
 
-An M5-only native BF16 Metal 4/TensorOps linear path is available with
-`H3_NAX=1`. It is guarded at runtime and falls back to the unchanged portable
-library if TensorOps compilation is unavailable. The path passes the complete
+M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
+attention-output projections at sequence lengths up to 2,048. The compact
+Morton schedule is byte-identical to MPSGraph and improves a complete 512x512
+50-block forward by typically 1-2% on the IT/US M5 Max systems. Larger sequences
+stay on MPSGraph, which is faster for their row geometry. `H3_NAX=0` disables
+TensorOps for exact A/B diagnosis. The selection is guarded at runtime and
+falls back to the unchanged portable library if compilation is unavailable.
+
+`H3_NAX=1` forces the broader native BF16 linear path. It passes the complete
 50-block MLX fixture, but remains opt-in: exact-shape microbenchmarks favor its
 128-row tile while full DiT runs currently favor MPSGraph scheduling. This
 keeps a working NAX integration available for later quantized/fused kernels

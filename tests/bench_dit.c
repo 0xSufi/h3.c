@@ -732,6 +732,102 @@ static void run_nax_morton_ab(h3_dit *dit, float *video, float *audio,
     free(audio_reference);
 }
 
+static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
+                              float *video_velocity,
+                              float *audio_velocity) {
+    char error[512];
+    int schedule_ab = getenv("H3_BENCH_NAX_LINEAR_MORTON_AB") != NULL;
+    const char *disable = schedule_ab ?
+        "H3_DISABLE_NAX_LINEAR_MORTON4" : "H3_DISABLE_NAX_LINEAR";
+    const char *baseline_name = schedule_ab ? "row-major NAX" : "MPSGraph";
+    const char *candidate_name = schedule_ab ? "compact NAX" : "NAX";
+    float *baseline_video = malloc(VIDEO_ELEMENTS * sizeof(*baseline_video));
+    float *baseline_audio = malloc(AUDIO_ELEMENTS * sizeof(*baseline_audio));
+    float *candidate_video = malloc(VIDEO_ELEMENTS * sizeof(*candidate_video));
+    float *candidate_audio = malloc(AUDIO_ELEMENTS * sizeof(*candidate_audio));
+    if (!baseline_video || !baseline_audio ||
+        !candidate_video || !candidate_audio)
+        die("out of memory allocating NAX linear AB references");
+    h3_gpu_stats stats_before, stats_baseline, stats_candidate;
+    if (!h3_dit_get_gpu_stats(dit, &stats_before))
+        die("cannot read NAX linear baseline GPU stats");
+    setenv(disable, "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    if (!h3_dit_get_gpu_stats(dit, &stats_baseline))
+        die("cannot read NAX linear baseline GPU stats");
+    memcpy(baseline_video, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*baseline_video));
+    memcpy(baseline_audio, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*baseline_audio));
+    unsetenv(disable);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    if (!h3_dit_get_gpu_stats(dit, &stats_candidate))
+        die("cannot read NAX linear candidate GPU stats");
+    memcpy(candidate_video, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*candidate_video));
+    memcpy(candidate_audio, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*candidate_audio));
+
+    static const int pattern[] = {0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0};
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0;
+    for (size_t run = 0; run < sizeof(pattern) / sizeof(*pattern); run++) {
+        if (pattern[run]) unsetenv(disable);
+        else setenv(disable, "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        const float *expected_video = pattern[run] ?
+            candidate_video : baseline_video;
+        const float *expected_audio = pattern[run] ?
+            candidate_audio : baseline_audio;
+        if (memcmp(video_velocity, expected_video,
+                   VIDEO_ELEMENTS * sizeof(*expected_video)) ||
+            memcmp(audio_velocity, expected_audio,
+                   AUDIO_ELEMENTS * sizeof(*expected_audio)))
+            die("NAX linear output changed between repetitions");
+        if (pattern[run]) {
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  %s %.3fs\n", candidate_name, elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  %s %.3fs\n", baseline_name, elapsed);
+        }
+    }
+    double video_abs = 0.0, audio_abs = 0.0;
+    double video_rel = relative_l2(candidate_video, baseline_video,
+                                   VIDEO_ELEMENTS, &video_abs);
+    double audio_rel = relative_l2(candidate_audio, baseline_audio,
+                                   AUDIO_ELEMENTS, &audio_abs);
+    unsetenv(disable);
+    printf("DiT NAX linear AB %s %.4fs, %s %.4fs, ratio %.4f; "
+           "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
+           baseline_name, baseline_seconds / baseline_count,
+           candidate_name, candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           video_rel, video_abs, audio_rel, audio_abs);
+    printf("NAX linear dispatches %s: direct %llu, MPS linear %llu; "
+           "%s: direct %llu, MPS linear %llu\n",
+           baseline_name,
+           (unsigned long long)(stats_baseline.direct_dispatches -
+                                stats_before.direct_dispatches),
+           (unsigned long long)(stats_baseline.mps_linear_dispatches -
+                                stats_before.mps_linear_dispatches),
+           candidate_name,
+           (unsigned long long)(stats_candidate.direct_dispatches -
+                                stats_baseline.direct_dispatches),
+           (unsigned long long)(stats_candidate.mps_linear_dispatches -
+                                stats_baseline.mps_linear_dispatches));
+    free(baseline_video); free(baseline_audio);
+    free(candidate_video); free(candidate_audio);
+}
+
 static void run_sampler_ab(h3_dit *dit, float *video, float *audio,
                            float *video_velocity, float *audio_velocity) {
     char error[512];
@@ -1268,6 +1364,18 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_NAX_MORTON4_AB")) {
         run_nax_morton_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before NAX Morton AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (getenv("H3_BENCH_NAX_LINEAR_AB") ||
+        getenv("H3_BENCH_NAX_LINEAR_MORTON_AB")) {
+        run_nax_linear_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT %ux%u/%u-layer load %.3fs before NAX linear AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);

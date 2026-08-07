@@ -360,9 +360,10 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
             const char *nax = getenv("H3_NAX");
+            BOOL m5 = [gpu.device.name rangeOfString:@"M5"].location !=
+                      NSNotFound;
             BOOL wantsTensorOps =
-                [gpu.device.name rangeOfString:@"M5"].location != NSNotFound &&
-                nax && *nax && strcmp(nax, "0");
+                m5 && (!nax || !*nax || strcmp(nax, "0") != 0);
             if (wantsTensorOps)
                 options.preprocessorMacros = @{ @"H3_METAL_HAS_TENSOR": @"1" };
             gpu.library = [gpu.device newLibraryWithSource:source
@@ -370,10 +371,11 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                                                      error:&libraryError];
             gpu.tensorOpsEnabled = gpu.library && wantsTensorOps;
             if (gpu.tensorOpsEnabled) {
-                gpu.tensorOpsMode = !strcmp(nax, "attn") ? 2u :
-                                    !strcmp(nax, "qkv-attn") ? 3u :
-                                    !strcmp(nax, "qkv") ? 4u :
-                                    !strcmp(nax, "mlp") ? 5u : 1u;
+                const char *mode = nax && *nax ? nax : "qkv-attn";
+                gpu.tensorOpsMode = !strcmp(mode, "attn") ? 2u :
+                                    !strcmp(mode, "qkv-attn") ? 3u :
+                                    !strcmp(mode, "qkv") ? 4u :
+                                    !strcmp(mode, "mlp") ? 5u : 1u;
             }
             if (!gpu.library && wantsTensorOps) {
                 /* TensorOps is optional: an older runtime must retain the
@@ -2303,18 +2305,27 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, weight, weight_count, @"linear weight") ||
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
+    BOOL specializedRows = rows <= 2048;
     BOOL naxShape = gpu.tensorOpsMode == 1 ||
-        (gpu.tensorOpsMode == 2 && input_dim == 7168 && output_dim == 5376) ||
-        (gpu.tensorOpsMode == 3 &&
+        (specializedRows && gpu.tensorOpsMode == 2 &&
+         input_dim == 7168 && output_dim == 5376) ||
+        (specializedRows && gpu.tensorOpsMode == 3 &&
          ((input_dim == 7168 && output_dim == 5376) ||
           (input_dim == 5376 && output_dim == 21504))) ||
-        (gpu.tensorOpsMode == 4 && input_dim == 5376 && output_dim == 21504);
+        (specializedRows && gpu.tensorOpsMode == 4 &&
+         input_dim == 5376 && output_dim == 21504);
     if (gpu.tensorOpsEnabled && naxShape && !bias && rows >= 128 &&
+        !getenv("H3_DISABLE_NAX_LINEAR") &&
         (input_dim % 32) == 0 && (output_dim % 64) == 0) {
         linear_args args = {rows, input_dim, output_dim, 0};
         if (!h3_gpu_require_command(gpu)) return 0;
+        uint32_t row_tiles = (rows + 127) / 128;
+        uint32_t column_tiles = (output_dim + 63) / 64;
+        BOOL morton4 = rows <= 2048 && !(column_tiles % 4) &&
+                       getenv("H3_DISABLE_NAX_LINEAR_MORTON4") == NULL;
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-            gpu, @"h3_linear_bf16_nax_r128");
+            gpu, morton4 ? @"h3_linear_bf16_nax_r128_morton4" :
+                           @"h3_linear_bf16_nax_r128");
         if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
             h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps");
             return 0;
@@ -2327,9 +2338,15 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
-            [encoder dispatchThreadgroups:
-                MTLSizeMake((rows + 127) / 128, (output_dim + 63) / 64, 1)
+            if (morton4) {
+                [encoder dispatchThreadgroups:
+                    MTLSizeMake((NSUInteger)row_tiles * column_tiles, 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                [encoder dispatchThreadgroups:
+                    MTLSizeMake(row_tiles, column_tiles, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
             [encoder endEncoding];
         }
         h3_gpu_stats stats = gpu.stats;
