@@ -29,6 +29,7 @@ static void usage(const char *program) {
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
         "      --use-slower-bf16-qkv  Force close-reference BF16 QKV\n"
+        "      --use-slower-bf16-attention-output  Force BF16 attention output\n"
         "      --use-slower-grouped-quantizer  Force 256-thread FC2 quantizer\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
@@ -189,6 +190,7 @@ int main(int argc, char **argv) {
            OPT_TOKEN_REDUCTION,
            OPT_USE_SLOWER_BF16_MLP,
            OPT_USE_SLOWER_BF16_QKV,
+           OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT,
            OPT_USE_SLOWER_GROUPED_QUANTIZER,
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
@@ -212,6 +214,8 @@ int main(int argc, char **argv) {
          OPT_USE_SLOWER_BF16_MLP},
         {"use-slower-bf16-qkv", no_argument, NULL,
          OPT_USE_SLOWER_BF16_QKV},
+        {"use-slower-bf16-attention-output", no_argument, NULL,
+         OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT},
         {"use-slower-grouped-quantizer", no_argument, NULL,
          OPT_USE_SLOWER_GROUPED_QUANTIZER},
         {"seed", required_argument, NULL, OPT_SEED},
@@ -272,6 +276,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_USE_SLOWER_BF16_QKV:
                 params.use_slower_bf16_qkv = 1;
+                break;
+            case OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT:
+                params.use_slower_bf16_attention_output = 1;
                 break;
             case OPT_USE_SLOWER_GROUPED_QUANTIZER:
                 params.use_slower_grouped_quantizer = 1;

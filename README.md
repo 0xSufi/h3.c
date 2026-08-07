@@ -586,6 +586,12 @@ through snow; quantized attention can change framing and fine detail. Use
 `--use-slower-bf16-qkv` for the close-reference BF16 projection. Normal int8
 loading releases the redundant BF16 QKV weights after quantization.
 
+The following attention-output projection is int8 as well on the default M5
+path. Crossed same-model tests improve a complete forward by another 4.5-5.5%
+at 512 and 864. A decoded fox render remained clean and closely matched the
+int8-QKV-only composition; its thermally hot denoise measured 19.18 seconds.
+Use `--use-slower-bf16-attention-output` to retain that projection in BF16.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \

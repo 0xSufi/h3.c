@@ -36,6 +36,8 @@ typedef struct {
     h3_gpu_tensor *q_norm;
     h3_gpu_tensor *k_norm;
     h3_gpu_tensor *out;
+    h3_gpu_tensor *out_int8;
+    h3_gpu_tensor *out_scales;
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *fc2;
     h3_gpu_tensor *fc1_int8;
@@ -52,7 +54,9 @@ struct h3_dit {
     int nax_mlp;
     int int8_mlp;
     int int8_qkv;
+    int int8_attention_out;
     int keep_bf16_qkv;
+    int keep_bf16_attention_out;
     int use_slower_grouped_quantizer;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -493,6 +497,8 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->q_norm);
     free_tensor(&block->k_norm);
     free_tensor(&block->out);
+    free_tensor(&block->out_int8);
+    free_tensor(&block->out_scales);
     free_tensor(&block->fc1);
     free_tensor(&block->fc2);
     free_tensor(&block->fc1_int8);
@@ -548,6 +554,27 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
         return 0;
     }
     if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
+    return 1;
+}
+
+static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
+                                        char *error, size_t error_size) {
+    block->out_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)HIDDEN * INNER);
+    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    int ok = block->out_int8 && block->out_scales &&
+             h3_gpu_begin(dit->gpu) &&
+             h3_gpu_quantize_weight_int8(
+                 dit->gpu, block->out_int8, block->out_scales, block->out,
+                 HIDDEN, INNER) &&
+             h3_gpu_submit(dit->gpu);
+    if (!ok) {
+        fail(error, error_size,
+             "cannot quantize DiT attention-output weight: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
     return 1;
 }
 
@@ -1034,6 +1061,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         if (dit->int8_qkv &&
             !quantize_block_qkv(dit, &dit->blocks[index],
                                 error, error_size)) return 0;
+        if (dit->int8_attention_out &&
+            !quantize_block_attention_out(
+                dit, &dit->blocks[index], error, error_size)) return 0;
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
@@ -1232,7 +1262,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (dit->int8_mlp || dit->int8_qkv) {
+    if (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) {
         size_t padded_sequence = (sequence + 127) & ~(size_t)127;
         dit->int8_activation = h3_gpu_tensor_new_i8(
             dit->gpu, padded_sequence * FFN);
@@ -1311,6 +1341,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int token_reduction,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
+                        int use_slower_bf16_attention_output,
                         int use_slower_grouped_quantizer,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
@@ -1365,6 +1396,12 @@ static h3_dit *load_dit(const char *weight_directory,
                     h3_gpu_has_int8_mlp(dit->gpu);
     dit->int8_qkv = !use_slower_bf16_qkv && dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
+    dit->int8_attention_out = !use_slower_bf16_attention_output &&
+                              dit->sequence >= 128 &&
+                              h3_gpu_has_int8_mlp(dit->gpu);
+    dit->keep_bf16_attention_out = dit->int8_attention_out &&
+        (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
+         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
     dit->keep_bf16_qkv = dit->int8_qkv &&
         (getenv("H3_INT8_KEEP_BF16_QKV") ||
          getenv("H3_BENCH_INT8_QKV_AB"));
@@ -1419,12 +1456,14 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int token_reduction,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
                          int use_slower_grouped_quantizer,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_bf16_attention_output,
                     use_slower_grouped_quantizer,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
@@ -1441,6 +1480,7 @@ h3_dit *h3_dit_load_conditioned(
                          int token_reduction,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
                          int use_slower_grouped_quantizer,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
@@ -1451,6 +1491,7 @@ h3_dit *h3_dit_load_conditioned(
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_bf16_attention_output,
                     use_slower_grouped_quantizer,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
@@ -1584,9 +1625,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
         dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "DiT full attention");
-    OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
-        dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
-       "DiT attention output");
+    if (dit->int8_attention_out &&
+        !getenv("H3_DISABLE_INT8_ATTENTION_OUT")) {
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, dit->attention_output, dit->int8_activation,
+            dit->int8_activation_scales, dit->attention_heads,
+            weight->out_int8, weight->out_scales, rows, INNER, HIDDEN),
+           "DiT int8 attention output");
+    } else {
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
+            dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
+           "DiT attention output");
+    }
     if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_gate_adaln_bf16(
             dit->gpu, dit->hidden, dit->mod_mlp, dit->hidden,

@@ -2819,6 +2819,57 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         1.0f, @"BF16 weight to quantize");
 }
 
+int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
+        output_dim % 128 ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
+                           @"int8 linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, output_dim,
+                            @"int8 linear weight scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"int8 linear output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    if (!h3_gpu_quantize_bf16_int8_rows(
+            opaque, quantized_input, input_scales, input, rows, padded_rows,
+            input_dim, 1.0f, @"int8 linear input")) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_nax_r128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, output_dim, 0};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(quantized_input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(input_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        NSUInteger groups = (NSUInteger)(padded_rows / 128u) *
+                            (output_dim / 128u);
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          h3_gpu_tensor *activated,
                          h3_gpu_tensor *quantized_activation,
