@@ -44,6 +44,7 @@ struct h3_dit {
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
+    int activation_aliases;
     int token_reduction;
     int token_reduction_active;
     unsigned token_reduction_begin;
@@ -966,6 +967,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t video = dit->video_rows;
     size_t audio_total = dit->audio_total_rows;
     size_t video_total = dit->video_total_rows;
+    dit->activation_aliases = !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
 #define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
 #define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
     h3_gpu_tensor *all[] = {
@@ -981,10 +983,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         BF(query, sequence * INNER),
         BF(key, sequence * INNER),
         BF(value, sequence * INNER),
-        BF(attention_heads, sequence * INNER),
         BF(attention_output, sequence * HIDDEN),
-        BF(mod_mlp, sequence * HIDDEN),
-        BF(mlp_output, sequence * HIDDEN),
         F32(final_audio_inverse, audio),
         F32(final_video_inverse, video),
         BF(audio_output_bf16, audio * AUDIO_CHANNELS),
@@ -998,6 +997,25 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
                  h3_gpu_error(dit->gpu));
             return 0;
         }
+    }
+    if (dit->activation_aliases) {
+        dit->attention_heads = dit->qkv;
+        dit->mod_mlp = dit->qkv;
+        dit->mlp_output = NULL;
+    } else {
+        dit->attention_heads = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * INNER);
+        dit->mod_mlp = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+        dit->mlp_output = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+    }
+    if (!dit->attention_heads || !dit->mod_mlp ||
+        (!dit->activation_aliases && !dit->mlp_output)) {
+        fail(error, error_size,
+             "cannot allocate DiT activation buffers: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -1376,12 +1394,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
     }
+    h3_gpu_tensor *mlp_output = dit->activation_aliases ?
+        dit->attention_output : dit->mlp_output;
     if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
-        OP(h3_gpu_mlp_nax_bf16(dit->gpu, dit->mlp_output, dit->activated,
+        OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
             dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
             HIDDEN), "DiT NAX fused MLP");
     } else if (dit->fused_mlp) {
-        OP(h3_gpu_mlp_bf16(dit->gpu, dit->mlp_output, dit->mod_mlp,
+        OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
             weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
            "DiT fused MLP");
     } else {
@@ -1389,7 +1409,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->mlp_output, dit->activated,
+        OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
     if (fuse_next_attention) {
@@ -1398,13 +1418,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->schedule, next_index);
         OP(h3_gpu_gate_adaln_bf16(
             dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
-            dit->mlp_output, next_weight->norm1, modulation,
+            mlp_output, next_weight->norm1, modulation,
             next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
            "DiT fused MLP gate and next attention AdaLN");
         *next_attention_adaln_ready = 1;
     } else {
         OP(h3_gpu_gate_bf16(
-            dit->gpu, dit->hidden, dit->hidden, dit->mlp_output,
+            dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
     }
 #undef OP
@@ -2179,6 +2199,10 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
 #define FREE(field) free_tensor(&dit->field)
+    if (dit->activation_aliases) {
+        dit->attention_heads = NULL;
+        dit->mod_mlp = NULL;
+    }
     FREE(video_input); FREE(audio_input);
     FREE(video_projected_f32); FREE(audio_projected_f32);
     FREE(video_projected); FREE(audio_projected); FREE(hidden);
