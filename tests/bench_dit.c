@@ -652,7 +652,7 @@ int main(int argc, char **argv) {
     double load_start = seconds();
     h3_dit *dit = h3_dit_load_t2va(
         weights, "h3_shaders.metal", &text, &layout, &sigmas, active_blocks, 1,
-        0, NULL, NULL, error, sizeof(error));
+        token_reduction_ab, NULL, NULL, error, sizeof(error));
     if (!dit) die(error);
     double load_seconds = seconds() - load_start;
 
