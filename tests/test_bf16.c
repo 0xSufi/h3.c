@@ -423,27 +423,35 @@ static void bench_h3_sdpa(test_context *test) {
         976, 1550, 976, 1550, 1550, 976
     };
     double small_seconds = 0.0, large_seconds = 0.0;
+    double small_encode = 0.0, large_encode = 0.0;
     int small_count = 0, large_count = 0;
     for (size_t sample = 0; sample < sizeof(pattern) / sizeof(*pattern);
          sample++) {
         double start = monotonic_seconds();
         require_gpu(test, h3_gpu_begin(test->gpu), "begin H3 SDPA benchmark");
+        double encode_start = monotonic_seconds();
         require_gpu(test, h3_gpu_sdpa_bf16(
             test->gpu, output, query, key, value, pattern[sample], H3_HEADS,
             DIMENSION, scale), "encode H3 SDPA benchmark");
+        double encode = monotonic_seconds() - encode_start;
         require_gpu(test, h3_gpu_submit(test->gpu), "submit H3 SDPA benchmark");
         double elapsed = monotonic_seconds() - start;
         if (pattern[sample] == shapes[0]) {
             small_seconds += elapsed;
+            small_encode += encode;
             small_count++;
         } else {
             large_seconds += elapsed;
+            large_encode += encode;
             large_count++;
         }
-        printf("  H3 SDPA %u tokens %.6fs\n", pattern[sample], elapsed);
+        printf("  H3 SDPA %u tokens %.6fs encode %.6fs\n",
+               pattern[sample], elapsed, encode);
     }
-    printf("H3 SDPA MPSGraph 976 %.6fs, 1550 %.6fs\n",
-           small_seconds / small_count, large_seconds / large_count);
+    printf("H3 SDPA MPSGraph 976 %.6fs encode %.6fs, 1550 %.6fs "
+           "encode %.6fs\n", small_seconds / small_count,
+           small_encode / small_count, large_seconds / large_count,
+           large_encode / large_count);
 }
 
 static void test_euler_update(test_context *test) {
