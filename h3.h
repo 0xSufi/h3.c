@@ -81,6 +81,9 @@ typedef struct {
      * canvas) or valid same-aspect dimensions no larger than width/height. */
     int render_width;
     int render_height;
+    /* Force the portable close-reference BF16/MPS MLP implementation instead
+     * of the fastest validated native MLP supported by the current GPU. */
+    int use_slower_bf16_mlp;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
@@ -89,7 +92,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

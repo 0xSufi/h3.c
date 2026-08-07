@@ -891,6 +891,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
+            params->use_slower_bf16_mlp,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -899,6 +900,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
+            params->use_slower_bf16_mlp,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {

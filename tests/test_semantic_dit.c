@@ -90,7 +90,8 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
     h3_dit *dit = h3_dit_load_t2va(weights, "h3_shaders.metal", &text,
-                                    &layout, &sigmas, 50, 1, 0, progress, NULL,
+                                    &layout, &sigmas, 50, 1, 0, 0,
+                                    progress, NULL,
                                     error, sizeof(error));
     if (!dit) die(error);
     if (h3_dit_video_elements(dit) != VIDEO_ELEMENTS ||

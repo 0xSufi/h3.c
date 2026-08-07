@@ -563,9 +563,9 @@ graph, avoiding separate graph boundaries and persistent intermediate tensors.
 Set `H3_DISABLE_FUSED_MLP=1` to retain the close-reference operation boundaries
 for numerical diagnosis.
 
-On Metal 4 TensorOps hardware, `H3_INT8_MLP=1` enables the experimental native
-int8 MLP engine. It dynamically quantizes activations, uses per-output-channel
-weight scales, and gives the sensitive FC2 input one scale per 1,024 channels.
+On supported M5 Metal 4 TensorOps hardware, the native int8 MLP engine is the
+default. It dynamically quantizes activations, uses per-output-channel weight
+scales, and gives the sensitive FC2 input one scale per 1,024 channels.
 The selected FC2 kernel keeps scaled partial products in private cooperative
 fragments instead of repeatedly spilling a 32 KiB threadgroup tile. A fixed
 50-layer, 19-transition 512x512 render measured 36.30 seconds with BF16 MPS and
@@ -578,11 +578,15 @@ finishes, reducing measured peak tensor storage to 25.9 GiB from the BF16
 path's 36.4 GiB. Runtime weight quantization still adds startup time.
 
 ```sh
-H3_INT8_MLP=1 ./h3 --profile -d ./MiniMax-H3 \
+./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \
   --width 512 --height 512 --frames 22 --steps 20 \
   --layers 50 --reuse 1 -o outputs/fox-int8.mp4
 ```
+
+Use `--use-slower-bf16-mlp` to force the portable close-reference MPS/BF16 MLP
+path for numerical comparison. Older Metal hardware selects that path
+automatically when the required native TensorOps kernels are unavailable.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,

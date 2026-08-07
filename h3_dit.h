@@ -24,6 +24,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
+                         int use_slower_bf16_mlp,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
@@ -39,6 +40,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
+                         int use_slower_bf16_mlp,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,

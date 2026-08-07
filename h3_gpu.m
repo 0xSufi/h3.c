@@ -519,8 +519,7 @@ int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
 int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
-    const char *value = getenv("H3_INT8_MLP");
-    return gpu.tensorOpsEnabled && value && *value && strcmp(value, "0");
+    return gpu.tensorOpsEnabled;
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
