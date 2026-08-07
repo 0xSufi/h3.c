@@ -450,6 +450,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_quantize_bf16_int8_groups"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
+            [names addObject:
+                @"h3_qkv_project_split_int8_nax_r128_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
@@ -3542,6 +3544,101 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
     stats.direct_dispatches += 2;
     gpu.stats = stats;
     gpu.headMajorSDPAInputs = headMajor != 0;
+    return 1;
+}
+
+int h3_gpu_grouped_qkv_linear_rope_int8(
+                                 h3_gpu *opaque,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *quantized_input,
+                                 h3_gpu_tensor *input_scales,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
+    uint32_t inner = heads * head_dim;
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    size_t projected = (size_t)rows * inner;
+    size_t rope_count = (size_t)rows * rope_half;
+    if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
+        head_dim != 128 || heads % 4 || rope_half != 48 ||
+        !h3_gpu_require_i8(gpu, weight,
+                           (size_t)inner * 3 * input_dim,
+                           @"int8 QKV projection weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, inner * 3,
+                            @"int8 QKV weight scales") ||
+        !h3_gpu_require_bf16(gpu, q_norm, head_dim, @"int8 Q norm") ||
+        !h3_gpu_require_bf16(gpu, k_norm, head_dim, @"int8 K norm") ||
+        !h3_gpu_require_bf16(gpu, rope_cos, rope_count,
+                             @"int8 RoPE cosine") ||
+        !h3_gpu_require_bf16(gpu, rope_sin, rope_count,
+                             @"int8 RoPE sine") ||
+        !h3_gpu_require_bf16(gpu, query, projected, @"int8 query") ||
+        !h3_gpu_require_bf16(gpu, key, projected, @"int8 key") ||
+        !h3_gpu_require_bf16(gpu, value, projected, @"int8 value") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    if (!h3_gpu_quantize_bf16_int8_rows(
+            opaque, quantized_input, input_scales, input, rows, padded_rows,
+            input_dim, 1.0f, @"int8 QKV input")) return 0;
+    id<MTLComputePipelineState> projection = h3_gpu_pipeline(
+        gpu, @"h3_qkv_project_split_int8_nax_r128_morton4");
+    id<MTLComputePipelineState> rope = h3_gpu_pipeline(
+        gpu, @"h3_qk_rope_bf16_nax_inplace");
+    if (!projection || projection.maxTotalThreadsPerThreadgroup < 256 ||
+        !rope || rope.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"int8 M5 QKV projection is unavailable");
+        return 0;
+    }
+    typedef struct {
+        uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
+        float epsilon;
+    } qkv_project_rope_args;
+    qkv_project_rope_args args = {
+        rows, input_dim, heads, head_dim, rope_half, 1, epsilon
+    };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:projection];
+        [encoder setBuffer:TENSOR(quantized_input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(input_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:6];
+        [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        NSUInteger groups = (NSUInteger)(padded_rows / 128u) * heads * 3u;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+        encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:rope];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 2;
+    gpu.stats = stats;
+    gpu.headMajorSDPAInputs = YES;
     return 1;
 }
 

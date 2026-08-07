@@ -1555,6 +1555,69 @@ kernel void h3_quantize_bf16_int8_groups_scalar128(
     }
 }
 
+/* Int8 H3 QKV projection. Checkpoint columns are grouped as
+ * [head, q/k/v, dimension], so each 128-column TensorOps tile writes one
+ * complete stream/head directly in head-major SDPA layout. */
+kernel void h3_qkv_project_split_int8_nax_r128_morton4(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *query [[buffer(4)]],
+                           device bfloat *key [[buffer(5)]],
+                           device bfloat *value [[buffer(6)]],
+                           constant h3_qkv_project_rope_args &args
+                               [[buffer(7)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE = 128;
+    constexpr uint STREAMS = 3;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.heads * STREAMS;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint checkpoint_column = group.y * TILE;
+    uint head = group.y / STREAMS;
+    uint stream = group.y - head * STREAMS;
+    device bfloat *destination = stream == 0 ? query :
+        stream == 1 ? key : value;
+    destination += head * args.rows * TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>(
+            (int)args.input_dim, (int)args.heads * (int)TILE * 3));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+    auto first_b = w.slice<TILE, TILE>(0, (int)checkpoint_column);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+        auto b = w.slice<TILE, TILE>((int)k, (int)checkpoint_column);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = (uint)index[0];
+        if (row < args.rows)
+            destination[row * TILE + column] =
+                (bfloat)((float)accum[element] * input_scales[row] *
+                         weight_scales[checkpoint_column + column]);
+    }
+}
+
 kernel void h3_fc1_swiglu_int8_nax_r128(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],

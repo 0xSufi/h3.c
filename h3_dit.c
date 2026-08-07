@@ -31,6 +31,8 @@ typedef struct {
     h3_gpu_tensor *norm1;
     h3_gpu_tensor *norm2;
     h3_gpu_tensor *qkv;
+    h3_gpu_tensor *qkv_int8;
+    h3_gpu_tensor *qkv_scales;
     h3_gpu_tensor *q_norm;
     h3_gpu_tensor *k_norm;
     h3_gpu_tensor *out;
@@ -49,6 +51,8 @@ struct h3_dit {
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
+    int int8_qkv;
+    int keep_bf16_qkv;
     int use_slower_grouped_quantizer;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -484,6 +488,8 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->norm1);
     free_tensor(&block->norm2);
     free_tensor(&block->qkv);
+    free_tensor(&block->qkv_int8);
+    free_tensor(&block->qkv_scales);
     free_tensor(&block->q_norm);
     free_tensor(&block->k_norm);
     free_tensor(&block->out);
@@ -522,6 +528,26 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
         free_tensor(&block->fc1);
         free_tensor(&block->fc2);
     }
+    return 1;
+}
+
+static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
+                              char *error, size_t error_size) {
+    block->qkv_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)INNER * 3 * HIDDEN);
+    block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    int ok = block->qkv_int8 && block->qkv_scales &&
+             h3_gpu_begin(dit->gpu) &&
+             h3_gpu_quantize_weight_int8(
+                 dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
+                 INNER * 3, HIDDEN) &&
+             h3_gpu_submit(dit->gpu);
+    if (!ok) {
+        fail(error, error_size, "cannot quantize DiT QKV weight: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
     return 1;
 }
 
@@ -1005,6 +1031,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         if (dit->int8_mlp &&
             !quantize_block_mlp(dit, &dit->blocks[index],
                                 error, error_size)) return 0;
+        if (dit->int8_qkv &&
+            !quantize_block_qkv(dit, &dit->blocks[index],
+                                error, error_size)) return 0;
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
@@ -1203,7 +1232,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (dit->int8_mlp) {
+    if (dit->int8_mlp || dit->int8_qkv) {
         size_t padded_sequence = (sequence + 127) & ~(size_t)127;
         dit->int8_activation = h3_gpu_tensor_new_i8(
             dit->gpu, padded_sequence * FFN);
@@ -1211,7 +1240,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             dit->gpu, padded_sequence * (FFN / 1024));
         if (!dit->int8_activation || !dit->int8_activation_scales) {
             fail(error, error_size,
-                 "cannot allocate int8 DiT MLP activation arena: %s",
+                 "cannot allocate int8 DiT activation arena: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1281,6 +1310,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         unsigned core_reuse_interval,
                         int token_reduction,
                         int use_slower_bf16_mlp,
+                        int use_slower_bf16_qkv,
                         int use_slower_grouped_quantizer,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
@@ -1333,6 +1363,11 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = dit->fused_mlp && !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
+    dit->int8_qkv = !use_slower_bf16_qkv && dit->sequence >= 128 &&
+                    h3_gpu_has_int8_mlp(dit->gpu);
+    dit->keep_bf16_qkv = dit->int8_qkv &&
+        (getenv("H3_INT8_KEEP_BF16_QKV") ||
+         getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
@@ -1383,12 +1418,14 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
                          int use_slower_grouped_quantizer,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
-                    use_slower_bf16_mlp, use_slower_grouped_quantizer,
+                    use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_grouped_quantizer,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1403,6 +1440,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
                          int use_slower_grouped_quantizer,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
@@ -1412,7 +1450,8 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
-                    use_slower_bf16_mlp, use_slower_grouped_quantizer,
+                    use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_grouped_quantizer,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -1527,11 +1566,21 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    OP(h3_gpu_grouped_qkv_linear_rope_bf16(
-        dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
-        dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
-        rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
-       "DiT QKV projection/norm/RoPE");
+    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+        OP(h3_gpu_grouped_qkv_linear_rope_int8(
+            dit->gpu, dit->query, dit->key, dit->value,
+            dit->int8_activation, dit->int8_activation_scales,
+            dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT int8 QKV projection/norm/RoPE");
+    } else {
+        OP(h3_gpu_grouped_qkv_linear_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
+            rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
+            1e-5f), "DiT QKV projection/norm/RoPE");
+    }
     OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
         dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "DiT full attention");

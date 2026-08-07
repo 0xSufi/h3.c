@@ -84,6 +84,8 @@ typedef struct {
     /* Force the portable close-reference BF16/MPS MLP implementation instead
      * of the fastest validated native MLP supported by the current GPU. */
     int use_slower_bf16_mlp;
+    /* Force the portable close-reference BF16 QKV projection. */
+    int use_slower_bf16_qkv;
     /* Force the original 256-thread FC2 grouped activation quantizer. */
     int use_slower_grouped_quantizer;
     h3_frame_callback on_frame;
@@ -94,7 +96,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

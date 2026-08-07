@@ -577,6 +577,15 @@ releases each block's BF16 FC1/FC2 buffers after their submitted quantization
 finishes, reducing measured peak tensor storage to 25.9 GiB from the BF16
 path's 36.4 GiB. Runtime weight quantization still adds startup time.
 
+The fastest M5 path also quantizes each DiT QKV projection and writes its
+Q/K/V tiles directly in head-major attention layout before the existing Q/K
+normalization and RoPE kernel. In a fixed 50-layer, 19-transition 512x512
+render this reduced denoising again, from 25.80 to 19.32 seconds. Sampled
+beginning, middle, and final frames remained a coherent detailed fox walking
+through snow; quantized attention can change framing and fine detail. Use
+`--use-slower-bf16-qkv` for the close-reference BF16 projection. Normal int8
+loading releases the redundant BF16 QKV weights after quantization.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \
