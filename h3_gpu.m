@@ -37,7 +37,8 @@
 @property(nonatomic, strong) MPSGraphTensor *key;
 @property(nonatomic, strong) MPSGraphTensor *value;
 @property(nonatomic, strong) MPSGraphTensor *output;
-@property(nonatomic, strong) NSArray<NSNumber *> *shape;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
 @end
 @implementation H3SDPA
 @end
@@ -115,6 +116,7 @@
 @property(nonatomic, copy) NSString *profileLabel;
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
+@property(nonatomic) BOOL headMajorSDPAInputs;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -437,6 +439,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_bf16_nax_r128"];
             [names addObject:@"h3_linear_bf16_nax_r128_morton"];
             [names addObject:@"h3_linear_bf16_nax_r128_morton4"];
+            [names addObject:
+                @"h3_qkv_project_split_bf16_nax_r128_morton4"];
+            [names addObject:@"h3_qk_rope_bf16_nax_inplace"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
@@ -1369,22 +1374,32 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
 static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
                                  uint32_t sequence,
                                  uint32_t heads, uint32_t head_dim, float scale,
-                                 MPSDataType dataType, int causal) {
+                                 MPSDataType dataType, int causal,
+                                 int headMajor) {
     @autoreleasepool {
-        NSString *cacheKey = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%.9g:%d",
+        NSString *cacheKey = [NSString stringWithFormat:
+                              @"%u:%u:%u:%u:%u:%.9g:%d:%d",
                               (unsigned)dataType, batch, sequence, heads,
-                              head_dim, scale, causal];
+                              head_dim, scale, causal, headMajor];
         H3SDPA *cached = gpu.sdpaCache[cacheKey];
         if (cached) return cached;
         MPSGraph *graph = [[MPSGraph alloc] init];
-        NSArray<NSNumber *> *shape = @[@(batch), @(sequence), @(heads),
-                                       @(head_dim)];
-        MPSGraphTensor *q = [graph placeholderWithShape:shape dataType:dataType name:nil];
-        MPSGraphTensor *k = [graph placeholderWithShape:shape dataType:dataType name:nil];
-        MPSGraphTensor *v = [graph placeholderWithShape:shape dataType:dataType name:nil];
-        MPSGraphTensor *qt = [graph transposeTensor:q dimension:1 withDimension:2 name:nil];
-        MPSGraphTensor *kt = [graph transposeTensor:k dimension:1 withDimension:2 name:nil];
-        MPSGraphTensor *vt = [graph transposeTensor:v dimension:1 withDimension:2 name:nil];
+        NSArray<NSNumber *> *outputShape =
+            @[@(batch), @(sequence), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *inputShape = headMajor ?
+            @[@(batch), @(heads), @(sequence), @(head_dim)] : outputShape;
+        MPSGraphTensor *q = [graph placeholderWithShape:inputShape
+                                               dataType:dataType name:nil];
+        MPSGraphTensor *k = [graph placeholderWithShape:inputShape
+                                               dataType:dataType name:nil];
+        MPSGraphTensor *v = [graph placeholderWithShape:inputShape
+                                               dataType:dataType name:nil];
+        MPSGraphTensor *qt = headMajor ? q :
+            [graph transposeTensor:q dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kt = headMajor ? k :
+            [graph transposeTensor:k dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *vt = headMajor ? v :
+            [graph transposeTensor:v dimension:1 withDimension:2 name:nil];
         if (![graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
             h3_gpu_set_error(gpu, @"native MPSGraph SDPA is unavailable");
             return nil;
@@ -1416,7 +1431,8 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         result.key = k;
         result.value = v;
         result.output = [graph transposeTensor:attention dimension:1 withDimension:2 name:nil];
-        result.shape = shape;
+        result.inputShape = inputShape;
+        result.outputShape = outputShape;
         gpu.sdpaCache[cacheKey] = result;
         return result;
     }
@@ -1430,6 +1446,9 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        h3_gpu_dtype tensor_dtype, MPSDataType mps_dtype,
                        int causal) {
     H3GPU *gpu = GPU(opaque);
+    int headMajor = gpu.headMajorSDPAInputs &&
+        tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal;
+    gpu.headMajorSDPAInputs = NO;
     size_t count = (size_t)batch * sequence * heads * head_dim;
     if (!batch || !sequence || !heads || !head_dim ||
         !h3_gpu_require_command(gpu) ||
@@ -1443,18 +1462,21 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         return 0;
     }
     H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
-                                      scale, mps_dtype, causal);
+                                      scale, mps_dtype, causal, headMajor);
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
         MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
             ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
-                return h3_gpu_graph_data(tensor, cache.shape, mps_dtype, 0);
+                return h3_gpu_graph_data(tensor, cache.inputShape,
+                                         mps_dtype, 0);
             };
         NSDictionary *feeds = @{
             cache.query: data(query), cache.key: data(key), cache.value: data(value)
         };
-        NSDictionary *results = @{cache.output: data(output)};
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(
+            output, cache.outputShape, mps_dtype, 0);
+        NSDictionary *results = @{cache.output: outputData};
         @try {
             [cache.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
                              resultsDictionary:results executionDescriptor:nil];
@@ -3065,6 +3087,111 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
     return h3_gpu_qkv_rope_bf16_layout(
         opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
         sequence, heads, head_dim, rope_half, 1, epsilon);
+}
+
+int h3_gpu_grouped_qkv_linear_rope_bf16(
+                                 h3_gpu *opaque,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
+    uint32_t inner = heads * head_dim;
+    BOOL candidate = gpu.tensorOpsEnabled && rows >= 64 && rows <= 2048 &&
+        input_dim == 5376 && heads == 56 && head_dim == 128 &&
+        rope_half == 48 &&
+        (gpu.tensorOpsMode == 1 || gpu.tensorOpsMode == 3 ||
+         gpu.tensorOpsMode == 4) &&
+        !getenv("H3_DISABLE_NAX_LINEAR") &&
+        !getenv("H3_DISABLE_SPLIT_NAX_QKV");
+    if (!candidate) {
+        return h3_gpu_linear_bf16(opaque, qkv, input, weight, NULL, rows,
+                                  input_dim, inner * 3) &&
+            h3_gpu_grouped_qkv_rope_bf16(
+                opaque, query, key, value, qkv, q_norm, k_norm, rope_cos,
+                rope_sin, rows, heads, head_dim, rope_half, epsilon);
+    }
+    size_t projected = (size_t)rows * inner;
+    size_t rope_count = (size_t)rows * rope_half;
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"split QKV projection input") ||
+        !h3_gpu_require_bf16(gpu, weight,
+                             (size_t)inner * 3 * input_dim,
+                             @"split QKV projection weight") ||
+        !h3_gpu_require_bf16(gpu, q_norm, head_dim,
+                             @"split Q norm") ||
+        !h3_gpu_require_bf16(gpu, k_norm, head_dim,
+                             @"split K norm") ||
+        !h3_gpu_require_bf16(gpu, rope_cos, rope_count,
+                             @"split RoPE cosine") ||
+        !h3_gpu_require_bf16(gpu, rope_sin, rope_count,
+                             @"split RoPE sine") ||
+        !h3_gpu_require_bf16(gpu, query, projected, @"split query") ||
+        !h3_gpu_require_bf16(gpu, key, projected, @"split key") ||
+        !h3_gpu_require_bf16(gpu, value, projected, @"split value") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    uint32_t headMajor = getenv("H3_DISABLE_HEAD_MAJOR_SDPA") == NULL;
+    typedef struct {
+        uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
+        float epsilon;
+    } qkv_project_rope_args;
+    qkv_project_rope_args args = {
+        rows, input_dim, heads, head_dim, rope_half, headMajor, epsilon
+    };
+    id<MTLComputePipelineState> projection = h3_gpu_pipeline(
+        gpu, @"h3_qkv_project_split_bf16_nax_r128_morton4");
+    id<MTLComputePipelineState> rope = h3_gpu_pipeline(
+        gpu, @"h3_qk_rope_bf16_nax_inplace");
+    const NSUInteger threads = 128;
+    if (!projection || !rope ||
+        projection.maxTotalThreadsPerThreadgroup < threads ||
+        rope.maxTotalThreadsPerThreadgroup < threads) {
+        h3_gpu_set_error(gpu,
+            @"split M5 QKV projection/RoPE needs 128 threads");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:projection];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        NSUInteger groups = (NSUInteger)((rows + 127) / 128) * heads * 6;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+        encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:rope];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 2;
+    gpu.stats = stats;
+    gpu.headMajorSDPAInputs = headMajor != 0;
+    return 1;
 }
 
 int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

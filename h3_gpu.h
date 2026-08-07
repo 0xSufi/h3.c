@@ -386,6 +386,24 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                                  uint32_t sequence, uint32_t heads,
                                  uint32_t head_dim, uint32_t rope_half,
                                  float epsilon);
+/* Project grouped H3 QKV and apply its exact Q/K norm/RoPE boundary. Metal 4
+ * may route projections directly into the attention layout; other devices
+ * retain the ordinary two calls. */
+int h3_gpu_grouped_qkv_linear_rope_bf16(
+                                 h3_gpu *gpu,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

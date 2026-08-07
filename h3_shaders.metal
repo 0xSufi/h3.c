@@ -930,6 +930,140 @@ kernel void h3_linear_bf16_nax_r128_morton4(
     mm.run(mx, mw, my);
 }
 
+struct h3_qkv_project_rope_args {
+    uint rows;
+    uint input_dim;
+    uint heads;
+    uint head_dim;
+    uint rope_half;
+    uint head_major;
+    float epsilon;
+};
+
+/* Preserve the successful direct 128x64 TensorOps matmul, but route each
+ * grouped checkpoint tile directly to its Q, K, or V destination. The six
+ * 64-column tiles of every head align exactly with Q0/Q1/K0/K1/V0/V1. */
+kernel void h3_qkv_project_split_bf16_nax_r128_morton4(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *query [[buffer(2)]],
+                           device bfloat *key [[buffer(3)]],
+                           device bfloat *value [[buffer(4)]],
+                           constant h3_qkv_project_rope_args &args
+                               [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr int ROW_TILE = 128;
+    constexpr int COLUMN_TILE = 64;
+    constexpr int HEAD_DIM = 128;
+    constexpr int TILES_PER_HEAD = 6;
+    uint row_tiles = (args.rows + ROW_TILE - 1) / ROW_TILE;
+    uint2 group = h3_morton_decode_compact4(code, row_tiles);
+    uint head = group.y / TILES_PER_HEAD;
+    uint head_tile = group.y - head * TILES_PER_HEAD;
+    uint stream = head_tile >> 1;
+    uint tile_half = head_tile & 1;
+    device bfloat *destination = stream == 0 ? query :
+        stream == 1 ? key : value;
+    if (args.head_major) destination += head * args.rows * HEAD_DIM;
+    int output_width = args.head_major ? HEAD_DIM :
+        (int)args.heads * HEAD_DIM;
+    int output_column = (args.head_major ? 0 : (int)head * HEAD_DIM) +
+        (int)tile_half * COLUMN_TILE;
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>(
+            (int)args.input_dim, (int)args.heads * HEAD_DIM * 3));
+    auto y = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        destination, dextents<int32_t, 2>(output_width, (int)args.rows));
+    auto mx = x.slice(0, (int)group.x * ROW_TILE);
+    auto mw = w.slice(0, (int)group.y * COLUMN_TILE);
+    auto my = y.slice(output_column, (int)group.x * ROW_TILE);
+    matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    mm.run(mx, mw, my);
+}
+
+/* Q and K already have the requested attention layout. Cache both 128-wide
+ * heads, retain the oracle's lane-zero scalar RMS order, and overwrite them
+ * with the rounded normalized/RoPE result. V needs no second pass. */
+kernel void h3_qk_rope_bf16_nax_inplace(
+                           device bfloat *query [[buffer(0)]],
+                           device bfloat *key [[buffer(1)]],
+                           device bfloat *q_weight [[buffer(2)]],
+                           device bfloat *k_weight [[buffer(3)]],
+                           device bfloat *rope_cos [[buffer(4)]],
+                           device bfloat *rope_sin [[buffer(5)]],
+                           constant h3_qkv_project_rope_args &args
+                               [[buffer(6)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint HEAD_DIM = 128;
+    constexpr uint HEADS_PER_GROUP = 4;
+    uint head = group.x * HEADS_PER_GROUP + simdgroup;
+    uint row = group.y;
+    if (head >= args.heads || row >= args.rows) return;
+    uint base = args.head_major ?
+        (head * args.rows + row) * HEAD_DIM :
+        (row * args.heads + head) * HEAD_DIM;
+    threadgroup bfloat q_values[HEADS_PER_GROUP * HEAD_DIM];
+    threadgroup bfloat k_values[HEADS_PER_GROUP * HEAD_DIM];
+    uint cache_base = simdgroup * HEAD_DIM;
+    for (uint dimension = lane; dimension < HEAD_DIM; dimension += 32) {
+        q_values[cache_base + dimension] = query[base + dimension];
+        k_values[cache_base + dimension] = key[base + dimension];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float q_inverse[HEADS_PER_GROUP];
+    threadgroup float k_inverse[HEADS_PER_GROUP];
+    if (lane == 0) {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (uint dimension = 0; dimension < HEAD_DIM; dimension++) {
+            float q_element = (float)q_values[cache_base + dimension];
+            float k_element = (float)k_values[cache_base + dimension];
+            q_sum = fma(q_element, q_element, q_sum);
+            k_sum = fma(k_element, k_element, k_sum);
+        }
+        q_inverse[simdgroup] =
+            rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+        k_inverse[simdgroup] =
+            rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint dimension = lane; dimension < HEAD_DIM; dimension += 32) {
+        float q0 = (float)q_values[cache_base + dimension] *
+                   q_inverse[simdgroup] * (float)q_weight[dimension];
+        float k0 = (float)k_values[cache_base + dimension] *
+                   k_inverse[simdgroup] * (float)k_weight[dimension];
+        if (dimension < args.rope_half) {
+            uint pair = dimension + args.rope_half;
+            float q1 = (float)q_values[cache_base + pair] *
+                       q_inverse[simdgroup] * (float)q_weight[pair];
+            float k1 = (float)k_values[cache_base + pair] *
+                       k_inverse[simdgroup] * (float)k_weight[pair];
+            float c = (float)rope_cos[row * args.rope_half + dimension];
+            float s = (float)rope_sin[row * args.rope_half + dimension];
+            q0 = q0 * c - q1 * s;
+            k0 = k0 * c - k1 * s;
+        } else if (dimension < args.rope_half * 2) {
+            uint pair = dimension - args.rope_half;
+            float q1 = (float)q_values[cache_base + pair] *
+                       q_inverse[simdgroup] * (float)q_weight[pair];
+            float k1 = (float)k_values[cache_base + pair] *
+                       k_inverse[simdgroup] * (float)k_weight[pair];
+            float c = (float)rope_cos[row * args.rope_half + pair];
+            float s = (float)rope_sin[row * args.rope_half + pair];
+            q0 = q0 * c + q1 * s;
+            k0 = k0 * c + k1 * s;
+        }
+        query[base + dimension] = (bfloat)q0;
+        key[base + dimension] = (bfloat)k0;
+    }
+}
+
 /* Pair the two FC1 halves while the TensorOps accumulators are still local.
  * Only the post-SwiGLU [rows, hidden_dim] tensor reaches device memory. */
 kernel void h3_fc1_swiglu_bf16_nax_r128(

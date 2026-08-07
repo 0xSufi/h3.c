@@ -419,11 +419,13 @@ and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
 attention-output projections at sequence lengths up to 2,048. The compact
-Morton schedule is byte-identical to MPSGraph and improves a complete 512x512
-50-block forward by typically 1-2% on the IT/US M5 Max systems. Larger sequences
-stay on MPSGraph, which is faster for their row geometry. `H3_NAX=0` disables
-TensorOps for exact A/B diagnosis. The selection is guarded at runtime and
-falls back to the unchanged portable library if compilation is unavailable.
+Morton schedule routes Q/K/V directly into head-major attention inputs, avoids
+three MPSGraph input transposes, and is byte-identical to the portable path. It
+improves a complete 512x512 50-block forward by about 2% across repeated IT/US
+M5 Max runs. Larger sequences stay on MPSGraph, which is faster for their row
+geometry. `H3_NAX=0` disables TensorOps for exact A/B diagnosis. The selection
+is guarded at runtime and falls back to the unchanged portable library if
+compilation is unavailable.
 
 `H3_NAX=1` forces the broader native BF16 linear path. It passes the complete
 50-block MLX fixture, but remains opt-in: exact-shape microbenchmarks favor its

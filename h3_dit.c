@@ -1453,12 +1453,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    OP(h3_gpu_linear_bf16(dit->gpu, dit->qkv, dit->mod_attention,
-        weight->qkv, NULL, rows, HIDDEN, INNER * 3), "DiT QKV");
-    OP(h3_gpu_grouped_qkv_rope_bf16(
-        dit->gpu, dit->query, dit->key, dit->value,
-        dit->qkv, weight->q_norm, weight->k_norm, rope_cos, rope_sin,
-        rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f), "DiT QK norm/RoPE");
+    OP(h3_gpu_grouped_qkv_linear_rope_bf16(
+        dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+        dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
+        rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+       "DiT QKV projection/norm/RoPE");
     OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
         dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "DiT full attention");

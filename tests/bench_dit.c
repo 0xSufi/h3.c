@@ -736,11 +736,19 @@ static void run_nax_linear_ab(h3_dit *dit, float *video, float *audio,
                               float *video_velocity,
                               float *audio_velocity) {
     char error[512];
+    int head_major_ab = getenv("H3_BENCH_HEAD_MAJOR_SDPA_AB") != NULL;
+    int split_qkv_ab = getenv("H3_BENCH_SPLIT_NAX_QKV_AB") != NULL;
     int schedule_ab = getenv("H3_BENCH_NAX_LINEAR_MORTON_AB") != NULL;
-    const char *disable = schedule_ab ?
-        "H3_DISABLE_NAX_LINEAR_MORTON4" : "H3_DISABLE_NAX_LINEAR";
-    const char *baseline_name = schedule_ab ? "row-major NAX" : "MPSGraph";
-    const char *candidate_name = schedule_ab ? "compact NAX" : "NAX";
+    const char *disable = head_major_ab ? "H3_DISABLE_HEAD_MAJOR_SDPA" :
+        split_qkv_ab ? "H3_DISABLE_SPLIT_NAX_QKV" :
+        schedule_ab ? "H3_DISABLE_NAX_LINEAR_MORTON4" :
+                      "H3_DISABLE_NAX_LINEAR";
+    const char *baseline_name = head_major_ab ? "row-major split QKV" :
+        split_qkv_ab ? "grouped NAX QKV" :
+        schedule_ab ? "row-major NAX" : "MPSGraph";
+    const char *candidate_name = head_major_ab ? "head-major split QKV" :
+        split_qkv_ab ? "split NAX QKV" :
+        schedule_ab ? "compact NAX" : "NAX";
     float *baseline_video = malloc(VIDEO_ELEMENTS * sizeof(*baseline_video));
     float *baseline_audio = malloc(AUDIO_ELEMENTS * sizeof(*baseline_audio));
     float *candidate_video = malloc(VIDEO_ELEMENTS * sizeof(*candidate_video));
@@ -1373,6 +1381,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (getenv("H3_BENCH_NAX_LINEAR_AB") ||
+        getenv("H3_BENCH_HEAD_MAJOR_SDPA_AB") ||
+        getenv("H3_BENCH_SPLIT_NAX_QKV_AB") ||
         getenv("H3_BENCH_NAX_LINEAR_MORTON_AB")) {
         run_nax_linear_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before NAX linear AB\n",
