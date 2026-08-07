@@ -89,6 +89,16 @@ typedef struct {
     int output_frames;
 } vae_context;
 
+struct h3_video_vae_decoder {
+    vae_context vae;
+    tile_axis y_axis;
+    tile_axis x_axis;
+    int latent_h;
+    int latent_w;
+    float latent_mean[LATENT_CHANNELS];
+    float latent_std[LATENT_CHANNELS];
+};
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -566,13 +576,19 @@ static int run_resident_tile(vae_context *vae, char *error,
     return 1;
 }
 
-static int unpack_frames(vae_context *vae, h3_video_frames *output,
-                         char *error, size_t error_size) {
+static int unpack_frame_range(vae_context *vae, int first_frame,
+                              int frame_count, h3_video_frames *output,
+                              char *error, size_t error_size) {
+    if (first_frame < 0 || frame_count < 1 ||
+        first_frame > vae->output_frames - frame_count) {
+        fail(error, error_size, "invalid video VAE output frame range");
+        return 0;
+    }
     size_t projected_count = (size_t)vae->sequence * OUTPUT_PATCH;
     float *rows = malloc(projected_count * sizeof(*rows));
     int pixel_h = vae->latent_h * 16;
     int pixel_w = vae->latent_w * 16;
-    size_t rgb_count = (size_t)vae->output_frames * (size_t)pixel_h *
+    size_t rgb_count = (size_t)frame_count * (size_t)pixel_h *
                        (size_t)pixel_w * 3;
     float *rgb = malloc(rgb_count * sizeof(*rgb));
     if (!rows || !rgb) {
@@ -587,7 +603,8 @@ static int unpack_frames(vae_context *vae, h3_video_frames *output,
     }
     static const float mean[] = {0.485f, 0.456f, 0.406f};
     static const float deviation[] = {0.229f, 0.224f, 0.225f};
-    for (int frame = 0; frame < vae->output_frames; frame++) {
+    for (int output_frame = 0; output_frame < frame_count; output_frame++) {
+        int frame = first_frame + output_frame;
         int decoded_t = frame + FRAME_OFFSET;
         if (vae->output_frames == FIRST_CHUNK_FRAMES && frame >= 17)
             decoded_t += 3;
@@ -608,7 +625,8 @@ static int unpack_frames(vae_context *vae, h3_video_frames *output,
                                   deviation[channel] + mean[channel];
                     if (value < 0.0f) value = 0.0f;
                     if (value > 1.0f) value = 1.0f;
-                    size_t destination = (((size_t)frame * (size_t)pixel_h +
+                    size_t destination = (((size_t)output_frame *
+                        (size_t)pixel_h +
                         (size_t)y) * (size_t)pixel_w + (size_t)x) * 3 +
                         (size_t)channel;
                     rgb[destination] = value;
@@ -617,11 +635,17 @@ static int unpack_frames(vae_context *vae, h3_video_frames *output,
         }
     }
     free(rows);
-    output->frames = vae->output_frames;
+    output->frames = frame_count;
     output->height = pixel_h;
     output->width = pixel_w;
     output->rgb = rgb;
     return h3_gpu_get_stats(vae->gpu, &output->gpu_stats);
+}
+
+static int unpack_frames(vae_context *vae, h3_video_frames *output,
+                         char *error, size_t error_size) {
+    return unpack_frame_range(vae, 0, vae->output_frames, output,
+                              error, error_size);
 }
 
 static void tile_axis_free(tile_axis *axis) {
@@ -735,11 +759,12 @@ static float *extract_latent_tile(const float *latent, int full_t,
 }
 
 static int stitch_tiles(float **tiles, const tile_axis *y_axis,
-                        const tile_axis *x_axis, h3_video_frames *output,
+                        const tile_axis *x_axis, int frame_count,
+                        h3_video_frames *output,
                         char *error, size_t error_size) {
     int full_h = y_axis->starts[y_axis->count - 1] + y_axis->length;
     int full_w = x_axis->starts[x_axis->count - 1] + x_axis->length;
-    size_t count = (size_t)FIRST_CHUNK_FRAMES * (size_t)full_h *
+    size_t count = (size_t)frame_count * (size_t)full_h *
                    (size_t)full_w * 3;
     float *rgb = malloc(count * sizeof(*rgb));
     if (!rgb) {
@@ -758,7 +783,7 @@ static int stitch_tiles(float **tiles, const tile_axis *y_axis,
                 (tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0);
             int keep_w = x_axis->length -
                 (tile_x + 1 < x_axis->count ? x_axis->overlaps[tile_x] : 0);
-            for (int frame = 0; frame < FIRST_CHUNK_FRAMES; frame++)
+            for (int frame = 0; frame < frame_count; frame++)
                 for (int y = 0; y < keep_h; y++)
                     for (int x = 0; x < keep_w; x++)
                         for (int channel = 0; channel < 3; channel++) {
@@ -796,11 +821,227 @@ static int stitch_tiles(float **tiles, const tile_axis *y_axis,
                             rgb[destination] = value;
                         }
         }
-    output->frames = FIRST_CHUNK_FRAMES;
+    output->frames = frame_count;
     output->height = full_h;
     output->width = full_w;
     output->rgb = rgb;
     return 1;
+}
+
+static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
+                                const float *normalized_latent,
+                                int latent_time, int chunk,
+                                int selected_frame,
+                                h3_video_frames *output,
+                                char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!decoder || !normalized_latent || !output || latent_time < 7 ||
+        chunk < 0 || chunk > (latent_time - CHUNK_LATENT_TIME) / 5 ||
+        selected_frame < -1 || selected_frame >= FIRST_CHUNK_FRAMES) {
+        fail(error, error_size, "invalid resident video VAE chunk arguments");
+        return 0;
+    }
+    int tile_count = decoder->y_axis.count * decoder->x_axis.count;
+    float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
+    if (!tiles) {
+        fail(error, error_size, "out of memory retaining video VAE tiles");
+        return 0;
+    }
+    int frame_count = selected_frame >= 0 ? 1 : FIRST_CHUNK_FRAMES;
+    int ok = 1;
+    for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
+        for (int tile_x = 0; tile_x < decoder->x_axis.count && ok; tile_x++) {
+            float *input = extract_latent_tile(
+                normalized_latent, latent_time, decoder->latent_h,
+                decoder->latent_w, chunk * 5,
+                decoder->y_axis.starts[tile_y] / SPATIAL_RATIO,
+                decoder->x_axis.starts[tile_x] / SPATIAL_RATIO,
+                CHUNK_LATENT_TIME, decoder->vae.latent_h,
+                decoder->vae.latent_w, error, error_size);
+            if (!input) {
+                ok = 0;
+                break;
+            }
+            free_tensor(&decoder->vae.latent);
+            ok = prepare_input(&decoder->vae, input,
+                               decoder->latent_mean, decoder->latent_std,
+                               error, error_size) &&
+                 run_resident_tile(&decoder->vae, error, error_size);
+            free(input);
+            if (!ok) break;
+            h3_video_frames tile;
+            memset(&tile, 0, sizeof(tile));
+            ok = selected_frame >= 0 ?
+                unpack_frame_range(&decoder->vae, selected_frame, 1, &tile,
+                                   error, error_size) :
+                unpack_frames(&decoder->vae, &tile, error, error_size);
+            if (ok) {
+                int index = tile_y * decoder->x_axis.count + tile_x;
+                tiles[index] = tile.rgb;
+            }
+        }
+    if (ok) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
+                              frame_count, output, error, error_size);
+    for (int index = 0; index < tile_count; index++) free(tiles[index]);
+    free(tiles);
+    if (!ok) h3_video_frames_free(output);
+    return ok;
+}
+
+h3_video_vae_decoder *h3_video_vae_decoder_load(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        int latent_height, int latent_width,
+                        h3_video_vae_progress progress, void *progress_opaque,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!weight_directory || !shader_source_path || latent_height < 1 ||
+        latent_width < 1 || latent_height > INT32_MAX / SPATIAL_RATIO ||
+        latent_width > INT32_MAX / SPATIAL_RATIO ||
+        (uint64_t)(unsigned)latent_height * (uint64_t)(unsigned)latent_width >
+            UINT32_MAX) {
+        fail(error, error_size, "invalid resident video VAE arguments");
+        return NULL;
+    }
+    h3_video_vae_decoder *decoder = calloc(1, sizeof(*decoder));
+    if (!decoder) {
+        fail(error, error_size, "out of memory creating resident video VAE");
+        return NULL;
+    }
+    decoder->latent_h = latent_height;
+    decoder->latent_w = latent_width;
+    int tile_pixels = configured_tile_pixels(
+        latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
+    int ok = load_latent_normalization(
+        weight_directory, decoder->latent_mean, decoder->latent_std,
+        error, error_size) &&
+        tile_axis_build(latent_height * SPATIAL_RATIO, tile_pixels,
+                        &decoder->y_axis, error, error_size) &&
+        tile_axis_build(latent_width * SPATIAL_RATIO, tile_pixels,
+                        &decoder->x_axis, error, error_size);
+    if (ok && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
+                decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
+    vae_context *vae = &decoder->vae;
+    if (ok) {
+        vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
+        vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
+        vae->latent_t = CHUNK_LATENT_TIME;
+        vae->output_frames = FIRST_CHUNK_FRAMES;
+        vae->patches = (uint32_t)(CHUNK_LATENT_TIME * vae->latent_h *
+                                  vae->latent_w);
+        vae->sequence = vae->patches + SUFFIX;
+        vae->weights = h3_weight_store_open(weight_directory,
+                                             error, error_size);
+        if (vae->weights)
+            vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
+        if (vae->gpu)
+            h3_gpu_profile_set_label(vae->gpu, "resident video VAE decoder");
+        ok = vae->weights && vae->gpu &&
+             load_resident_weights(vae, progress, progress_opaque,
+                                   error, error_size) &&
+             prepare_rope(vae, error, error_size) &&
+             allocate_activations(vae, error, error_size);
+    }
+    if (!ok) {
+        h3_video_vae_decoder_free(decoder);
+        return NULL;
+    }
+    return decoder;
+}
+
+int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_frames *output, int *output_frame_index,
+                        char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (error && error_size) error[0] = '\0';
+    if (!decoder || !normalized_latent || !output || !output_frame_index ||
+        latent_time < CHUNK_LATENT_TIME || (latent_time - 2) % 5) {
+        fail(error, error_size, "invalid video VAE preview arguments");
+        return 0;
+    }
+    int chunks = (latent_time - 2) / 5;
+    int chunk = chunks / 2;
+    int local_frame = FIRST_CHUNK_FRAMES / 2;
+    int output_frames = chunks * 17 + 5;
+    int global_frame = chunk * 17 + local_frame;
+    if (global_frame >= output_frames) global_frame = output_frames - 1;
+    int ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
+                                  chunk, local_frame, output,
+                                  error, error_size);
+    if (ok) *output_frame_index = global_frame;
+    return ok;
+}
+
+int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_frames *output,
+                        char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (error && error_size) error[0] = '\0';
+    if (!decoder || !normalized_latent || !output ||
+        latent_time < CHUNK_LATENT_TIME || (latent_time - 2) % 5) {
+        fail(error, error_size, "invalid resident video VAE decode arguments");
+        return 0;
+    }
+    int chunks = (latent_time - 2) / 5;
+    int output_frames = chunks * 17 + 5;
+    int pixel_h = decoder->latent_h * SPATIAL_RATIO;
+    int pixel_w = decoder->latent_w * SPATIAL_RATIO;
+    size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
+    size_t output_elements = (size_t)output_frames * frame_elements;
+    float *final_rgb = malloc(output_elements * sizeof(*final_rgb));
+    float *temporal_overlap = malloc(5 * frame_elements *
+                                     sizeof(*temporal_overlap));
+    if (!final_rgb || !temporal_overlap) {
+        free(final_rgb);
+        free(temporal_overlap);
+        fail(error, error_size, "out of memory retaining decoded video frames");
+        return 0;
+    }
+    int ok = 1;
+    for (int chunk = 0; chunk < chunks && ok; chunk++) {
+        h3_video_frames decoded;
+        memset(&decoded, 0, sizeof(decoded));
+        ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
+                                  chunk, -1, &decoded, error, error_size);
+        if (!ok) break;
+        if (chunk) for (int frame = 0; frame < 5; frame++) {
+            float alpha = (float)frame / 5.0f;
+            size_t base = (size_t)frame * frame_elements;
+            for (size_t index = 0; index < frame_elements; index++)
+                decoded.rgb[base + index] = temporal_overlap[base + index] *
+                    (1.0f - alpha) + decoded.rgb[base + index] * alpha;
+        }
+        memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
+               decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
+        memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
+               5 * frame_elements * sizeof(*temporal_overlap));
+        h3_video_frames_free(&decoded);
+    }
+    if (ok) {
+        memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
+               temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        output->frames = output_frames;
+        output->height = pixel_h;
+        output->width = pixel_w;
+        output->rgb = final_rgb;
+        final_rgb = NULL;
+        ok = h3_gpu_get_stats(decoder->vae.gpu, &output->gpu_stats);
+    }
+    free(final_rgb);
+    free(temporal_overlap);
+    if (!ok) h3_video_frames_free(output);
+    return ok;
+}
+
+void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder) {
+    if (!decoder) return;
+    cleanup(&decoder->vae);
+    tile_axis_free(&decoder->y_axis);
+    tile_axis_free(&decoder->x_axis);
+    free(decoder);
 }
 
 static int decode_chunked(const char *weight_directory,
@@ -895,7 +1136,8 @@ static int decode_chunked(const char *weight_directory,
             }
         h3_video_frames decoded;
         memset(&decoded, 0, sizeof(decoded));
-        if (ok) ok = stitch_tiles(tiles, &y_axis, &x_axis, &decoded,
+        if (ok) ok = stitch_tiles(tiles, &y_axis, &x_axis,
+                                  FIRST_CHUNK_FRAMES, &decoded,
                                   error, error_size);
         for (int index = 0; index < tile_count; index++) free(tiles[index]);
         free(tiles);

@@ -13,6 +13,10 @@ typedef struct h3_dit h3_dit;
 typedef void (*h3_dit_progress)(const char *phase, int completed, int total,
                                 void *opaque);
 
+typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
+                              const float *video_latent,
+                              size_t video_elements, void *opaque);
+
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
  * happen before the persistent 37 GiB core is mapped, keeping phase residency
  * bounded on 128 GiB machines. */
@@ -87,6 +91,16 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+
+/* Preview variant. The callback runs after every Euler transition with the
+ * current channel-major F32 video latent. It is deliberately opt-in because it
+ * introduces a synchronization point after each step. */
+int h3_dit_denoise_euler_preview(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size);
 
 /* Build the velocity-evaluation mask used by the serving sampler. Returns the

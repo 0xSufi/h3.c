@@ -42,7 +42,68 @@ static void progress(int completed, int total, void *opaque) {
         fprintf(stderr, "semantic VAE: %d/%d blocks\n", completed, total);
 }
 
+static void test_resident_preview(const char *model_root) {
+    enum {
+        TEST_T = 12,
+        TEST_FRAMES = 39,
+        TEST_LATENTS = 24 * TEST_T * LATENT_H * LATENT_W,
+        TEST_PIXELS = 3 * TEST_FRAMES * HEIGHT * WIDTH
+    };
+    char error[512];
+    h3_st_header fixture;
+    if (!h3_st_read_header(
+            "misc/fixtures/h3_real_video_vae_256x256x39_f32.safetensors",
+            &fixture, error, sizeof(error))) die(error);
+    float *latent = load_f32(&fixture, "x.latent", TEST_LATENTS);
+    char weights[1024];
+    snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
+    h3_video_frames ordinary;
+    if (!h3_video_vae_decode(weights, "h3_shaders.metal", latent,
+                             TEST_T, LATENT_H, LATENT_W, progress, NULL,
+                             &ordinary, error, sizeof(error))) die(error);
+    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
+        weights, "h3_shaders.metal", LATENT_H, LATENT_W,
+        progress, NULL, error, sizeof(error));
+    if (!decoder) die(error);
+    h3_video_frames preview;
+    int frame_index = -1;
+    if (!h3_video_vae_decoder_preview(
+            decoder, latent, TEST_T, &preview, &frame_index,
+            error, sizeof(error))) die(error);
+    if (preview.frames != 1 || preview.height != HEIGHT ||
+        preview.width != WIDTH || frame_index < 0 ||
+        frame_index >= TEST_FRAMES) {
+        die("resident VAE preview returned the wrong shape or frame");
+    }
+    size_t frame_elements = (size_t)HEIGHT * WIDTH * 3;
+    if (memcmp(preview.rgb,
+               ordinary.rgb + (size_t)frame_index * frame_elements,
+               frame_elements * sizeof(*preview.rgb)))
+        die("resident VAE preview differs from the complete decoder frame");
+    h3_video_frames_free(&preview);
+    h3_video_frames resident;
+    if (!h3_video_vae_decoder_decode(
+            decoder, latent, TEST_T, &resident,
+            error, sizeof(error))) die(error);
+    if (resident.frames != ordinary.frames ||
+        resident.height != ordinary.height ||
+        resident.width != ordinary.width ||
+        memcmp(resident.rgb, ordinary.rgb,
+               (size_t)TEST_PIXELS * sizeof(*resident.rgb)))
+        die("resident final VAE decode differs from the ordinary path");
+    h3_video_frames_free(&resident);
+    h3_video_frames_free(&ordinary);
+    h3_video_vae_decoder_free(decoder);
+    h3_st_free_header(&fixture);
+    free(latent);
+    puts("ok: resident VAE preview and final decode are byte-identical");
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--resident-preview")) {
+        test_resident_preview(argc > 2 ? argv[2] : "MiniMax-H3");
+        return 0;
+    }
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *fixture_path = argc > 2 ? argv[2] :
         "misc/fixtures/h3_semantic_256x22_seed42.safetensors";

@@ -50,7 +50,7 @@ static void usage(const char *program) {
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
-        "      --show             Graphical-terminal frame display (M5)\n"
+        "      --show             Display a frame after every denoising step (M5)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
@@ -167,7 +167,8 @@ static int cli_progress(const char *phase, int completed, int total,
 
 static int cli_frame(const h3_frame *frame, void *opaque) {
     cli_state *state = opaque;
-    if (state->frames_dir && !state->frame_write_failed) {
+    int preview = frame->denoise_step >= 0;
+    if (!preview && state->frames_dir && !state->frame_write_failed) {
         char path[1024];
         int length = snprintf(path, sizeof(path), "%s/frame-%04d.ppm",
                               state->frames_dir, frame->frame_index);
@@ -197,8 +198,20 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
     }
     if (state->frame_write_failed) return 1;
     if (state->display_failed || state->terminal == H3_TERM_NONE) return 0;
-    fprintf(stderr, "h3: frame %d/%d via %s\n", frame->frame_index + 1,
-            frame->frame_count, h3_terminal_protocol_name(state->terminal));
+    if (state->active) {
+        fputc('\n', stderr);
+        state->active = 0;
+    }
+    if (preview)
+        fprintf(stderr,
+                "h3: denoise preview %d/%d, video frame %d/%d via %s\n",
+                frame->denoise_step + 1, frame->denoise_steps,
+                frame->frame_index + 1, frame->frame_count,
+                h3_terminal_protocol_name(state->terminal));
+    else
+        fprintf(stderr, "h3: frame %d/%d via %s\n", frame->frame_index + 1,
+                frame->frame_count,
+                h3_terminal_protocol_name(state->terminal));
     char error[256];
     if (!h3_terminal_display_rgb24(state->terminal, frame->rgb,
                                    frame->width, frame->height, frame->stride,
@@ -457,6 +470,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "h3: graphical output uses %s\n",
                         h3_terminal_protocol_name(cli.terminal));
                 params.on_frame = cli_frame;
+                params.preview_denoise = 1;
             }
         }
         h3_result *result = h3_generate(ctx, prompt, &params);

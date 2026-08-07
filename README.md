@@ -29,8 +29,9 @@ reference.
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps
-(about 0.92 seconds), displays decoded frames in a supported graphical
-terminal, and prints phase timings:
+(about 0.92 seconds), displays the evolving middle-video frame after every
+denoising transition in a supported graphical terminal, and prints phase
+timings:
 
 ```sh
 ./h3 --profile \
@@ -52,7 +53,10 @@ This is deliberately not the most aggressive configuration:
 - `--layers 45` runs 45 of the 50 transformer blocks, reducing both time and
   unified-memory use.
 - `--show` is optional. It supports Kitty/Ghostty and
-  iTerm2/WezTerm/Konsole graphical protocols.
+  iTerm2/WezTerm/Konsole graphical protocols. It loads a resident preview VAE,
+  displays one representative middle-video frame after every Euler transition,
+  and then displays all final frames. This adds preview decode time and roughly
+  10 GiB of temporary model residency; runs without `--show` are unchanged.
 - `--profile` is optional and does not select a different generation path.
 
 The first process invocation also pays model loading and filesystem-cache
@@ -218,8 +222,10 @@ prompt, seed, resolution, frame count, and step count.
 
 ### 7. Preview frames and diagnose performance
 
-- `--show` displays decoded frames in a supported graphical terminal.
-- `--frames-dir DIR` writes every callback frame as a PPM file.
+- `--show` displays a representative frame after every denoising transition,
+  followed by all frames from the completed video.
+- `--frames-dir DIR` writes final callback frames as PPM files. Intermediate
+  `--show` previews are not written there.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is
   unavailable.
 - `--profile` reports phase wall time, Metal encoding/wait time, peak live

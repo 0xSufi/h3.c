@@ -46,6 +46,9 @@ typedef struct {
     const uint8_t *rgb;
     int frame_index;
     int frame_count;
+    /* Non-negative only for an intermediate denoising preview. */
+    int denoise_step;
+    int denoise_steps;
 } h3_frame;
 
 typedef int (*h3_frame_callback)(const h3_frame *frame, void *opaque);
@@ -102,6 +105,8 @@ typedef struct {
     int use_slower_dynamic_fc1_k;
     /* Force the original 256-thread FC2 grouped activation quantizer. */
     int use_slower_grouped_quantizer;
+    /* Decode and deliver one representative frame after every Euler step. */
+    int preview_denoise;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
@@ -110,7 +115,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

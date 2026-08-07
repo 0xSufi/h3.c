@@ -199,6 +199,14 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "token reduction must be zero or one");
         return 0;
     }
+    if (params->preview_denoise != 0 && params->preview_denoise != 1) {
+        h3_set_error(ctx, "denoising preview must be zero or one");
+        return 0;
+    }
+    if (params->preview_denoise && !params->on_frame) {
+        h3_set_error(ctx, "denoising preview requires a frame callback");
+        return 0;
+    }
     if (params->core_reuse > 1 && params->denoise_reuse > 1) {
         h3_set_error(ctx, "core reuse and denoiser reuse cannot be combined");
         return 0;
@@ -293,6 +301,11 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
 
+static void h3_preview_vae_progress_bridge(int completed, int total,
+                                           void *opaque) {
+    h3_progress_emit(opaque, "preview VAE load", completed, total);
+}
+
 static void h3_audio_vae_progress_bridge(int completed, int total,
                                          void *opaque) {
     h3_progress_emit(opaque, "audio VAE", completed, total);
@@ -310,6 +323,105 @@ static void h3_video_encoder_progress_bridge(int completed, int total,
 
 static void h3_vision_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "Qwen vision", completed, total);
+}
+
+static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
+    uint8_t *output = malloc(count);
+    if (!output) return NULL;
+    for (size_t index = 0; index < count; index++) {
+        float scaled = rgb[index] * 255.0f;
+        if (scaled < 0.0f) scaled = 0.0f;
+        if (scaled > 255.0f) scaled = 255.0f;
+        output[index] = (uint8_t)lrintf(scaled);
+    }
+    return output;
+}
+
+typedef struct {
+    h3_generation_progress *progress;
+    h3_video_vae_decoder *decoder;
+    int latent_t;
+    int latent_h;
+    int latent_w;
+    int output_frames;
+    int output_width;
+    int output_height;
+    int failed;
+} h3_live_preview;
+
+static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
+                                      const float *video_latent,
+                                      size_t video_elements, void *opaque) {
+    h3_live_preview *preview = opaque;
+    if (!preview || !preview->progress || !preview->decoder || !video_latent) {
+        if (preview && preview->progress)
+            h3_set_error(preview->progress->ctx,
+                         "invalid denoising preview latent");
+        if (preview) preview->failed = 1;
+        return 1;
+    }
+    size_t expected = (size_t)24 * (size_t)preview->latent_t *
+                      (size_t)preview->latent_h * (size_t)preview->latent_w;
+    if (video_elements != expected) {
+        h3_set_error(preview->progress->ctx,
+                     "invalid denoising preview latent size");
+        preview->failed = 1;
+        return 1;
+    }
+    char detail[512];
+    h3_video_frames decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    int frame_index = 0;
+    if (!h3_video_vae_decoder_preview(
+            preview->decoder, video_latent, preview->latent_t,
+            &decoded, &frame_index, detail, sizeof(detail))) {
+        h3_set_error(preview->progress->ctx,
+                     "cannot decode denoising preview: %s", detail);
+        preview->failed = 1;
+        return 1;
+    }
+    size_t count = (size_t)decoded.width * (size_t)decoded.height * 3;
+    uint8_t *rgb = h3_rgb_f32_to_u8(decoded.rgb, count);
+    h3_video_frames_free(&decoded);
+    if (!rgb) {
+        h3_set_error(preview->progress->ctx,
+                     "out of memory converting denoising preview");
+        preview->failed = 1;
+        return 1;
+    }
+    int source_width = preview->latent_w * H3_VAE_SPATIAL_RATIO;
+    int source_height = preview->latent_h * H3_VAE_SPATIAL_RATIO;
+    if (source_width != preview->output_width ||
+        source_height != preview->output_height) {
+        uint8_t *resized = NULL;
+        if (!h3_resize_rgb24_high_quality(
+                rgb, 1, source_width, source_height,
+                preview->output_width, preview->output_height, &resized)) {
+            free(rgb);
+            h3_set_error(preview->progress->ctx,
+                         "cannot resize denoising preview");
+            preview->failed = 1;
+            return 1;
+        }
+        free(rgb);
+        rgb = resized;
+    }
+    h3_frame frame = {
+        preview->output_width, preview->output_height,
+        preview->output_width * 3, rgb, frame_index,
+        preview->output_frames, completed_steps - 1, total_steps
+    };
+    int cancelled = preview->progress->params->on_frame(
+        &frame, preview->progress->params->callback_opaque);
+    free(rgb);
+    if (cancelled) {
+        h3_set_error(preview->progress->ctx,
+                     "generation cancelled during denoising preview %d",
+                     completed_steps);
+        preview->failed = 1;
+        return 1;
+    }
+    return 0;
 }
 
 /* Qwen consumes reference video as time-major two-frame blocks, while the
@@ -389,6 +501,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_layout layout;
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
+    h3_video_vae_decoder *preview_decoder = NULL;
+    h3_live_preview live_preview;
+    memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
     h3_video_frames frames;
     memset(&frames, 0, sizeof(frames));
@@ -931,6 +1046,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(condition_audio_rows);
     condition_audio_rows = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->preview_denoise) {
+        h3_progress_emit(&progress, "preview VAE load", 0, 36);
+        preview_decoder = h3_video_vae_decoder_load(
+            vae_path, "h3_shaders.metal", latent_h, latent_w,
+            h3_preview_vae_progress_bridge, &progress,
+            detail, sizeof(detail));
+        if (!preview_decoder) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        live_preview.progress = &progress;
+        live_preview.decoder = preview_decoder;
+        live_preview.latent_t = temporal.video_t;
+        live_preview.latent_h = latent_h;
+        live_preview.latent_w = latent_w;
+        live_preview.output_frames = temporal.frame_count;
+        live_preview.output_width = params->width;
+        live_preview.output_height = params->height;
+        if (progress.cancelled) goto cleanup;
+    }
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
     video = malloc(video_count * sizeof(*video));
@@ -946,10 +1081,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    if (!h3_dit_denoise_euler(
+    if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
-            h3_dit_progress_bridge, &progress, detail, sizeof(detail))) {
-        h3_set_error(ctx, "%s", detail);
+            h3_dit_progress_bridge, &progress,
+            preview_decoder ? h3_deliver_denoise_preview : NULL,
+            preview_decoder ? &live_preview : NULL,
+            detail, sizeof(detail))) {
+        if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
     h3_dit_free(dit);
@@ -965,10 +1103,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
-    if (!h3_video_vae_decode(vae_path, "h3_shaders.metal", video,
-                             temporal.video_t, latent_h, latent_w,
-                             h3_vae_progress_bridge, &progress, &frames,
-                             detail, sizeof(detail))) {
+    int video_ok = preview_decoder ?
+        h3_video_vae_decoder_decode(
+            preview_decoder, video, temporal.video_t, &frames,
+            detail, sizeof(detail)) :
+        h3_video_vae_decode(
+            vae_path, "h3_shaders.metal", video,
+            temporal.video_t, latent_h, latent_w,
+            h3_vae_progress_bridge, &progress, &frames,
+            detail, sizeof(detail));
+    if (!video_ok) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
@@ -977,16 +1121,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (progress.cancelled) goto cleanup;
     size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
                        (size_t)frames.width * 3;
-    rgb8 = malloc(rgb_count);
+    rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
     if (!rgb8) {
         h3_set_error(ctx, "out of memory converting generated RGB frames");
         goto cleanup;
-    }
-    for (size_t index = 0; index < rgb_count; index++) {
-        float scaled = frames.rgb[index] * 255.0f;
-        if (scaled < 0.0f) scaled = 0.0f;
-        if (scaled > 255.0f) scaled = 255.0f;
-        rgb8[index] = (uint8_t)lrintf(scaled);
     }
     int output_width = frames.width;
     int output_height = frames.height;
@@ -1008,7 +1146,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         for (int index = 0; index < frames.frames; index++) {
             h3_frame frame = {output_width, output_height, output_width * 3,
                               rgb8 + (size_t)index * frame_bytes,
-                              index, frames.frames};
+                              index, frames.frames, -1, 0};
             if (params->on_frame(&frame, params->callback_opaque)) {
                 h3_set_error(ctx, "generation cancelled while delivering frame %d",
                              index);
@@ -1067,6 +1205,7 @@ cleanup:
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
     h3_dit_free(dit);
+    h3_video_vae_decoder_free(preview_decoder);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);

@@ -17,6 +17,27 @@ typedef struct {
 typedef void (*h3_video_vae_progress)(int completed_blocks, int total_blocks,
                                       void *opaque);
 
+typedef struct h3_video_vae_decoder h3_video_vae_decoder;
+
+/* Resident tiled decoder used by live denoising previews. It decodes one
+ * representative middle frame per preview call and can then produce the final
+ * complete video without loading the 9.7 GiB weight set again. */
+h3_video_vae_decoder *h3_video_vae_decoder_load(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        int latent_height, int latent_width,
+                        h3_video_vae_progress progress, void *progress_opaque,
+                        char *error, size_t error_size);
+int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_frames *output, int *output_frame_index,
+                        char *error, size_t error_size);
+int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_frames *output,
+                        char *error, size_t error_size);
+void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder);
+
 /* Decode aligned H3 temporal chunks, using the released overlap/blend rules in
  * time and 256-pixel overlapping tiles in space. The two-token mode remains
  * available only for the diagnostic MLX fixture. */
