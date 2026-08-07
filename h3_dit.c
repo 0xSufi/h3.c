@@ -46,6 +46,7 @@ struct h3_dit {
     int nax_mlp;
     int activation_aliases;
     int fused_patch_projection;
+    int fused_patch_pack;
     int token_reduction;
     int token_reduction_active;
     unsigned token_reduction_begin;
@@ -103,6 +104,8 @@ struct h3_dit {
     h3_gpu_tensor *audio_projected_f32;
     h3_gpu_tensor *video_projected;
     h3_gpu_tensor *audio_projected;
+    h3_gpu_tensor *video_projection_map;
+    h3_gpu_tensor *audio_projection_map;
     h3_gpu_tensor *hidden;
     h3_gpu_tensor *core_input;
     h3_gpu_tensor *core_residual;
@@ -785,6 +788,64 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
     return 1;
 }
 
+static int prepare_projection_maps(h3_dit *dit, char *error,
+                                   size_t error_size) {
+    unsigned video_segments = 0, audio_segments = 0;
+    for (size_t index = 0; index < dit->layout.segment_count; index++) {
+        h3_segment_kind kind = dit->layout.segments[index].kind;
+        if (kind == H3_SEG_COND || kind == H3_SEG_REF_IMAGE ||
+            kind == H3_SEG_VIDEO)
+            video_segments++;
+        else if (kind != H3_SEG_TEXT)
+            audio_segments++;
+    }
+    uint32_t *video = video_segments > 1 ?
+        malloc((size_t)dit->video_total_rows * sizeof(*video)) : NULL;
+    uint32_t *audio = audio_segments > 1 ?
+        malloc((size_t)dit->audio_total_rows * sizeof(*audio)) : NULL;
+    if ((video_segments > 1 && !video) || (audio_segments > 1 && !audio)) {
+        free(video); free(audio);
+        fail(error, error_size, "out of memory allocating projection maps");
+        return 0;
+    }
+    size_t video_offset = 0, audio_offset = 0;
+    for (size_t index = 0; index < dit->layout.segment_count; index++) {
+        const h3_segment *segment = &dit->layout.segments[index];
+        size_t rows = segment->stop - segment->start;
+        if (segment->kind == H3_SEG_COND ||
+            segment->kind == H3_SEG_REF_IMAGE ||
+            segment->kind == H3_SEG_VIDEO) {
+            for (size_t row = 0; video && row < rows; row++)
+                video[video_offset + row] = (uint32_t)(segment->start + row);
+            video_offset += rows;
+        } else if (segment->kind != H3_SEG_TEXT) {
+            for (size_t row = 0; audio && row < rows; row++)
+                audio[audio_offset + row] = (uint32_t)(segment->start + row);
+            audio_offset += rows;
+        }
+    }
+    if (video_offset != dit->video_total_rows ||
+        audio_offset != dit->audio_total_rows) {
+        free(video); free(audio);
+        fail(error, error_size, "projection map rows are inconsistent");
+        return 0;
+    }
+    if (video)
+        dit->video_projection_map = h3_gpu_tensor_from_u32(
+            dit->gpu, video, dit->video_total_rows);
+    if (audio)
+        dit->audio_projection_map = h3_gpu_tensor_from_u32(
+            dit->gpu, audio, dit->audio_total_rows);
+    free(video); free(audio);
+    if ((video_segments > 1 && !dit->video_projection_map) ||
+        (audio_segments > 1 && !dit->audio_projection_map)) {
+        fail(error, error_size, "cannot allocate projection map tensors: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
+}
+
 static int prepare_token_reduction_maps(h3_dit *dit, char *error,
                                         size_t error_size) {
     if (!dit->token_reduction) return 1;
@@ -971,13 +1032,13 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     dit->activation_aliases = !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
     dit->fused_patch_projection =
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
+    dit->fused_patch_pack = dit->fused_patch_projection &&
+        !getenv("H3_DISABLE_FUSED_PATCH_PACK");
 #define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
 #define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
     h3_gpu_tensor *all[] = {
         F32(video_input, video_total * VIDEO_PATCH),
         F32(audio_input, audio_total * AUDIO_CHANNELS),
-        BF(video_projected, video_total * HIDDEN),
-        BF(audio_projected, audio_total * HIDDEN),
         BF(hidden, sequence * HIDDEN),
         BF(mod_attention, sequence * HIDDEN),
         BF(qkv, sequence * INNER * 3),
@@ -995,6 +1056,18 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
         if (!all[index]) {
             fail(error, error_size, "cannot allocate DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (!dit->fused_patch_pack) {
+        dit->video_projected = h3_gpu_tensor_new_bf16(
+            dit->gpu, video_total * HIDDEN);
+        dit->audio_projected = h3_gpu_tensor_new_bf16(
+            dit->gpu, audio_total * HIDDEN);
+        if (!dit->video_projected || !dit->audio_projected) {
+            fail(error, error_size,
+                 "cannot allocate packed patch projections: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1213,6 +1286,7 @@ static h3_dit *load_dit(const char *weight_directory,
     }
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
@@ -1451,53 +1525,103 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
     if (begin) OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
-    if (dit->fused_patch_projection) {
-        OP(h3_gpu_patch_linear_bf16(
-            dit->gpu, dit->video_projected, dit->video_input,
-            dit->video_patch_w, dit->video_patch_b, dit->video_total_rows,
-            VIDEO_PATCH, HIDDEN), "fused video patch projection");
-        OP(h3_gpu_patch_linear_bf16(
-            dit->gpu, dit->audio_projected, dit->audio_input,
-            dit->audio_patch_w, dit->audio_patch_b, dit->audio_total_rows,
-            AUDIO_CHANNELS, HIDDEN), "fused audio patch projection");
-    } else {
-        OP(h3_gpu_linear_f32(
-            dit->gpu, dit->video_projected_f32, dit->video_input,
-            dit->video_patch_w, dit->video_patch_b, dit->video_total_rows,
-            VIDEO_PATCH, HIDDEN), "video patch projection");
-        OP(h3_gpu_linear_f32(
-            dit->gpu, dit->audio_projected_f32, dit->audio_input,
-            dit->audio_patch_w, dit->audio_patch_b, dit->audio_total_rows,
-            AUDIO_CHANNELS, HIDDEN), "audio patch projection");
-        OP(h3_gpu_cast_f32_to_bf16(
-            dit->gpu, dit->video_projected, dit->video_projected_f32,
-            dit->video_total_rows * HIDDEN), "video BF16 cast");
-        OP(h3_gpu_cast_f32_to_bf16(
-            dit->gpu, dit->audio_projected, dit->audio_projected_f32,
-            dit->audio_total_rows * HIDDEN), "audio BF16 cast");
-    }
     size_t video_offset = 0;
     size_t audio_offset = 0;
-    for (size_t index = 0; index < dit->layout.segment_count; index++) {
-        const h3_segment *segment = &dit->layout.segments[index];
-        size_t segment_rows = segment->stop - segment->start;
-        size_t destination = segment->start * HIDDEN;
-        if (segment->kind == H3_SEG_TEXT) {
-            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
-                dit->refined_text, 0, segment_rows * HIDDEN),
-               "pack refined text");
-        } else if (segment->kind == H3_SEG_COND ||
-                   segment->kind == H3_SEG_REF_IMAGE ||
-                   segment->kind == H3_SEG_VIDEO) {
-            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
-                dit->video_projected, video_offset * HIDDEN,
-                segment_rows * HIDDEN), "pack video source");
-            video_offset += segment_rows;
+    if (dit->fused_patch_pack) {
+        if (dit->video_projection_map)
+            OP(h3_gpu_patch_linear_bf16_map(
+                dit->gpu, dit->hidden, dit->video_input, dit->video_patch_w,
+                dit->video_patch_b, dit->video_projection_map, dit->sequence,
+                dit->video_total_rows, VIDEO_PATCH, HIDDEN),
+               "project mapped video sources");
+        if (dit->audio_projection_map)
+            OP(h3_gpu_patch_linear_bf16_map(
+                dit->gpu, dit->hidden, dit->audio_input, dit->audio_patch_w,
+                dit->audio_patch_b, dit->audio_projection_map, dit->sequence,
+                dit->audio_total_rows, AUDIO_CHANNELS, HIDDEN),
+               "project mapped audio sources");
+        for (size_t index = 0; index < dit->layout.segment_count; index++) {
+            const h3_segment *segment = &dit->layout.segments[index];
+            size_t segment_rows = segment->stop - segment->start;
+            size_t destination = segment->start * HIDDEN;
+            if (segment->kind == H3_SEG_TEXT) {
+                OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
+                    dit->refined_text, 0, segment_rows * HIDDEN),
+                   "pack refined text");
+            } else if (segment->kind == H3_SEG_COND ||
+                       segment->kind == H3_SEG_REF_IMAGE ||
+                       segment->kind == H3_SEG_VIDEO) {
+                if (!dit->video_projection_map)
+                    OP(h3_gpu_patch_linear_bf16_offset(
+                        dit->gpu, dit->hidden, destination, dit->video_input,
+                        video_offset * VIDEO_PATCH, dit->video_patch_w,
+                        dit->video_patch_b, (uint32_t)segment_rows,
+                        VIDEO_PATCH, HIDDEN), "project packed video source");
+                video_offset += segment_rows;
+            } else {
+                if (!dit->audio_projection_map)
+                    OP(h3_gpu_patch_linear_bf16_offset(
+                        dit->gpu, dit->hidden, destination, dit->audio_input,
+                        audio_offset * AUDIO_CHANNELS, dit->audio_patch_w,
+                        dit->audio_patch_b, (uint32_t)segment_rows,
+                        AUDIO_CHANNELS, HIDDEN),
+                       "project packed audio source");
+                audio_offset += segment_rows;
+            }
+        }
+    } else {
+        if (dit->fused_patch_projection) {
+            OP(h3_gpu_patch_linear_bf16(
+                dit->gpu, dit->video_projected, dit->video_input,
+                dit->video_patch_w, dit->video_patch_b,
+                dit->video_total_rows, VIDEO_PATCH, HIDDEN),
+               "fused video patch projection");
+            OP(h3_gpu_patch_linear_bf16(
+                dit->gpu, dit->audio_projected, dit->audio_input,
+                dit->audio_patch_w, dit->audio_patch_b,
+                dit->audio_total_rows, AUDIO_CHANNELS, HIDDEN),
+               "fused audio patch projection");
         } else {
-            OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
-                dit->audio_projected, audio_offset * HIDDEN,
-                segment_rows * HIDDEN), "pack audio source");
-            audio_offset += segment_rows;
+            OP(h3_gpu_linear_f32(
+                dit->gpu, dit->video_projected_f32, dit->video_input,
+                dit->video_patch_w, dit->video_patch_b,
+                dit->video_total_rows, VIDEO_PATCH, HIDDEN),
+               "video patch projection");
+            OP(h3_gpu_linear_f32(
+                dit->gpu, dit->audio_projected_f32, dit->audio_input,
+                dit->audio_patch_w, dit->audio_patch_b,
+                dit->audio_total_rows, AUDIO_CHANNELS, HIDDEN),
+               "audio patch projection");
+            OP(h3_gpu_cast_f32_to_bf16(
+                dit->gpu, dit->video_projected, dit->video_projected_f32,
+                dit->video_total_rows * HIDDEN), "video BF16 cast");
+            OP(h3_gpu_cast_f32_to_bf16(
+                dit->gpu, dit->audio_projected, dit->audio_projected_f32,
+                dit->audio_total_rows * HIDDEN), "audio BF16 cast");
+        }
+        for (size_t index = 0; index < dit->layout.segment_count; index++) {
+            const h3_segment *segment = &dit->layout.segments[index];
+            size_t segment_rows = segment->stop - segment->start;
+            size_t destination = segment->start * HIDDEN;
+            if (segment->kind == H3_SEG_TEXT) {
+                OP(h3_gpu_copy_bf16(dit->gpu, dit->hidden, destination,
+                    dit->refined_text, 0, segment_rows * HIDDEN),
+                   "pack refined text");
+            } else if (segment->kind == H3_SEG_COND ||
+                       segment->kind == H3_SEG_REF_IMAGE ||
+                       segment->kind == H3_SEG_VIDEO) {
+                OP(h3_gpu_copy_bf16(
+                    dit->gpu, dit->hidden, destination, dit->video_projected,
+                    video_offset * HIDDEN, segment_rows * HIDDEN),
+                   "pack video source");
+                video_offset += segment_rows;
+            } else {
+                OP(h3_gpu_copy_bf16(
+                    dit->gpu, dit->hidden, destination, dit->audio_projected,
+                    audio_offset * HIDDEN, segment_rows * HIDDEN),
+                   "pack audio source");
+                audio_offset += segment_rows;
+            }
         }
     }
     if (video_offset != dit->video_total_rows ||
@@ -2231,7 +2355,8 @@ void h3_dit_free(h3_dit *dit) {
     }
     FREE(video_input); FREE(audio_input);
     FREE(video_projected_f32); FREE(audio_projected_f32);
-    FREE(video_projected); FREE(audio_projected); FREE(hidden);
+    FREE(video_projected); FREE(audio_projected);
+    FREE(video_projection_map); FREE(audio_projection_map); FREE(hidden);
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);

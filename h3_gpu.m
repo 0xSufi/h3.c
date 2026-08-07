@@ -401,6 +401,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         NSMutableArray<NSString *> *names = [@[
             @"h3_linear_f32", @"h3_linear_f32_tiled",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
+            @"h3_linear_f32_tiled_bf16_map",
             @"h3_cast_f32_to_bf16",
             @"h3_cast_bf16_to_f32",
             @"h3_rms_norm_f32",
@@ -1004,8 +1005,10 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
-int h3_gpu_patch_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
-                             const h3_gpu_tensor *input,
+int h3_gpu_patch_linear_bf16_offset(
+                             h3_gpu *opaque, h3_gpu_tensor *output,
+                             size_t output_offset,
+                             const h3_gpu_tensor *input, size_t input_offset,
                              const h3_gpu_tensor *weight,
                              const h3_gpu_tensor *bias, uint32_t rows,
                              uint32_t input_dim, uint32_t output_dim) {
@@ -1017,13 +1020,20 @@ int h3_gpu_patch_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"unsupported fused patch projection shape");
         return 0;
     }
-    if (!h3_gpu_require_elements(gpu, input, input_count,
+    if (input_offset > SIZE_MAX - input_count ||
+        output_offset > SIZE_MAX - output_count ||
+        input_offset > SIZE_MAX / sizeof(float) ||
+        output_offset > SIZE_MAX / sizeof(uint16_t)) {
+        h3_gpu_set_error(gpu, @"fused patch projection offset is out of range");
+        return 0;
+    }
+    if (!h3_gpu_require_elements(gpu, input, input_offset + input_count,
                                  @"patch projection input") ||
         TENSOR(input).dtype != H3_GPU_F32 ||
         !h3_gpu_require_elements(gpu, weight, weight_count,
                                  @"patch projection weight") ||
         TENSOR(weight).dtype != H3_GPU_F32 ||
-        !h3_gpu_require_elements(gpu, output, output_count,
+        !h3_gpu_require_elements(gpu, output, output_offset + output_count,
                                  @"patch projection output") ||
         TENSOR(output).dtype != H3_GPU_BF16 ||
         (bias && (!h3_gpu_require_elements(gpu, bias, output_dim,
@@ -1043,11 +1053,85 @@ int h3_gpu_patch_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer
+                       offset:input_offset * sizeof(float) atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer
+                       offset:output_offset * sizeof(uint16_t) atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                                  (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_patch_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    return h3_gpu_patch_linear_bf16_offset(
+        opaque, output, 0, input, 0, weight, bias, rows, input_dim,
+        output_dim);
+}
+
+int h3_gpu_patch_linear_bf16_map(
+                             h3_gpu *opaque, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias,
+                             const h3_gpu_tensor *row_map,
+                             uint32_t output_rows, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)output_rows * output_dim;
+    if (output_dim != 5376 || (input_dim != 32 && input_dim != 96)) {
+        h3_gpu_set_error(gpu, @"unsupported mapped patch projection shape");
+        return 0;
+    }
+    if (!h3_gpu_require_elements(gpu, input, input_count,
+                                 @"mapped patch input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count,
+                                 @"mapped patch weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count,
+                                 @"mapped patch output") ||
+        TENSOR(output).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, row_map, rows,
+                                 @"mapped patch row map") ||
+        TENSOR(row_map).dtype != H3_GPU_U32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_dim,
+                                           @"mapped patch bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32)) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_f32_tiled_bf16_map");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch the mapped patch tile");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
         [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
         [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:5];
         [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
                                                   (rows + 15) / 16, 1)
                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];

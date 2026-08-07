@@ -106,6 +106,45 @@ kernel void h3_linear_f32_tiled_bf16(
         output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
 }
 
+kernel void h3_linear_f32_tiled_bf16_map(
+                                device const float *input [[buffer(0)]],
+                                device const float *weight [[buffer(1)]],
+                                device const float *bias [[buffer(2)]],
+                                device ushort *output [[buffer(3)]],
+                                constant linear_args &args [[buffer(4)]],
+                                device const uint *row_map [[buffer(5)]],
+                                uint2 tid [[thread_position_in_threadgroup]],
+                                uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    threadgroup uint output_rows[16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    if (tid.x == 0)
+        output_rows[tid.y] = row < args.rows ? row_map[row] : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = args.has_bias && column < args.output_dim ?
+        bias[column] : 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            input[row * args.input_dim + input_k] : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+            weight[column * args.input_dim + weight_k] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim)
+        output[output_rows[tid.y] * args.output_dim + column] =
+            h3_f32_to_bf16(sum);
+}
+
 kernel void h3_silu_f32(device const float *input [[buffer(0)]],
                         device float *output [[buffer(1)]],
                         constant uint &count [[buffer(2)]],

@@ -728,8 +728,16 @@ int main(int argc, char **argv) {
         .width = TEXT_WIDTH,
         .values = text_values
     };
+    int ref_layout = getenv("H3_BENCH_REF_LAYOUT") != NULL;
+    h3_layout_ref references[] = {
+        {H3_LAYOUT_REF_IMAGE, 0, 16, 24, 0},
+        {H3_LAYOUT_REF_VIDEO, 3, 16, 24, 20},
+        {H3_LAYOUT_REF_AUDIO, 0, 0, 0, 24}
+    };
     h3_layout_spec spec = {TEXT_ROWS, LATENT_T, LATENT_H, LATENT_W, AUDIO_T,
-                           22, NULL, 0, NULL, 0};
+                           22, NULL, 0, ref_layout ? references : NULL,
+                           ref_layout ? sizeof(references) / sizeof(*references)
+                                      : 0};
     h3_layout layout;
     h3_sigma_schedule sigmas;
     char error[512];
@@ -746,7 +754,8 @@ int main(int argc, char **argv) {
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
     char weights[1024];
-    snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
+    snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,
+             ref_layout ? "Ref2VA" : "FL2VA");
     unsigned active_blocks = 50;
     int reuse_interval = 1;
     const char *layers = getenv("H3_BENCH_LAYERS");
@@ -772,11 +781,35 @@ int main(int argc, char **argv) {
     } else if (final_head_ab) {
         setenv("H3_DISABLE_FUSED_FINAL_HEAD", "1", 1);
     }
-    h3_dit *dit = h3_dit_load_t2va(
-        weights, "h3_shaders.metal", &text, &layout, &sigmas, active_blocks, 1,
-        token_reduction_ab || cross_adaln_ab || final_slice_ab ||
-        final_head_ab,
-        NULL, NULL, error, sizeof(error));
+    int enable_token_reduction = token_reduction_ab || cross_adaln_ab ||
+        final_slice_ab || final_head_ab;
+    h3_dit *dit;
+    if (ref_layout) {
+        size_t video_condition_elements =
+            layout.img_cond_rows * (size_t)96;
+        size_t audio_condition_elements =
+            layout.audio_cond_rows * (size_t)32;
+        float *video_condition = calloc(
+            video_condition_elements ? video_condition_elements : 1,
+            sizeof(*video_condition));
+        float *audio_condition = calloc(
+            audio_condition_elements ? audio_condition_elements : 1,
+            sizeof(*audio_condition));
+        if (!video_condition || !audio_condition)
+            die("out of memory allocating reference conditions");
+        dit = h3_dit_load_conditioned(
+            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            active_blocks, 1, enable_token_reduction, video_condition,
+            video_condition_elements, audio_condition,
+            audio_condition_elements, NULL, NULL, error, sizeof(error));
+        free(video_condition);
+        free(audio_condition);
+    } else {
+        dit = h3_dit_load_t2va(
+            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            active_blocks, 1, enable_token_reduction, NULL, NULL, error,
+            sizeof(error));
+    }
     if (!dit) die(error);
     if (final_slice_ab) {
         unsetenv("H3_DISABLE_FUSED_FINAL_HEAD");

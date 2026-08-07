@@ -207,6 +207,14 @@ on M3 and 1.555 to 1.186 ms on M5, and removes 38.27/59.66 MiB of F32 scratch
 at 512/864-class geometry. `H3_DISABLE_FUSED_PATCH_CAST=1` restores the tiled
 F32 output plus standalone cast; `H3_SCALAR_PATCH=1` selects the scalar
 diagnostic path.
+The same tile binds its output directly into the packed hidden stream, removing
+the BF16 media staging buffers and their blits. This saves another 19.13/29.83
+MiB and improves the 2835-row boundary from 1.847 to 1.730 ms on M3 and 1.282
+to 1.184 ms on M5. Contiguous T2VA uses byte offsets; FL2VA/Ref2VA use compact
+destination-row maps so each modality remains one large dispatch. A complete
+six-segment Ref2VA M5 ABBA remained byte-identical and improved 5.067 to 5.033
+seconds per measured forward pair. `H3_DISABLE_FUSED_PATCH_PACK=1` restores the
+staging buffers and packing blits.
 The DiT core is split into two ordered Metal command buffers so GPU execution
 of the first part overlaps CPU encoding of the second. Thermal-balanced ABBA
 measurements select a 60%-depth split on M5 (30/50, 27/45, and 24/40), with

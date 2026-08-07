@@ -12,7 +12,7 @@ enum {
     SEQUENCE = 32, HIDDEN = 256, HEADS = 4, HEAD_DIM = 32,
     INNER = HEADS * HEAD_DIM, FFN = 128, T_ROWS = 2, T_DIM = 32,
     MODALITIES = 3, MODULATION_SLOTS = 6, ROPE_HALF = 12,
-    MAX_TENSORS = 100
+    MAX_TENSORS = 104
 };
 
 typedef struct {
@@ -450,6 +450,10 @@ static void bench_patch_projection(test_context *test, uint32_t rows) {
         test, h3_gpu_tensor_new_f32(test->gpu, output_count));
     h3_gpu_tensor *bf16_output = own(
         test, h3_gpu_tensor_new_bf16(test->gpu, output_count));
+    size_t destination_offset = (size_t)80 * OUTPUT_DIM;
+    h3_gpu_tensor *packed_output = own(
+        test, h3_gpu_tensor_new_bf16(
+            test->gpu, destination_offset + output_count));
     static const int fused_pattern[] = {0, 1, 1, 0, 0, 1, 1, 0};
     double separate_seconds = 0.0, fused_seconds = 0.0;
     unsigned separate_count = 0, fused_count = 0;
@@ -488,6 +492,49 @@ static void bench_patch_projection(test_context *test, uint32_t rows) {
     double fused = fused_seconds /
         ((double)fused_count * (double)ITERATIONS);
     printf("patch projection %u rows: separate %.3f ms, fused %.3f ms, "
+           "ratio %.4f\n", rows, separate * 1000.0, fused * 1000.0,
+           fused / separate);
+
+    separate_seconds = 0.0;
+    fused_seconds = 0.0;
+    separate_count = 0;
+    fused_count = 0;
+    for (size_t run = 0;
+         run < sizeof(fused_pattern) / sizeof(*fused_pattern); run++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu),
+                    "begin patch packing benchmark");
+        for (unsigned iteration = 0; iteration < ITERATIONS; iteration++) {
+            if (fused_pattern[run]) {
+                require_gpu(test, h3_gpu_patch_linear_bf16_offset(
+                    test->gpu, packed_output, destination_offset, input, 0,
+                    weight, bias, rows, INPUT_DIM, OUTPUT_DIM),
+                            "benchmark directly packed projection");
+            } else {
+                require_gpu(test, h3_gpu_patch_linear_bf16(
+                    test->gpu, bf16_output, input, weight, bias, rows,
+                    INPUT_DIM, OUTPUT_DIM),
+                            "benchmark temporary patch projection");
+                require_gpu(test, h3_gpu_copy_bf16(
+                    test->gpu, packed_output, destination_offset, bf16_output,
+                    0, output_count), "benchmark patch packing blit");
+            }
+        }
+        require_gpu(test, h3_gpu_submit(test->gpu),
+                    "submit patch packing benchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (fused_pattern[run]) {
+            fused_seconds += elapsed;
+            fused_count++;
+        } else {
+            separate_seconds += elapsed;
+            separate_count++;
+        }
+    }
+    separate = separate_seconds /
+        ((double)separate_count * (double)ITERATIONS);
+    fused = fused_seconds / ((double)fused_count * (double)ITERATIONS);
+    printf("patch packing %u rows: temporary %.3f ms, direct %.3f ms, "
            "ratio %.4f\n", rows, separate * 1000.0, fused * 1000.0,
            fused / separate);
 }
@@ -1279,7 +1326,10 @@ int main(int argc, char **argv) {
     test_wide_token_adaln(&test);
 
     {
-        enum { PATCH_ROWS = 16, PATCH_IN = 32, PATCH_OUT = 5376 };
+        enum {
+            PATCH_ROWS = 16, PATCH_IN = 32, PATCH_OUT = 5376,
+            PACKED_ROWS = 24, FIRST_ROWS = 7, SECOND_DESTINATION = 12
+        };
         size_t input_count = PATCH_ROWS * PATCH_IN;
         size_t weight_count = PATCH_OUT * PATCH_IN;
         size_t output_count = PATCH_ROWS * PATCH_OUT;
@@ -1290,8 +1340,12 @@ int main(int argc, char **argv) {
         float *tiled = malloc(output_count * sizeof(*tiled));
         uint16_t *legacy_bf16 = malloc(output_count * sizeof(*legacy_bf16));
         uint16_t *fused_bf16 = malloc(output_count * sizeof(*fused_bf16));
+        uint16_t *packed_bf16 = malloc(
+            (size_t)PACKED_ROWS * PATCH_OUT * sizeof(*packed_bf16));
+        uint16_t *mapped_bf16 = malloc(
+            (size_t)PACKED_ROWS * PATCH_OUT * sizeof(*mapped_bf16));
         require(input && weight && bias && scalar && tiled && legacy_bf16 &&
-                fused_bf16,
+                fused_bf16 && packed_bf16 && mapped_bf16,
                 "patch tile host allocation failed");
         for (size_t index = 0; index < input_count; index++)
             input[index] = (float)((int)(index % 17) - 8) * 0.03125f;
@@ -1313,6 +1367,18 @@ int main(int argc, char **argv) {
             &test, h3_gpu_tensor_new_bf16(test.gpu, output_count));
         h3_gpu_tensor *fused_bf16_output = own(
             &test, h3_gpu_tensor_new_bf16(test.gpu, output_count));
+        h3_gpu_tensor *packed_bf16_output = own(
+            &test, h3_gpu_tensor_new_bf16(
+                test.gpu, (size_t)PACKED_ROWS * PATCH_OUT));
+        h3_gpu_tensor *mapped_bf16_output = own(
+            &test, h3_gpu_tensor_new_bf16(
+                test.gpu, (size_t)PACKED_ROWS * PATCH_OUT));
+        uint32_t packed_rows[PATCH_ROWS];
+        for (uint32_t row = 0; row < PATCH_ROWS; row++)
+            packed_rows[row] = row < FIRST_ROWS ? 3 + row :
+                SECOND_DESTINATION + row - FIRST_ROWS;
+        h3_gpu_tensor *gpu_packed_rows = own(
+            &test, h3_gpu_tensor_from_u32(test.gpu, packed_rows, PATCH_ROWS));
         setenv("H3_SCALAR_PATCH", "1", 1);
         require_gpu(&test, h3_gpu_begin(test.gpu),
                     "begin scalar patch stream");
@@ -1344,6 +1410,20 @@ int main(int argc, char **argv) {
         require_gpu(&test, h3_gpu_patch_linear_bf16(
             test.gpu, fused_bf16_output, gpu_input, gpu_weight, gpu_bias,
             PATCH_ROWS, PATCH_IN, PATCH_OUT), "fused patch BF16 linear");
+        require_gpu(&test, h3_gpu_patch_linear_bf16_offset(
+            test.gpu, packed_bf16_output, (size_t)3 * PATCH_OUT,
+            gpu_input, 0, gpu_weight, gpu_bias, FIRST_ROWS, PATCH_IN,
+            PATCH_OUT), "first packed patch segment");
+        require_gpu(&test, h3_gpu_patch_linear_bf16_offset(
+            test.gpu, packed_bf16_output,
+            (size_t)SECOND_DESTINATION * PATCH_OUT, gpu_input,
+            (size_t)FIRST_ROWS * PATCH_IN, gpu_weight, gpu_bias,
+            PATCH_ROWS - FIRST_ROWS, PATCH_IN, PATCH_OUT),
+                    "second packed patch segment");
+        require_gpu(&test, h3_gpu_patch_linear_bf16_map(
+            test.gpu, mapped_bf16_output, gpu_input, gpu_weight, gpu_bias,
+            gpu_packed_rows, PACKED_ROWS, PATCH_ROWS, PATCH_IN, PATCH_OUT),
+                    "mapped patch segments");
         require_gpu(&test, h3_gpu_submit(test.gpu),
                     "submit fused patch/cast stream");
         require(h3_gpu_tensor_read_bf16(
@@ -1352,11 +1432,40 @@ int main(int argc, char **argv) {
         require(h3_gpu_tensor_read_bf16(
                     fused_bf16_output, fused_bf16, output_count),
                 "cannot read fused patch BF16 output");
+        require(h3_gpu_tensor_read_bf16(
+                    packed_bf16_output, packed_bf16,
+                    (size_t)PACKED_ROWS * PATCH_OUT),
+                "cannot read packed patch BF16 output");
+        require(h3_gpu_tensor_read_bf16(
+                    mapped_bf16_output, mapped_bf16,
+                    (size_t)PACKED_ROWS * PATCH_OUT),
+                "cannot read mapped patch BF16 output");
         require(memcmp(legacy_bf16, fused_bf16,
                        output_count * sizeof(*legacy_bf16)) == 0,
                 "fused patch projection differs from linear plus cast");
+        require(memcmp(legacy_bf16,
+                       packed_bf16 + (size_t)3 * PATCH_OUT,
+                       (size_t)FIRST_ROWS * PATCH_OUT * sizeof(*legacy_bf16)) == 0,
+                "first offset patch segment differs");
+        require(memcmp(legacy_bf16 + (size_t)FIRST_ROWS * PATCH_OUT,
+                       packed_bf16 + (size_t)SECOND_DESTINATION * PATCH_OUT,
+                       (size_t)(PATCH_ROWS - FIRST_ROWS) * PATCH_OUT *
+                           sizeof(*legacy_bf16)) == 0,
+                "second offset patch segment differs");
+        require(memcmp(packed_bf16 + (size_t)3 * PATCH_OUT,
+                       mapped_bf16 + (size_t)3 * PATCH_OUT,
+                       (size_t)FIRST_ROWS * PATCH_OUT * sizeof(*packed_bf16)) == 0,
+                "first mapped patch segment differs");
+        require(memcmp(packed_bf16 +
+                           (size_t)SECOND_DESTINATION * PATCH_OUT,
+                       mapped_bf16 +
+                           (size_t)SECOND_DESTINATION * PATCH_OUT,
+                       (size_t)(PATCH_ROWS - FIRST_ROWS) * PATCH_OUT *
+                           sizeof(*packed_bf16)) == 0,
+                "second mapped patch segment differs");
         free(input); free(weight); free(bias); free(scalar); free(tiled);
-        free(legacy_bf16); free(fused_bf16);
+        free(legacy_bf16); free(fused_bf16); free(packed_bf16);
+        free(mapped_bf16);
     }
     h3_gpu_stats setup_stats;
     require(h3_gpu_get_stats(test.gpu, &setup_stats),
