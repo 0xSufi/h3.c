@@ -1696,9 +1696,23 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
         uint row = row_start + tid;
         if (tid < TILE && row < args.rows) {
             float sum = 0.0f;
-            for (uint dimension = 0; dimension < TILE; dimension++) {
-                float element = (float)destination[row * TILE + dimension];
-                sum = fma(element, element, sum);
+            if (args.head_major == 2) {
+                device const bfloat4 *destination4 =
+                    reinterpret_cast<device const bfloat4 *>(destination);
+                uint vector_base = row * (TILE / 4);
+                for (uint vector = 0; vector < TILE / 4; vector++) {
+                    float4 elements = float4(destination4[vector_base + vector]);
+                    sum = fma(elements.x, elements.x, sum);
+                    sum = fma(elements.y, elements.y, sum);
+                    sum = fma(elements.z, elements.z, sum);
+                    sum = fma(elements.w, elements.w, sum);
+                }
+            } else {
+                for (uint dimension = 0; dimension < TILE; dimension++) {
+                    float element =
+                        (float)destination[row * TILE + dimension];
+                    sum = fma(element, element, sum);
+                }
             }
             inverse[tid] = rsqrt(sum / float(TILE) + args.epsilon);
         }

@@ -59,6 +59,7 @@ struct h3_dit {
     int keep_bf16_attention_out;
     int use_slower_unfused_int8_inputs;
     int use_slower_unfused_qkv_rope;
+    int use_slower_scalar_qkv_rms;
     int use_slower_grouped_quantizer;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -1346,6 +1347,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_bf16_attention_output,
                         int use_slower_unfused_int8_inputs,
                         int use_slower_unfused_qkv_rope,
+                        int use_slower_scalar_qkv_rms,
                         int use_slower_grouped_quantizer,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
@@ -1407,6 +1409,7 @@ static h3_dit *load_dit(const char *weight_directory,
         use_slower_unfused_int8_inputs;
     dit->use_slower_unfused_qkv_rope =
         use_slower_unfused_qkv_rope;
+    dit->use_slower_scalar_qkv_rms = use_slower_scalar_qkv_rms;
     dit->keep_bf16_attention_out = dit->int8_attention_out &&
         (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
          getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
@@ -1467,6 +1470,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_bf16_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
                          int use_slower_grouped_quantizer,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
@@ -1476,6 +1480,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_bf16_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,
+                    use_slower_scalar_qkv_rms,
                     use_slower_grouped_quantizer,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
@@ -1495,6 +1500,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_bf16_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
                          int use_slower_grouped_quantizer,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
@@ -1508,6 +1514,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_bf16_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,
+                    use_slower_scalar_qkv_rms,
                     use_slower_grouped_quantizer,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
@@ -1634,7 +1641,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,
             rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f,
             attention_input_quantized,
-            dit->use_slower_unfused_qkv_rope),
+            dit->use_slower_unfused_qkv_rope,
+            dit->use_slower_scalar_qkv_rms),
            "DiT int8 QKV projection/norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(

@@ -603,6 +603,11 @@ tile as well. The fused epilogue is byte-identical and improves complete
 forwards by 2.1-3.2% at 512 and 1.0-1.8% at 864 in crossed M5 measurements.
 Use `--use-slower-unfused-qkv-rope` to restore the separate Q/K kernel.
 
+At up to 2,048 rows, the exact RMS loop uses BF16x4 loads followed by four
+explicit ordered FMAs. This preserves every output bit and improves 512-class
+forwards by another 0.5-0.6%; larger shapes retain scalar loads because the two
+forms tie there. Use `--use-slower-scalar-qkv-rms` to force scalar loads.
+
 ```sh
 ./h3 --profile -d ./MiniMax-H3 \
   -p "A red fox walks through fresh snow." \

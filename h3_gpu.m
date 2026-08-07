@@ -3704,7 +3704,8 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  uint32_t heads, uint32_t head_dim,
                                  uint32_t rope_half, float epsilon,
                                  int input_is_quantized,
-                                 int use_slower_unfused_qkv_rope) {
+                                 int use_slower_unfused_qkv_rope,
+                                 int use_slower_scalar_qkv_rms) {
     H3GPU *gpu = GPU(opaque);
     gpu.headMajorSDPAInputs = NO;
     uint32_t inner = heads * head_dim;
@@ -3757,8 +3758,11 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
         uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
         float epsilon;
     } qkv_project_rope_args;
+    uint32_t rms_mode = fused_rope && rows <= 2048 &&
+        !use_slower_scalar_qkv_rms &&
+        getenv("H3_DISABLE_VECTOR_QKV_RMS") == NULL ? 2u : 1u;
     qkv_project_rope_args args = {
-        rows, input_dim, heads, head_dim, rope_half, 1, epsilon
+        rows, input_dim, heads, head_dim, rope_half, rms_mode, epsilon
     };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
