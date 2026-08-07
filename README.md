@@ -92,7 +92,7 @@ transformer-core residual while still refreshing the patch projection and
 timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
 validated aggressive limit; values above 6 lose subject fidelity. Core reuse
 and whole-velocity `--reuse` are intentionally mutually exclusive.
-`--token-reduction` is an independent aggressive DiT mode. After block 9 it
+`--token-reduction` is an independent aggressive DiT mode. After block 4 it
 pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is
 kept as a bypass. During the first ten noisy evaluations it restores before
@@ -110,12 +110,12 @@ At the restore boundary, the first full-resolution attention AdaLN is fused
 into expansion: a 10.5 KiB threadgroup row avoids a global residual reread while
 still writing the exact bypass needed by the following residual branch.
 On a thermal-balanced 512x512x22, 19-forward IT M5 Max A/B this reduced denoise
-time from 36.46 to 29.07 seconds (20.3%). Final video/audio latent relative L2
-was 5.13%/14.99%. First/middle/last fox frames retained one clean muzzle,
-coherent legs, and sharp fur; an independent surfer remained consistent while
-emerging with the same board from wave spray. It changes composition and is
+time from 35.64 to 26.11 seconds (26.7%). Final video/audio latent relative L2
+was 5.31%/14.98%. First/middle/last fox frames retained one clean muzzle,
+coherent legs, and sharp fur; an independent surfer remained consistent with
+one rider and board through the wave spray. It changes composition and is
 therefore opt-in rather than the close-reference default.
-`H3_TOKEN_REDUCTION_BLOCKS` can override the later `10:30` interval;
+`H3_TOKEN_REDUCTION_BLOCKS` can override the later `5:30` interval;
 `H3_TOKEN_REDUCTION_EARLY=STEPS:END` overrides the early schedule and `0`
 disables it. `H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
 Token reduction composes cleanly with the validated `--layers 45 --reuse 2`
