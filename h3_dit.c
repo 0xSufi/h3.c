@@ -124,6 +124,8 @@ struct h3_dit {
     h3_gpu_tensor *mlp_output;
     h3_gpu_tensor *final_audio_input;
     h3_gpu_tensor *final_video_input;
+    h3_gpu_tensor *final_audio_inverse;
+    h3_gpu_tensor *final_video_inverse;
     h3_gpu_tensor *final_audio_norm;
     h3_gpu_tensor *final_video_norm;
     h3_gpu_tensor *final_audio_f32;
@@ -983,8 +985,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         BF(attention_output, sequence * HIDDEN),
         BF(mod_mlp, sequence * HIDDEN),
         BF(mlp_output, sequence * HIDDEN),
-        BF(final_audio_norm, audio * HIDDEN),
-        BF(final_video_norm, video * HIDDEN),
+        F32(final_audio_inverse, audio),
+        F32(final_video_inverse, video),
         BF(audio_output_bf16, audio * AUDIO_CHANNELS),
         BF(video_output_bf16, video * VIDEO_PATCH)
     };
@@ -1005,6 +1007,19 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         if (!dit->final_audio_input || !dit->final_video_input) {
             fail(error, error_size,
                  "cannot allocate separate final DiT slices: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (!dit->bf16_final || getenv("H3_DISABLE_FUSED_FINAL_HEAD") ||
+        getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+        dit->final_audio_norm = h3_gpu_tensor_new_bf16(
+            dit->gpu, audio * HIDDEN);
+        dit->final_video_norm = h3_gpu_tensor_new_bf16(
+            dit->gpu, video * HIDDEN);
+        if (!dit->final_audio_norm || !dit->final_video_norm) {
+            fail(error, error_size,
+                 "cannot allocate separate final DiT normalization: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1520,7 +1535,25 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     }
     dit->core_forward_count++;
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
-    if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+    int fused_final_head = dit->bf16_final &&
+        !getenv("H3_DISABLE_FUSED_FINAL_HEAD") &&
+        !getenv("H3_DISABLE_FUSED_FINAL_SLICE");
+    if (fused_final_head) {
+        OP(h3_gpu_adaln_linear_bf16(
+            dit->gpu, dit->audio_output_bf16, dit->final_audio_inverse,
+            dit->hidden, (size_t)dit->audio_target_start * HIDDEN,
+            dit->final_norm, final, dit->final_audio_maps[step],
+            dit->final_audio_w, dit->final_audio_b, dit->audio_rows, HIDDEN,
+            AUDIO_CHANNELS, FINAL_SLOTS, 0, 1, 1e-5f),
+           "fused final audio AdaLN/head");
+        OP(h3_gpu_adaln_linear_bf16(
+            dit->gpu, dit->video_output_bf16, dit->final_video_inverse,
+            dit->hidden, (size_t)dit->video_target_start * HIDDEN,
+            dit->final_norm, final, dit->final_video_maps[step],
+            dit->final_video_w, dit->final_video_b, dit->video_rows, HIDDEN,
+            VIDEO_PATCH, FINAL_SLOTS, 0, 1, 1e-5f),
+           "fused final video AdaLN/head");
+    } else if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         OP(h3_gpu_copy_bf16(dit->gpu, dit->final_audio_input, 0, dit->hidden,
             (size_t)dit->audio_target_start * HIDDEN,
             (size_t)dit->audio_rows * HIDDEN), "slice final audio");
@@ -1547,7 +1580,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
             0, 1, 1e-5f), "fused final video slice/AdaLN");
     }
-    if (dit->bf16_final) {
+    if (dit->bf16_final && !fused_final_head) {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->audio_output_bf16,
             dit->final_audio_norm, dit->final_audio_w, dit->final_audio_b,
             dit->audio_rows, HIDDEN, AUDIO_CHANNELS),
@@ -1556,7 +1589,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->final_video_norm, dit->final_video_w, dit->final_video_b,
             dit->video_rows, HIDDEN, VIDEO_PATCH),
            "BF16 final video head");
-    } else {
+    } else if (!dit->bf16_final) {
         OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
             dit->final_audio_norm, dit->audio_rows * HIDDEN),
            "final audio F32 cast");
@@ -2155,7 +2188,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(final_audio_input);
-    FREE(final_video_input); FREE(final_audio_norm); FREE(final_video_norm);
+    FREE(final_video_input); FREE(final_audio_inverse);
+    FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);

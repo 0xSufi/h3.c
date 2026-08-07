@@ -100,9 +100,14 @@ produces the next block's attention AdaLN and carries that normalized state
 across the loop. `H3_DISABLE_FUSED_GATE_ADALN=1` and
 `H3_DISABLE_FUSED_CROSS_BLOCK_ADALN=1` restore the two-kernel oracles.
 The final audio/video AdaLN kernels bind directly to offsets in the residual
-stream, avoiding two slice blits and 37.5 MiB of scratch at 512x512 (58.9 MiB
+stream, avoiding two slice blits and 18.8 MiB of scratch at 512x512 (29.4 MiB
 at the 864-class benchmark shape).
 `H3_DISABLE_FUSED_FINAL_SLICE=1` restores the copy-plus-AdaLN oracle at load.
+The BF16 final heads then apply AdaLN while loading their 16x16 projection
+tiles, preserving the standalone rounding and accumulation order while
+removing another equally sized normalized activation. The two optimizations
+together save 37.5/58.9 MiB. `H3_DISABLE_FUSED_FINAL_HEAD=1` restores the
+offset-AdaLN-plus-linear oracle at load.
 `--token-reduction` is an independent aggressive DiT mode. After block 3 it
 pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is

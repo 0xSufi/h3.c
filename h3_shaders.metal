@@ -1012,6 +1012,102 @@ kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+/* Preserve the standalone AdaLN reduction tree while emitting only the one
+ * F32 inverse RMS scalar needed by the fused final projection. */
+kernel void h3_rms_inverse_bf16(
+                          device const ushort *input [[buffer(0)]],
+                          device float *inverse [[buffer(1)]],
+                          constant norm_args &args [[buffer(2)]],
+                          uint3 group [[threadgroup_position_in_grid]],
+                          uint3 thread_position
+                              [[thread_position_in_threadgroup]],
+                          uint3 threadgroup_size
+                              [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const ushort *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float value = h3_bf16_to_f32(x[k]);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0)
+        inverse[row] = rsqrt(reductions[0] / float(args.width) +
+                             args.epsilon);
+}
+
+struct h3_adaln_linear_args {
+    uint rows;
+    uint width;
+    uint output_dim;
+    uint slots;
+    uint shift_slot;
+    uint scale_slot;
+    uint has_bias;
+};
+
+/* Apply final AdaLN while loading the existing 16x16 linear tiles. The
+ * normalized value is rounded to BF16 before the dot product, retaining the
+ * exact arithmetic boundary and accumulation order of AdaLN + linear. */
+kernel void h3_adaln_linear_bf16(
+                          device const ushort *input [[buffer(0)]],
+                          device const float *inverse [[buffer(1)]],
+                          device const ushort *norm_weight [[buffer(2)]],
+                          device const ushort *modulation [[buffer(3)]],
+                          device const uint *row_map [[buffer(4)]],
+                          device const ushort *weight [[buffer(5)]],
+                          device const ushort *bias [[buffer(6)]],
+                          device ushort *output [[buffer(7)]],
+                          constant h3_adaln_linear_args &args [[buffer(8)]],
+                          uint2 tid [[thread_position_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup ushort input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = args.has_bias && column < args.output_dim ?
+        h3_bf16_to_f32(bias[column]) : 0.0f;
+    uint base = row < args.rows ?
+        row_map[row] * args.slots * args.width : 0;
+    uint tile_count = (args.width + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        ushort normalized = 0;
+        if (row < args.rows && input_k < args.width) {
+            float value = h3_bf16_to_f32(
+                input[row * args.width + input_k]);
+            float shift = h3_bf16_to_f32(
+                modulation[base + args.shift_slot * args.width + input_k]);
+            float scale = h3_bf16_to_f32(
+                modulation[base + args.scale_slot * args.width + input_k]);
+            float normed = value * inverse[row] *
+                h3_bf16_to_f32(norm_weight[input_k]);
+            normalized = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+        }
+        input_tile[tid.y][tid.x] = normalized;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.width ?
+            h3_bf16_to_f32(weight[column * args.width + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(h3_bf16_to_f32(input_tile[tid.y][k]),
+                      weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim)
+        output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+}
+
 kernel void h3_gate_bf16(device const ushort *residual [[buffer(0)]],
                          device const ushort *branch [[buffer(1)]],
                          device const ushort *modulation [[buffer(2)]],

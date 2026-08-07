@@ -408,6 +408,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
+            @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16",
             @"h3_qkv_rope_bf16", @"h3_swiglu_bf16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
@@ -2560,6 +2561,96 @@ int h3_gpu_adaln_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return h3_gpu_adaln_bf16_offset(
         opaque, output, input, 0, norm_weight, modulation, row_map, rows,
         width, slots, shift_slot, scale_slot, epsilon);
+}
+
+int h3_gpu_adaln_linear_bf16(
+                      h3_gpu *opaque, h3_gpu_tensor *output,
+                      h3_gpu_tensor *inverse,
+                      const h3_gpu_tensor *input, size_t input_offset,
+                      const h3_gpu_tensor *norm_weight,
+                      const h3_gpu_tensor *modulation,
+                      const h3_gpu_tensor *row_map,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t rows,
+                      uint32_t width, uint32_t output_dim, uint32_t slots,
+                      uint32_t shift_slot, uint32_t scale_slot,
+                      float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * width;
+    size_t weight_count = (size_t)output_dim * width;
+    size_t output_count = (size_t)rows * output_dim;
+    if (input_offset > SIZE_MAX - input_count ||
+        input_offset > SIZE_MAX / sizeof(uint16_t)) {
+        h3_gpu_set_error(gpu, @"fused final head input offset is out of range");
+        return 0;
+    }
+    if (!h3_gpu_require_bf16(gpu, input, input_offset + input_count,
+                             @"fused final head input") ||
+        !h3_gpu_require_elements(gpu, inverse, rows,
+                                 @"fused final head inverse RMS") ||
+        TENSOR(inverse).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_bf16(gpu, norm_weight, width,
+                             @"fused final head norm") ||
+        !h3_gpu_require_bf16(gpu, modulation, 1,
+                             @"fused final head modulation") ||
+        !h3_gpu_require_elements(gpu, row_map, rows,
+                                 @"fused final head row map") ||
+        TENSOR(row_map).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_bf16(gpu, weight, weight_count,
+                             @"fused final head weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count,
+                             @"fused final head output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"fused final head bias")) ||
+        shift_slot >= slots || scale_slot >= slots) return 0;
+    norm_args rms_args = {rows, width, epsilon};
+    if (!h3_gpu_dispatch_rows(
+            gpu, @"h3_rms_inverse_bf16", rows,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(input).buffer
+                             offset:input_offset * sizeof(uint16_t) atIndex:0];
+                [encoder setBuffer:TENSOR(inverse).buffer offset:0 atIndex:1];
+                [encoder setBytes:&rms_args length:sizeof(rms_args) atIndex:2];
+            })) return 0;
+    typedef struct {
+        uint32_t rows, width, output_dim, slots, shift_slot, scale_slot;
+        uint32_t has_bias;
+    } adaln_linear_args;
+    adaln_linear_args args = {
+        rows, width, output_dim, slots, shift_slot, scale_slot,
+        bias ? 1u : 0u
+    };
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_adaln_linear_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch fused final BF16 head");
+        return 0;
+    }
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer
+                     offset:input_offset * sizeof(uint16_t) atIndex:0];
+        [encoder setBuffer:TENSOR(inverse).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:7];
+        [encoder setBytes:&args length:sizeof(args) atIndex:8];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((output_dim + 15) / 16, (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_gate_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
