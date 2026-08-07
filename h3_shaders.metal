@@ -25,6 +25,19 @@ struct linear_args {
     uint has_bias;
 };
 
+struct int8_quant_args {
+    uint rows;
+    uint columns;
+    float clip;
+};
+
+struct int8_group_quant_args {
+    uint rows;
+    uint columns;
+    uint group_size;
+    uint groups;
+};
+
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
                           device const float *weight [[buffer(1)]],
                           device const float *bias [[buffer(2)]],
@@ -845,6 +858,19 @@ inline uint2 h3_morton_decode_compact4(uint code, uint row_tiles) {
                  column_block * 4 + tail / tail_rows);
 }
 
+/* Exact compact Morton walk for a final 1-3 column strip as well. */
+inline uint2 h3_morton_decode_compact(uint code, uint row_tiles,
+                                      uint column_tiles) {
+    uint full_columns = column_tiles & ~3u;
+    uint full_groups = row_tiles * full_columns;
+    if (code < full_groups)
+        return h3_morton_decode_compact4(code, row_tiles);
+    uint tail_columns = column_tiles - full_columns;
+    uint tail = code - full_groups;
+    return uint2(tail / tail_columns,
+                 full_columns + tail % tail_columns);
+}
+
 /*
  * M5 Metal 4/TensorOps path for the large H3 matrices.  This follows the
  * retained direct-RHS design in ds4.c: the contiguous dimension comes first
@@ -1242,6 +1268,675 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton4(
             float up = (float)up_tile[index];
             float activated = gate / (1.0f + exp(-gate)) * up;
             output[row * args.output_dim + column] = (bfloat)activated;
+        }
+    }
+}
+
+/* Draw Things/ccv-style dynamic symmetric row quantization. Weight rows are
+ * checkpoint output channels; activation rows include zero-padded M tails so
+ * the int8 matmuls can keep a fully static 128x128x128 descriptor. */
+inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
+                                ushort simdgroup, ushort lane) {
+    value = max(value, simd_shuffle_xor(value, 16));
+    value = max(value, simd_shuffle_xor(value, 8));
+    value = max(value, simd_shuffle_xor(value, 4));
+    value = max(value, simd_shuffle_xor(value, 2));
+    value = max(value, simd_shuffle_xor(value, 1));
+    if (lane == 0) scratch[simdgroup] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        value = lane < 8 ? scratch[lane] : 0.0f;
+        value = max(value, simd_shuffle_xor(value, 16));
+        value = max(value, simd_shuffle_xor(value, 8));
+        value = max(value, simd_shuffle_xor(value, 4));
+        value = max(value, simd_shuffle_xor(value, 2));
+        value = max(value, simd_shuffle_xor(value, 1));
+        if (lane == 0) scratch[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+
+kernel void h3_quantize_bf16_int8_rows(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        if ((args.columns & 3u) == 0) {
+            device char4 *output4 =
+                reinterpret_cast<device char4 *>(output);
+            uint vector_base = row * (args.columns / 4);
+            for (uint column = tid; column < args.columns / 4;
+                 column += 256)
+                output4[vector_base + column] = char4(0);
+        } else {
+            for (uint column = tid; column < args.columns; column += 256)
+                output[base + column] = 0;
+        }
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    float local_max = 0.0f;
+    if ((args.columns & 3u) == 0) {
+        device const bfloat4 *input4 =
+            reinterpret_cast<device const bfloat4 *>(input);
+        uint vectors_per_row = args.columns / 4;
+        uint vector_base = row * vectors_per_row;
+        for (uint column = tid; column < vectors_per_row; column += 256) {
+            float4 value = float4(input4[vector_base + column]);
+            local_max = max(local_max,
+                max(max(fabs(value.x), fabs(value.y)),
+                    max(fabs(value.z), fabs(value.w))));
+        }
+    } else {
+        for (uint column = tid; column < args.columns; column += 256)
+            local_max = max(local_max, fabs((float)input[base + column]));
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, scratch, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    if ((args.columns & 3u) == 0) {
+        device const bfloat4 *input4 =
+            reinterpret_cast<device const bfloat4 *>(input);
+        device char4 *output4 =
+            reinterpret_cast<device char4 *>(output);
+        uint vectors_per_row = args.columns / 4;
+        uint vector_base = row * vectors_per_row;
+        for (uint column = tid; column < vectors_per_row; column += 256) {
+            int4 quantized = int4(rint(
+                float4(input4[vector_base + column]) * inverse));
+            output4[vector_base + column] =
+                char4(clamp(quantized, int4(-127), int4(127)));
+        }
+    } else {
+        for (uint column = tid; column < args.columns; column += 256) {
+            int quantized = (int)rint((float)input[base + column] * inverse);
+            output[base + column] =
+                (int8_t)clamp(quantized, -127, 127);
+        }
+    }
+}
+
+/* Retained only for crossed kernel measurements against the vec4 path. */
+kernel void h3_quantize_bf16_int8_rows_scalar(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        for (uint column = tid; column < args.columns; column += 256)
+            output[base + column] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    float local_max = 0.0f;
+    for (uint column = tid; column < args.columns; column += 256)
+        local_max = max(local_max, fabs((float)input[base + column]));
+    float max_abs = h3_int8_reduce_max(
+        local_max, scratch, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    for (uint column = tid; column < args.columns; column += 256) {
+        int quantized = (int)rint((float)input[base + column] * inverse);
+        output[base + column] = (int8_t)clamp(quantized, -127, 127);
+    }
+}
+
+kernel void h3_quantize_bf16_int8_groups(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint vectors_per_row = args.columns / 4;
+    uint vectors_per_group = args.group_size / 4;
+    uint vector_base = row * vectors_per_row;
+    device const bfloat4 *input4 =
+        reinterpret_cast<device const bfloat4 *>(input);
+    device char4 *output4 = reinterpret_cast<device char4 *>(output);
+    if (row >= args.rows) {
+        for (uint column = tid; column < vectors_per_row; column += 256)
+            output4[vector_base + column] = char4(0);
+        for (uint group = tid; group < args.groups; group += 256)
+            scales[row * args.groups + group] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    for (uint group = 0; group < args.groups; group++) {
+        uint start = vector_base + group * vectors_per_group;
+        float local_max = 0.0f;
+        for (uint local = tid; local < vectors_per_group; local += 256) {
+            float4 value = float4(input4[start + local]);
+            local_max = max(local_max,
+                max(max(fabs(value.x), fabs(value.y)),
+                    max(fabs(value.z), fabs(value.w))));
+        }
+        float max_abs = h3_int8_reduce_max(
+            local_max, scratch, simdgroup, lane);
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0) scales[row * args.groups + group] = scale;
+        for (uint local = tid; local < vectors_per_group; local += 256) {
+            int4 quantized = int4(rint(float4(input4[start + local]) *
+                                       inverse));
+            output4[start + local] =
+                char4(clamp(quantized, int4(-127), int4(127)));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/* Retained only for crossed kernel measurements against the vec4 path. */
+kernel void h3_quantize_bf16_int8_groups_scalar(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint row_base = row * args.columns;
+    if (row >= args.rows) {
+        for (uint column = tid; column < args.columns; column += 256)
+            output[row_base + column] = 0;
+        for (uint group = tid; group < args.groups; group += 256)
+            scales[row * args.groups + group] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[8];
+    for (uint group = 0; group < args.groups; group++) {
+        uint start = group * args.group_size;
+        float local_max = 0.0f;
+        for (uint local = tid; local < args.group_size; local += 256)
+            local_max = max(local_max,
+                fabs((float)input[row_base + start + local]));
+        float max_abs = h3_int8_reduce_max(
+            local_max, scratch, simdgroup, lane);
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0) scales[row * args.groups + group] = scale;
+        for (uint local = tid; local < args.group_size; local += 256) {
+            int quantized = (int)rint(
+                (float)input[row_base + start + local] * inverse);
+            output[row_base + start + local] =
+                (int8_t)clamp(quantized, -127, 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void h3_fc1_swiglu_int8_nax_r128(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE = 128;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.output_dim / TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint column_start = group.y * TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim * 2));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    threadgroup bfloat gate_tile[TILE * TILE];
+    {
+        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+        auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k = 0; k < args.input_dim; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] * input_scales[row] *
+                          weight_scales[column];
+            gate_tile[(uint)index[1] * TILE + (uint)index[0]] =
+                (bfloat)value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+        auto first_b = w.slice<TILE, TILE>(
+            0, (int)args.output_dim + (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k = 0; k < args.input_dim; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>(
+                (int)k, (int)args.output_dim + (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint local = (uint)index[1] * TILE + (uint)index[0];
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            if (row >= args.rows) continue;
+            float gate = (float)gate_tile[local];
+            float up = (float)accum[element] * input_scales[row] *
+                       weight_scales[args.output_dim + column];
+            output[row * args.output_dim + column] =
+                (bfloat)(gate / (1.0f + exp(-gate)) * up);
+        }
+    }
+}
+
+/* Gate and up use the same cooperative-fragment mapping. Preserve the gate's
+ * existing BF16 rounding point in thread-private storage, then consume it
+ * after the up projection without a 32 KiB threadgroup tile or barrier. */
+kernel void h3_fc1_swiglu_int8_local_nax_r128(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE = 128;
+    constexpr uint FRAGMENT_CAPACITY = 64;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.output_dim / TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint column_start = group.y * TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim * 2));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    thread bfloat gate_values[FRAGMENT_CAPACITY];
+    {
+        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+        auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k = 0; k < args.input_dim; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] * input_scales[row] *
+                          weight_scales[column];
+            gate_values[element] = (bfloat)value;
+        }
+    }
+    {
+        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+        auto first_b = w.slice<TILE, TILE>(
+            0, (int)args.output_dim + (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k = 0; k < args.input_dim; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>(
+                (int)k, (int)args.output_dim + (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            if (row >= args.rows) continue;
+            float gate = (float)gate_values[element];
+            float up = (float)accum[element] * input_scales[row] *
+                       weight_scales[args.output_dim + column];
+            output[row * args.output_dim + column] =
+                (bfloat)(gate / (1.0f + exp(-gate)) * up);
+        }
+    }
+}
+
+kernel void h3_linear_int8_nax_r128(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE = 128;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint column_tiles = args.output_dim / TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * TILE;
+    uint column_start = group.y * TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
+    auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(first_a), decltype(first_b), int32_t>();
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++)
+        if (accum.is_valid_element(element)) accum[element] = 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+        auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+        mm.run(a, b, accum);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = column_start + (uint)index[0];
+        if (row < args.rows)
+            output[row * args.output_dim + column] =
+                (bfloat)((float)accum[element] * input_scales[row] *
+                         weight_scales[column]);
+    }
+}
+
+/* FC2 is more sensitive to a single scale spanning all 14336 activated
+ * channels.  Retain one activation scale per 1024-wide K group, accumulate
+ * each group's exact int32 product separately, then apply its scale before
+ * adding it to the FP32 tile.  The 128x64 tile keeps that FP32 tile within
+ * the M5 threadgroup-memory limit. */
+kernel void h3_linear_int8_grouped_nax_r128x64(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint K_TILE = 128;
+    constexpr uint SCALE_GROUP = 1024;
+    constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = args.output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    uint scale_groups = args.input_dim / SCALE_GROUP;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    threadgroup float totals[ROW_TILE * COLUMN_TILE];
+    for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
+        uint k_start = scale_group * SCALE_GROUP;
+        auto first_a = x.slice<ROW_TILE, K_TILE>(
+            (int)k_start, (int)row_start);
+        auto first_b = w.slice<K_TILE, COLUMN_TILE>(
+            (int)k_start, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        #pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < K_TILES_PER_GROUP; k_tile++) {
+            uint k = k_start + k_tile * K_TILE;
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>(
+                (int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint local = (uint)index[1] * COLUMN_TILE +
+                         (uint)index[0];
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] *
+                input_scales[row * scale_groups + scale_group] *
+                weight_scales[column];
+            if (scale_group == 0) totals[local] = value;
+            else totals[local] += value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint local = tid; local < ROW_TILE * COLUMN_TILE; local += 128) {
+        uint row = row_start + local / COLUMN_TILE;
+        uint column = column_start + local % COLUMN_TILE;
+        if (row < args.rows)
+            output[row * args.output_dim + column] = (bfloat)totals[local];
+    }
+}
+
+/* Same scaled K-group arithmetic as the threadgroup-tile version, but the
+ * cooperative tensor assigns the same fragment element to the same thread
+ * for every K slice. Keep those 64 FP32 totals private and eliminate 32 KiB
+ * of threadgroup traffic plus the barrier after every scale group. */
+kernel void h3_linear_int8_grouped_local_nax_r128x64(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint K_TILE = 128;
+    constexpr uint SCALE_GROUP = 1024;
+    constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
+    constexpr uint FRAGMENT_CAPACITY = 64;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = args.output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    uint scale_groups = args.input_dim / SCALE_GROUP;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    thread float totals[FRAGMENT_CAPACITY];
+    for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
+        uint k_start = scale_group * SCALE_GROUP;
+        auto first_a = x.slice<ROW_TILE, K_TILE>(
+            (int)k_start, (int)row_start);
+        auto first_b = w.slice<K_TILE, COLUMN_TILE>(
+            (int)k_start, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        #pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < K_TILES_PER_GROUP; k_tile++) {
+            uint k = k_start + k_tile * K_TILE;
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>(
+                (int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] *
+                input_scales[row * scale_groups + scale_group] *
+                weight_scales[column];
+            if (scale_group == 0) totals[element] = value;
+            else totals[element] += value;
+            if (scale_group + 1 == scale_groups && row < args.rows)
+                output[row * args.output_dim + column] =
+                    (bfloat)totals[element];
+        }
+    }
+}
+
+/* Wider-output form: the doubled tile uses eight SIMD groups, so each thread
+ * still owns 64 output elements while the grid launches half as many FC2
+ * workgroups. */
+kernel void h3_linear_int8_grouped_local_nax_r128x128(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 128;
+    constexpr uint K_TILE = 128;
+    constexpr uint SCALE_GROUP = 1024;
+    constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
+    constexpr uint FRAGMENT_CAPACITY = 64;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = args.output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    uint scale_groups = args.input_dim / SCALE_GROUP;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    thread float totals[FRAGMENT_CAPACITY];
+    for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
+        uint k_start = scale_group * SCALE_GROUP;
+        auto first_a = x.slice<ROW_TILE, K_TILE>(
+            (int)k_start, (int)row_start);
+        auto first_b = w.slice<K_TILE, COLUMN_TILE>(
+            (int)k_start, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        #pragma clang loop unroll(full)
+        for (uint k_tile = 0; k_tile < K_TILES_PER_GROUP; k_tile++) {
+            uint k = k_start + k_tile * K_TILE;
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>(
+                (int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] *
+                input_scales[row * scale_groups + scale_group] *
+                weight_scales[column];
+            if (scale_group == 0) totals[element] = value;
+            else totals[element] += value;
+            if (scale_group + 1 == scale_groups && row < args.rows)
+                output[row * args.output_dim + column] =
+                    (bfloat)totals[element];
         }
     }
 }

@@ -36,6 +36,10 @@ typedef struct {
     h3_gpu_tensor *out;
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *fc2;
+    h3_gpu_tensor *fc1_int8;
+    h3_gpu_tensor *fc1_scales;
+    h3_gpu_tensor *fc2_int8;
+    h3_gpu_tensor *fc2_scales;
 } h3_dit_block;
 
 struct h3_dit {
@@ -44,6 +48,7 @@ struct h3_dit {
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
+    int int8_mlp;
     int activation_aliases;
     int fused_patch_projection;
     int fused_patch_pack;
@@ -127,6 +132,8 @@ struct h3_dit {
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *activated;
     h3_gpu_tensor *mlp_output;
+    h3_gpu_tensor *int8_activation;
+    h3_gpu_tensor *int8_activation_scales;
     h3_gpu_tensor *final_audio_input;
     h3_gpu_tensor *final_video_input;
     h3_gpu_tensor *final_audio_inverse;
@@ -480,6 +487,36 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->out);
     free_tensor(&block->fc1);
     free_tensor(&block->fc2);
+    free_tensor(&block->fc1_int8);
+    free_tensor(&block->fc1_scales);
+    free_tensor(&block->fc2_int8);
+    free_tensor(&block->fc2_scales);
+}
+
+static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
+                              char *error, size_t error_size) {
+    block->fc1_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)FFN * 2 * HIDDEN);
+    block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+    block->fc2_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)HIDDEN * FFN);
+    block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    int ok = block->fc1_int8 && block->fc1_scales &&
+             block->fc2_int8 && block->fc2_scales &&
+             h3_gpu_begin(dit->gpu) &&
+             h3_gpu_quantize_weight_int8(
+                 dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
+                 FFN * 2, HIDDEN) &&
+             h3_gpu_quantize_weight_int8(
+                 dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
+                 HIDDEN, FFN) &&
+             h3_gpu_submit(dit->gpu);
+    if (!ok) {
+        fail(error, error_size, "cannot quantize DiT MLP weights: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
 }
 
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
@@ -959,6 +996,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
         if (!load_block(dit, &dit->blocks[index], prefix, error, error_size))
             return 0;
+        if (dit->int8_mlp &&
+            !quantize_block_mlp(dit, &dit->blocks[index],
+                                error, error_size)) return 0;
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
@@ -1148,11 +1188,24 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     if (!dit->fused_mlp) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
     }
-    if (!dit->fused_mlp || dit->nax_mlp) {
+    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
         dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
         if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (dit->int8_mlp) {
+        size_t padded_sequence = (sequence + 127) & ~(size_t)127;
+        dit->int8_activation = h3_gpu_tensor_new_i8(
+            dit->gpu, padded_sequence * FFN);
+        dit->int8_activation_scales = h3_gpu_tensor_new_f32(
+            dit->gpu, padded_sequence * (FFN / 1024));
+        if (!dit->int8_activation || !dit->int8_activation_scales) {
+            fail(error, error_size,
+                 "cannot allocate int8 DiT MLP activation arena: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1270,6 +1323,7 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
+    dit->int8_mlp = dit->fused_mlp && h3_gpu_has_int8_mlp(dit->gpu);
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -1482,7 +1536,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
+    if (dit->int8_mlp && !getenv("H3_DISABLE_INT8_MLP")) {
+        OP(h3_gpu_mlp_int8_bf16(
+            dit->gpu, mlp_output, dit->activated, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_mlp,
+            weight->fc1_int8, weight->fc1_scales,
+            weight->fc2_int8, weight->fc2_scales,
+            weight->fc1, weight->fc2,
+            rows, HIDDEN, FFN, HIDDEN), "DiT int8 fused MLP");
+    } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
             dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
             HIDDEN), "DiT NAX fused MLP");
@@ -2361,7 +2423,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(attention_heads); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
-    FREE(activated); FREE(mlp_output); FREE(final_audio_input);
+    FREE(activated); FREE(mlp_output); FREE(int8_activation);
+    FREE(int8_activation_scales); FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_inverse);
     FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);

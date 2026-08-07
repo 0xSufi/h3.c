@@ -593,6 +593,20 @@ static void run_qkv_step_ab(h3_dit *dit, float *video, float *audio,
 static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                            float *video_velocity, float *audio_velocity) {
     char error[512];
+    int quant_ab = getenv("H3_BENCH_INT8_QUANT_AB") != NULL;
+    int local_ab = getenv("H3_BENCH_INT8_GROUP_LOCAL_AB") != NULL;
+    int local128_ab =
+        getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") != NULL;
+    int fc1local_ab = getenv("H3_BENCH_INT8_FC1_LOCAL_AB") != NULL;
+    int int8_ab = quant_ab || local_ab || local128_ab || fc1local_ab ||
+        getenv("H3_BENCH_INT8_MLP_AB") != NULL;
+    const char *disable = int8_ab ? "H3_DISABLE_INT8_MLP" :
+                                    "H3_DISABLE_NAX_MLP";
+    const char *candidate_name = quant_ab ? "vec4 int8 quantizer" :
+        local_ab ? "local grouped FC2" :
+        local128_ab ? "128x128 local grouped FC2" :
+        fc1local_ab ? "local FC1" :
+        int8_ab ? "int8" : "NAX";
     char candidate_blocks[16] = {0};
     const char *blocks = getenv("H3_BENCH_NAX_COMMAND_BLOCKS");
     if (blocks) snprintf(candidate_blocks, sizeof(candidate_blocks), "%s",
@@ -601,7 +615,17 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
     if (!video_reference || !audio_reference)
         die("out of memory allocating NAX MLP AB references");
-    setenv("H3_DISABLE_NAX_MLP", "1", 1);
+    if (quant_ab || local_ab || local128_ab || fc1local_ab) {
+        unsetenv("H3_INT8_FC1_LOCAL");
+        if (!fc1local_ab) {
+            unsetenv("H3_INT8_VECTOR_QUANT");
+            unsetenv("H3_INT8_GROUP_FC2_LOCAL");
+            unsetenv("H3_INT8_GROUP_FC2_LOCAL128");
+            if (local128_ab)
+                setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
+        }
+    }
+    else setenv(disable, "1", 1);
     unsetenv("H3_DIT_COMMAND_BLOCKS");
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
@@ -609,11 +633,33 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
            VIDEO_ELEMENTS * sizeof(*video_reference));
     memcpy(audio_reference, audio_velocity,
            AUDIO_ELEMENTS * sizeof(*audio_reference));
-    unsetenv("H3_DISABLE_NAX_MLP");
+    if (quant_ab) setenv("H3_INT8_VECTOR_QUANT", "1", 1);
+    else if (local_ab) setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
+    else if (local128_ab) {
+        unsetenv("H3_INT8_GROUP_FC2_LOCAL");
+        setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
+    }
+    else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+    else unsetenv(disable);
     if (candidate_blocks[0])
         setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
     if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
                         error, sizeof(error))) die(error);
+    if (int8_ab && getenv("H3_BENCH_INT8_QUICK")) {
+        double video_abs = 0.0, audio_abs = 0.0;
+        double video_rel = relative_l2(video_velocity, video_reference,
+                                       VIDEO_ELEMENTS, &video_abs);
+        double audio_rel = relative_l2(audio_velocity, audio_reference,
+                                       AUDIO_ELEMENTS, &audio_abs);
+        printf("DiT int8 MLP quick drift video relL2 %.6g max %.6g; "
+               "audio relL2 %.6g max %.6g\n",
+               video_rel, video_abs, audio_rel, audio_abs);
+        unsetenv(disable);
+        unsetenv("H3_DIT_COMMAND_BLOCKS");
+        free(video_reference);
+        free(audio_reference);
+        return;
+    }
 
     static const int nax_pattern[] = {
         0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
@@ -625,14 +671,29 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     double video_rel = 0.0, audio_rel = 0.0;
     double video_abs = 0.0, audio_abs = 0.0;
     for (size_t index = 0;
-         index < sizeof(nax_pattern) / sizeof(*nax_pattern); index++) {
+        index < sizeof(nax_pattern) / sizeof(*nax_pattern); index++) {
         if (nax_pattern[index]) {
-            unsetenv("H3_DISABLE_NAX_MLP");
+            if (quant_ab) setenv("H3_INT8_VECTOR_QUANT", "1", 1);
+            else if (local_ab)
+                setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
+            else if (local128_ab) {
+                unsetenv("H3_INT8_GROUP_FC2_LOCAL");
+                setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
+            }
+            else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+            else unsetenv(disable);
             if (candidate_blocks[0])
                 setenv("H3_DIT_COMMAND_BLOCKS", candidate_blocks, 1);
             else unsetenv("H3_DIT_COMMAND_BLOCKS");
         } else {
-            setenv("H3_DISABLE_NAX_MLP", "1", 1);
+            if (quant_ab) unsetenv("H3_INT8_VECTOR_QUANT");
+            else if (local_ab) unsetenv("H3_INT8_GROUP_FC2_LOCAL");
+            else if (local128_ab) {
+                unsetenv("H3_INT8_GROUP_FC2_LOCAL128");
+                setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
+            }
+            else if (fc1local_ab) unsetenv("H3_INT8_FC1_LOCAL");
+            else setenv(disable, "1", 1);
             unsetenv("H3_DIT_COMMAND_BLOCKS");
         }
         double start = seconds();
@@ -640,30 +701,47 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (nax_pattern[index]) {
+            if ((quant_ab || local_ab || local128_ab || fc1local_ab) &&
+                (memcmp(video_velocity, video_reference,
+                        VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+                 memcmp(audio_velocity, audio_reference,
+                        AUDIO_ELEMENTS * sizeof(*audio_reference))))
+                die(quant_ab ? "vec4 int8 quantizer changed output bytes" :
+                    local128_ab ? "128x128 grouped FC2 changed output bytes" :
+                    fc1local_ab ? "local FC1 changed output bytes" :
+                                  "local grouped FC2 changed output bytes");
             video_rel = relative_l2(video_velocity, video_reference,
                                     VIDEO_ELEMENTS, &video_abs);
             audio_rel = relative_l2(audio_velocity, audio_reference,
                                     AUDIO_ELEMENTS, &audio_abs);
             nax_seconds += elapsed;
             nax_count++;
-            printf("  NAX MLP AB candidate %.3fs video relL2 %.6g; "
-                   "audio relL2 %.6g\n", elapsed, video_rel, audio_rel);
+            printf("  %s MLP AB candidate %.3fs video relL2 %.6g; "
+                   "audio relL2 %.6g\n", candidate_name, elapsed,
+                   video_rel, audio_rel);
         } else {
             if (memcmp(video_velocity, video_reference,
                        VIDEO_ELEMENTS * sizeof(*video_reference)) ||
                 memcmp(audio_velocity, audio_reference,
                        AUDIO_ELEMENTS * sizeof(*audio_reference)))
-                die("repeated MPSGraph MLP changed output bytes");
+                die((quant_ab || local_ab || local128_ab || fc1local_ab) ?
+                               "int8 kernel baseline changed output bytes" :
+                               "repeated MPSGraph MLP changed output bytes");
             baseline_seconds += elapsed;
             baseline_count++;
-            printf("  NAX MLP AB baseline %.3fs\n", elapsed);
+            printf("  %s MLP AB baseline %.3fs\n", candidate_name, elapsed);
         }
     }
-    unsetenv("H3_DISABLE_NAX_MLP");
+    unsetenv(disable);
+    unsetenv("H3_INT8_VECTOR_QUANT");
+    unsetenv("H3_INT8_GROUP_FC2_LOCAL");
+    unsetenv("H3_INT8_GROUP_FC2_LOCAL128");
+    unsetenv("H3_INT8_FC1_LOCAL");
     unsetenv("H3_DIT_COMMAND_BLOCKS");
-    printf("DiT NAX MLP AB baseline %.4fs, NAX %.4fs, ratio %.4f; "
+    printf("DiT %s MLP AB baseline %.4fs, candidate %.4fs, ratio %.4f; "
            "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
-           baseline_seconds / baseline_count, nax_seconds / nax_count,
+           candidate_name, baseline_seconds / baseline_count,
+           nax_seconds / nax_count,
            nax_seconds * baseline_count / (baseline_seconds * nax_count),
            video_rel, video_abs, audio_rel, audio_abs);
     free(video_reference);
@@ -1367,9 +1445,14 @@ int main(int argc, char **argv) {
         free(video_velocity); free(audio_velocity);
         return 0;
     }
-    if (getenv("H3_BENCH_NAX_MLP_AB")) {
+    if (getenv("H3_BENCH_NAX_MLP_AB") ||
+        getenv("H3_BENCH_INT8_MLP_AB") ||
+        getenv("H3_BENCH_INT8_QUANT_AB") ||
+        getenv("H3_BENCH_INT8_GROUP_LOCAL_AB") ||
+        getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") ||
+        getenv("H3_BENCH_INT8_FC1_LOCAL_AB")) {
         run_nax_mlp_ab(dit, video, audio, video_velocity, audio_velocity);
-        printf("DiT %ux%u/%u-layer load %.3fs before NAX MLP AB\n",
+        printf("DiT %ux%u/%u-layer load %.3fs before MLP AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);

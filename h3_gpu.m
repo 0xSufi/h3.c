@@ -445,6 +445,18 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton"];
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
+            [names addObject:@"h3_quantize_bf16_int8_rows"];
+            [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
+            [names addObject:@"h3_quantize_bf16_int8_groups"];
+            [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
+            [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
+            [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
+            [names addObject:@"h3_linear_int8_nax_r128"];
+            [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
+            [names addObject:
+                @"h3_linear_int8_grouped_local_nax_r128x64"];
+            [names addObject:
+                @"h3_linear_int8_grouped_local_nax_r128x128"];
         }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -504,6 +516,13 @@ int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
     return gpu.tensorOpsEnabled && gpu.tensorOpsMode == 5;
 }
 
+int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
+    if (!opaque) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    const char *value = getenv("H3_INT8_MLP");
+    return gpu.tensorOpsEnabled && value && *value && strcmp(value, "0");
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
                                         size_t elements, size_t item_size,
                                         h3_gpu_dtype dtype) {
@@ -538,6 +557,10 @@ h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements) {
 
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
     return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(uint16_t), H3_GPU_BF16);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
+    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(int8_t), H3_GPU_I8);
 }
 
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
@@ -906,6 +929,9 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
+typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
+typedef struct { uint32_t rows, columns, group_size, groups; }
+    int8_group_quant_args;
 typedef struct { uint32_t rows, width; float epsilon; } norm_args;
 typedef struct {
     uint32_t rows, width, slots, shift_slot, scale_slot;
@@ -2235,6 +2261,26 @@ static int h3_gpu_require_bf16(H3GPU *gpu, const h3_gpu_tensor *tensor,
     return 1;
 }
 
+static int h3_gpu_require_i8(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                             size_t elements, NSString *label) {
+    if (!h3_gpu_require_elements(gpu, tensor, elements, label)) return 0;
+    if (TENSOR(tensor).dtype != H3_GPU_I8) {
+        h3_gpu_set_error(gpu, @"%@ tensor is not int8", label);
+        return 0;
+    }
+    return 1;
+}
+
+static int h3_gpu_require_f32(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                              size_t elements, NSString *label) {
+    if (!h3_gpu_require_elements(gpu, tensor, elements, label)) return 0;
+    if (TENSOR(tensor).dtype != H3_GPU_F32) {
+        h3_gpu_set_error(gpu, @"%@ tensor is not F32", label);
+        return 0;
+    }
+    return 1;
+}
+
 static H3Linear *h3_gpu_linear_graph(H3GPU *gpu, uint32_t rows,
                                      uint32_t input_dim, uint32_t output_dim,
                                      int has_bias, MPSDataType dataType) {
@@ -2538,7 +2584,7 @@ static int h3_gpu_fc1_swiglu_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                       uint32_t hidden_dim) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu.tensorOpsEnabled ||
-        gpu.tensorOpsMode != 5 ||
+        (gpu.tensorOpsMode != 5 && !h3_gpu_has_int8_mlp(opaque)) ||
         !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
                              @"NAX FC1 input") ||
         !h3_gpu_require_bf16(gpu, weight,
@@ -2660,6 +2706,280 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches++;
     gpu.stats = stats;
+    return 1;
+}
+
+static int h3_gpu_quantize_bf16_int8_rows(
+                        h3_gpu *opaque, h3_gpu_tensor *output,
+                        h3_gpu_tensor *scales,
+                        const h3_gpu_tensor *input, uint32_t rows,
+                        uint32_t dispatch_rows, uint32_t columns,
+                        float clip, NSString *label) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu.tensorOpsEnabled || !rows || dispatch_rows < rows || !columns ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * columns, label) ||
+        !h3_gpu_require_i8(gpu, output,
+                           (size_t)dispatch_rows * columns,
+                           @"int8 quantized output") ||
+        !h3_gpu_require_f32(gpu, scales, dispatch_rows,
+                            @"int8 quantization scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
+        @"h3_quantize_bf16_int8_rows" :
+        @"h3_quantize_bf16_int8_rows_scalar";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch M5 int8 quantizer");
+        return 0;
+    }
+    int8_quant_args args = {rows, columns, clip};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(dispatch_rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static int h3_gpu_quantize_bf16_int8_groups(
+                        h3_gpu *opaque, h3_gpu_tensor *output,
+                        h3_gpu_tensor *scales,
+                        const h3_gpu_tensor *input, uint32_t rows,
+                        uint32_t dispatch_rows, uint32_t columns,
+                        uint32_t group_size) {
+    H3GPU *gpu = GPU(opaque);
+    if (!group_size || (group_size % 4)) return 0;
+    uint32_t groups = (columns + group_size - 1) / group_size;
+    if (!gpu.tensorOpsEnabled || !rows || dispatch_rows < rows || !columns ||
+        (columns % group_size) ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * columns,
+                             @"grouped int8 input") ||
+        !h3_gpu_require_i8(gpu, output,
+                           (size_t)dispatch_rows * columns,
+                           @"grouped int8 output") ||
+        !h3_gpu_require_f32(gpu, scales,
+                            (size_t)dispatch_rows * groups,
+                            @"grouped int8 scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
+        @"h3_quantize_bf16_int8_groups" :
+        @"h3_quantize_bf16_int8_groups_scalar";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch grouped M5 int8 quantizer");
+        return 0;
+    }
+    int8_group_quant_args args = {
+        rows, columns, group_size, groups
+    };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(dispatch_rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
+                                h3_gpu_tensor *scales,
+                                const h3_gpu_tensor *input, uint32_t rows,
+                                uint32_t columns) {
+    return h3_gpu_quantize_bf16_int8_rows(
+        opaque, output, scales, input, rows, rows, columns,
+        1.0f, @"BF16 weight to quantize");
+}
+
+int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         h3_gpu_tensor *activated,
+                         h3_gpu_tensor *quantized_activation,
+                         h3_gpu_tensor *activation_scales,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *fc1_weight,
+                         const h3_gpu_tensor *fc1_scales,
+                         const h3_gpu_tensor *fc2_weight,
+                         const h3_gpu_tensor *fc2_scales,
+                         const h3_gpu_tensor *fc1_bf16,
+                         const h3_gpu_tensor *fc2_bf16, uint32_t rows,
+                         uint32_t input_dim, uint32_t hidden_dim,
+                         uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    uint32_t fc2_scale_groups = hidden_dim / 1024u;
+    size_t activation_capacity = (size_t)padded_rows *
+        MAX(input_dim, hidden_dim);
+    if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 127u ||
+        (input_dim % 128) || (hidden_dim % 128) || (output_dim % 128) ||
+        !h3_gpu_require_i8(gpu, quantized_activation, activation_capacity,
+                           @"int8 MLP activation") ||
+        !h3_gpu_require_f32(gpu, activation_scales,
+                            (size_t)padded_rows * MAX(fc2_scale_groups, 1u),
+                            @"int8 MLP activation scales") ||
+        !h3_gpu_require_i8(gpu, fc1_weight,
+                           (size_t)hidden_dim * 2 * input_dim,
+                           @"int8 MLP FC1 weight") ||
+        !h3_gpu_require_f32(gpu, fc1_scales, (size_t)hidden_dim * 2,
+                            @"int8 MLP FC1 scales") ||
+        !h3_gpu_require_i8(gpu, fc2_weight,
+                           (size_t)output_dim * hidden_dim,
+                           @"int8 MLP FC2 weight") ||
+        !h3_gpu_require_f32(gpu, fc2_scales, output_dim,
+                            @"int8 MLP FC2 scales") ||
+        !h3_gpu_require_bf16(gpu, fc1_bf16,
+                             (size_t)hidden_dim * 2 * input_dim,
+                             @"diagnostic BF16 MLP FC1 weight") ||
+        !h3_gpu_require_bf16(gpu, fc2_bf16,
+                             (size_t)output_dim * hidden_dim,
+                             @"diagnostic BF16 MLP FC2 weight") ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"int8 MLP input") ||
+        !h3_gpu_require_bf16(gpu, activated,
+                             (size_t)rows * hidden_dim,
+                             @"int8 MLP activated") ||
+        !h3_gpu_require_bf16(gpu, output,
+                             (size_t)rows * output_dim,
+                             @"int8 MLP output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+
+    id<MTLComputePipelineState> fc1 = h3_gpu_pipeline(
+        gpu, @"h3_fc1_swiglu_int8_nax_r128");
+    id<MTLComputePipelineState> fc1_local = h3_gpu_pipeline(
+        gpu, @"h3_fc1_swiglu_int8_local_nax_r128");
+    id<MTLComputePipelineState> fc2 = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_nax_r128");
+    id<MTLComputePipelineState> fc2_grouped = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_grouped_nax_r128x64");
+    id<MTLComputePipelineState> fc2_grouped_local = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_grouped_local_nax_r128x64");
+    id<MTLComputePipelineState> fc2_grouped_local128 = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_grouped_local_nax_r128x128");
+    if (!fc1 || !fc1_local || !fc2 ||
+        fc1.maxTotalThreadsPerThreadgroup < 256 ||
+        fc1_local.maxTotalThreadsPerThreadgroup < 256 ||
+        fc2.maxTotalThreadsPerThreadgroup < 256 || !fc2_grouped ||
+        fc2_grouped.maxTotalThreadsPerThreadgroup < 128 ||
+        !fc2_grouped_local ||
+        fc2_grouped_local.maxTotalThreadsPerThreadgroup < 128 ||
+        !fc2_grouped_local128 ||
+        fc2_grouped_local128.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch M5 int8 MLP");
+        return 0;
+    }
+    float activation_clip = 1.0f;
+    const char *clip_value = getenv("H3_INT8_ACTIVATION_CLIP");
+    if (clip_value) {
+        float parsed = strtof(clip_value, NULL);
+        if (parsed >= 0.1f && parsed <= 1.0f) activation_clip = parsed;
+    }
+    const char *stage = getenv("H3_INT8_MLP_STAGE");
+    BOOL int8_fc1 = !stage || (strcmp(stage, "fc2") &&
+                               strcmp(stage, "bf16"));
+    BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
+                               strcmp(stage, "bf16"));
+    BOOL grouped_fc2 = int8_fc2 &&
+        getenv("H3_INT8_UNGROUPED_FC2") == NULL;
+    BOOL grouped_fc2_local = grouped_fc2 &&
+        getenv("H3_INT8_GROUP_FC2_THREADGROUP") == NULL;
+    BOOL grouped_fc2_local128 = grouped_fc2 &&
+        getenv("H3_INT8_GROUP_FC2_LOCAL128") != NULL;
+    BOOL int8_fc1_local = int8_fc1 &&
+        getenv("H3_INT8_FC1_LOCAL") != NULL;
+    uint32_t row_tiles = padded_rows / 128;
+    if (int8_fc1 && !h3_gpu_quantize_bf16_int8_rows(
+            opaque, quantized_activation, activation_scales, input, rows,
+            padded_rows, input_dim, activation_clip,
+            @"int8 MLP input")) return 0;
+    if (int8_fc1) @autoreleasepool {
+        linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:int8_fc1_local ? fc1_local : fc1];
+        [encoder setBuffer:TENSOR(quantized_activation).buffer
+                         offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(fc1_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(activation_scales).buffer
+                         offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(fc1_scales).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(activated).buffer offset:0 atIndex:4];
+        [encoder setBytes:&fc1_args length:sizeof(fc1_args) atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((NSUInteger)row_tiles * (hidden_dim / 128), 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    } else if (!h3_gpu_fc1_swiglu_nax_bf16(
+                   opaque, activated, input, fc1_bf16,
+                   rows, input_dim, hidden_dim)) {
+        return 0;
+    }
+    if (int8_fc1) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+    }
+
+    if (int8_fc2 && grouped_fc2 &&
+        !h3_gpu_quantize_bf16_int8_groups(
+            opaque, quantized_activation, activation_scales, activated, rows,
+            padded_rows, hidden_dim, 1024)) return 0;
+    if (int8_fc2 && !grouped_fc2 &&
+        !h3_gpu_quantize_bf16_int8_rows(
+            opaque, quantized_activation, activation_scales, activated, rows,
+            padded_rows, hidden_dim, activation_clip,
+            @"int8 MLP FC2 input")) return 0;
+    if (int8_fc2) @autoreleasepool {
+        linear_args fc2_args = {rows, hidden_dim, output_dim, 0};
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:grouped_fc2_local128 ?
+            fc2_grouped_local128 : grouped_fc2_local ?
+            fc2_grouped_local : grouped_fc2 ? fc2_grouped : fc2];
+        [encoder setBuffer:TENSOR(quantized_activation).buffer
+                         offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(fc2_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(activation_scales).buffer
+                         offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(fc2_scales).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&fc2_args length:sizeof(fc2_args) atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((NSUInteger)row_tiles *
+                        (output_dim /
+                         (grouped_fc2 && !grouped_fc2_local128 ?
+                          64u : 128u)), 1, 1)
+                 threadsPerThreadgroup:
+                    MTLSizeMake(grouped_fc2_local128 ? 256u :
+                        grouped_fc2 ? 128u : 256u, 1, 1)];
+        [encoder endEncoding];
+    } else if (!h3_gpu_linear_bf16(
+                   opaque, output, activated, fc2_bf16, NULL,
+                   rows, hidden_dim, output_dim)) {
+        return 0;
+    }
+    if (int8_fc2) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+    }
     return 1;
 }
 

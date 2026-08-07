@@ -1,8 +1,9 @@
 # Third-party notices
 
-The rectangular Morton decoder in `h3_shaders.metal` is adapted from ccv's
-Metal FlashAttention `NAMatMulKernel`, distributed under the following
-BSD-3-Clause license:
+The rectangular Morton decoder and the dynamic symmetric int8 quantization /
+Metal 4 TensorOps scheduling design in `h3_shaders.metal` are adapted from
+ccv's Metal FlashAttention `NAMatMulKernel` and `NAInt8MatMulKernel`,
+distributed under the following BSD-3-Clause license:
 
 Copyright (c) 2010, Liu Liu
 All rights reserved.
