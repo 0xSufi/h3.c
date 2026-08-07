@@ -1363,6 +1363,7 @@ kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
 }
 
 struct h3_token_pool_args {
+    uint input_offset;
     uint rows;
     uint width;
 };
@@ -1379,18 +1380,21 @@ kernel void h3_token_pool_bf16(
     uint row = gid.y;
     if (row >= args.rows || column >= args.width) return;
     uint2 pair = pairs[row];
-    ushort first = input[pair.x * args.width + column];
+    ushort first = input[args.input_offset + pair.x * args.width + column];
     if (pair.x == pair.y) {
         output[row * args.width + column] = first;
     } else {
         float average = (h3_bf16_to_f32(first) +
                          h3_bf16_to_f32(
-                             input[pair.y * args.width + column])) * 0.5f;
+                             input[args.input_offset + pair.y * args.width +
+                                   column])) * 0.5f;
         output[row * args.width + column] = h3_f32_to_bf16(average);
     }
 }
 
 struct h3_token_expand_args {
+    uint original_offset;
+    uint baseline_offset;
     uint rows;
     uint width;
     uint exact_prefix_rows;
@@ -1416,10 +1420,12 @@ kernel void h3_token_expand_delta_bf16(
     if (row < args.exact_prefix_rows) {
         output[destination] = reduced[reduced_index];
     } else {
+        uint baseline_index = args.baseline_offset +
+            (parent - args.exact_prefix_rows) * args.width + column;
         float update = h3_bf16_to_f32(reduced[reduced_index]) -
-                       h3_bf16_to_f32(baseline[reduced_index]);
+                       h3_bf16_to_f32(baseline[baseline_index]);
         output[destination] = h3_f32_to_bf16(
-            h3_bf16_to_f32(original[destination]) +
+            h3_bf16_to_f32(original[args.original_offset + destination]) +
             args.update_scale * update);
     }
 }

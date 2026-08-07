@@ -30,6 +30,16 @@ static double seconds(void) {
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
 }
 
+static uint64_t hash_bytes(const void *data, size_t bytes) {
+    const uint8_t *octets = data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= octets[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static uint16_t *load_text(const char *path) {
     char error[512];
     h3_st_header header;
@@ -430,6 +440,7 @@ static void run_token_reduction_ab(h3_dit *dit, float *video, float *audio,
     double candidate_seconds = 0.0;
     int baseline_count = 0;
     int candidate_count = 0;
+    uint64_t candidate_video_hash = 0, candidate_audio_hash = 0;
     double video_relative = 0.0, audio_relative = 0.0;
     double video_absolute = 0.0, audio_absolute = 0.0;
     for (size_t run = 0;
@@ -441,6 +452,16 @@ static void run_token_reduction_ab(h3_dit *dit, float *video, float *audio,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (candidate_pattern[run]) {
+            uint64_t video_hash = hash_bytes(
+                video_velocity, VIDEO_ELEMENTS * sizeof(*video_velocity));
+            uint64_t audio_hash = hash_bytes(
+                audio_velocity, AUDIO_ELEMENTS * sizeof(*audio_velocity));
+            if (candidate_count &&
+                (video_hash != candidate_video_hash ||
+                 audio_hash != candidate_audio_hash))
+                die("token-reduction candidate changed output bytes");
+            candidate_video_hash = video_hash;
+            candidate_audio_hash = audio_hash;
             video_relative = relative_l2(
                 video_velocity, video_reference, VIDEO_ELEMENTS,
                 &video_absolute);
@@ -471,6 +492,14 @@ static void run_token_reduction_ab(h3_dit *dit, float *video, float *audio,
            candidate_seconds * baseline_count /
                (baseline_seconds * candidate_count),
            video_relative, video_absolute, audio_relative, audio_absolute);
+    printf("token reduction candidate hashes video %016llx audio %016llx\n",
+           (unsigned long long)candidate_video_hash,
+           (unsigned long long)candidate_audio_hash);
+    h3_gpu_stats stats;
+    if (!h3_dit_get_gpu_stats(dit, &stats))
+        die("cannot read token-reduction GPU allocation stats");
+    printf("token reduction cumulative GPU allocations %.3f GiB\n",
+           (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0));
     free(video_reference);
     free(audio_reference);
 }

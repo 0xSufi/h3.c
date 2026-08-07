@@ -2967,18 +2967,24 @@ int h3_gpu_sub_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
 
 int h3_gpu_token_pool_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                            const h3_gpu_tensor *input,
-                           const h3_gpu_tensor *pairs, uint32_t rows,
-                           uint32_t width) {
+                           size_t input_offset,
+                           const h3_gpu_tensor *pairs, uint32_t input_rows,
+                           uint32_t rows, uint32_t width) {
     H3GPU *gpu = GPU(opaque);
     size_t elements = (size_t)rows * width;
-    if (!rows || !width ||
-        !h3_gpu_require_bf16(gpu, input, elements, @"token pool input") ||
+    size_t input_elements = (size_t)input_rows * width;
+    if (!input_rows || !rows || rows > input_rows || !width ||
+        elements > UINT32_MAX || input_offset > UINT32_MAX ||
+        input_elements > UINT32_MAX - input_offset ||
+        !input || TENSOR(input).dtype != H3_GPU_BF16 ||
+        input_offset > TENSOR(input).elements ||
+        input_elements > TENSOR(input).elements - input_offset ||
         !h3_gpu_require_bf16(gpu, output, elements, @"token pool output") ||
         !h3_gpu_require_elements(gpu, pairs, (size_t)rows * 2,
                                  @"token pool pairs") ||
         TENSOR(pairs).dtype != H3_GPU_U32) return 0;
-    typedef struct { uint32_t rows, width; } token_pool_args;
-    token_pool_args args = {rows, width};
+    typedef struct { uint32_t input_offset, rows, width; } token_pool_args;
+    token_pool_args args = {(uint32_t)input_offset, rows, width};
     return h3_gpu_dispatch_2d(gpu, @"h3_token_pool_bf16", width, rows,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
@@ -2991,28 +2997,47 @@ int h3_gpu_token_pool_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
 int h3_gpu_token_expand_delta_bf16(
                            h3_gpu *opaque, h3_gpu_tensor *output,
                            const h3_gpu_tensor *original,
+                           size_t original_offset,
                            const h3_gpu_tensor *reduced,
                            const h3_gpu_tensor *baseline,
+                           size_t baseline_offset,
                            const h3_gpu_tensor *parents, uint32_t rows,
-                           uint32_t width, uint32_t exact_prefix_rows,
+                           uint32_t reduced_rows, uint32_t width,
+                           uint32_t exact_prefix_rows,
                            float update_scale) {
     H3GPU *gpu = GPU(opaque);
     size_t elements = (size_t)rows * width;
-    if (!rows || !width || exact_prefix_rows > rows ||
-        !h3_gpu_require_bf16(gpu, original, elements,
-                             @"token expand original") ||
+    size_t reduced_elements = (size_t)reduced_rows * width;
+    size_t baseline_elements = exact_prefix_rows <= reduced_rows ?
+        (size_t)(reduced_rows - exact_prefix_rows) * width : 0;
+    if (!rows || !reduced_rows || reduced_rows > rows || !width ||
+        exact_prefix_rows > reduced_rows || elements > UINT32_MAX ||
+        reduced_elements > UINT32_MAX || original_offset > UINT32_MAX ||
+        elements > UINT32_MAX - original_offset ||
+        baseline_offset > UINT32_MAX ||
+        baseline_elements > UINT32_MAX - baseline_offset ||
+        !original || TENSOR(original).dtype != H3_GPU_BF16 ||
+        original_offset > TENSOR(original).elements ||
+        elements > TENSOR(original).elements - original_offset ||
         !h3_gpu_require_bf16(gpu, output, elements,
                              @"token expand output") ||
-        !h3_gpu_require_bf16(gpu, reduced, 1, @"token expand reduced") ||
-        !h3_gpu_require_bf16(gpu, baseline, 1, @"token expand baseline") ||
+        !h3_gpu_require_bf16(gpu, reduced, reduced_elements,
+                             @"token expand reduced") ||
+        !baseline || TENSOR(baseline).dtype != H3_GPU_BF16 ||
+        baseline_offset > TENSOR(baseline).elements ||
+        baseline_elements > TENSOR(baseline).elements - baseline_offset ||
         !h3_gpu_require_elements(gpu, parents, rows,
                                  @"token expand parents") ||
         TENSOR(parents).dtype != H3_GPU_U32) return 0;
     typedef struct {
+        uint32_t original_offset, baseline_offset;
         uint32_t rows, width, exact_prefix_rows;
         float update_scale;
     } token_expand_args;
-    token_expand_args args = {rows, width, exact_prefix_rows, update_scale};
+    token_expand_args args = {
+        (uint32_t)original_offset, (uint32_t)baseline_offset,
+        rows, width, exact_prefix_rows, update_scale
+    };
     return h3_gpu_dispatch_2d(gpu, @"h3_token_expand_delta_bf16", width, rows,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(original).buffer offset:0 atIndex:0];

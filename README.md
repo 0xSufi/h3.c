@@ -91,6 +91,9 @@ pairs adjacent horizontal target-video tokens while leaving text, audio,
 conditions, and reference tokens exact. The complete full-resolution state is
 kept as a bypass; before block 30 each token is restored as its original value
 plus the update learned by its pair, so within-pair detail is not discarded.
+At common even token-grid widths the bypass and pooled baseline occupy dormant
+tails of the already allocated QKV and attention scratch buffers, adding no
+activation arena; guarded dedicated buffers cover other layouts.
 On a thermal-balanced 512x512x22, 19-forward M5 Max A/B this reduced denoise
 time from 37.65 to 31.66 seconds (15.9%). Final video/audio latent relative L2
 was 4.90%/12.15%. Independent fox/snow and surfer/wave renders remained sharp,
