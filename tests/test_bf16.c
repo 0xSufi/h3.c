@@ -12,7 +12,7 @@ enum {
     SEQUENCE = 32, HIDDEN = 256, HEADS = 4, HEAD_DIM = 32,
     INNER = HEADS * HEAD_DIM, FFN = 128, T_ROWS = 2, T_DIM = 32,
     MODALITIES = 3, MODULATION_SLOTS = 6, ROPE_HALF = 12,
-    MAX_TENSORS = 96
+    MAX_TENSORS = 100
 };
 
 typedef struct {
@@ -432,6 +432,64 @@ static double monotonic_seconds(void) {
     require(clock_gettime(CLOCK_MONOTONIC, &value) == 0,
             "cannot read monotonic clock");
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+static void bench_patch_projection(test_context *test, uint32_t rows) {
+    enum { INPUT_DIM = 96, OUTPUT_DIM = 5376, ITERATIONS = 20 };
+    size_t input_count = (size_t)rows * INPUT_DIM;
+    size_t weight_count = (size_t)OUTPUT_DIM * INPUT_DIM;
+    size_t output_count = (size_t)rows * OUTPUT_DIM;
+    require(output_count <= UINT32_MAX, "patch benchmark shape is too large");
+    h3_gpu_tensor *input = own(
+        test, h3_gpu_tensor_new_f32(test->gpu, input_count));
+    h3_gpu_tensor *weight = own(
+        test, h3_gpu_tensor_new_f32(test->gpu, weight_count));
+    h3_gpu_tensor *bias = own(
+        test, h3_gpu_tensor_new_f32(test->gpu, OUTPUT_DIM));
+    h3_gpu_tensor *f32_output = own(
+        test, h3_gpu_tensor_new_f32(test->gpu, output_count));
+    h3_gpu_tensor *bf16_output = own(
+        test, h3_gpu_tensor_new_bf16(test->gpu, output_count));
+    static const int fused_pattern[] = {0, 1, 1, 0, 0, 1, 1, 0};
+    double separate_seconds = 0.0, fused_seconds = 0.0;
+    unsigned separate_count = 0, fused_count = 0;
+    for (size_t run = 0;
+         run < sizeof(fused_pattern) / sizeof(*fused_pattern); run++) {
+        double start = monotonic_seconds();
+        require_gpu(test, h3_gpu_begin(test->gpu),
+                    "begin patch projection benchmark");
+        for (unsigned iteration = 0; iteration < ITERATIONS; iteration++) {
+            if (fused_pattern[run]) {
+                require_gpu(test, h3_gpu_patch_linear_bf16(
+                    test->gpu, bf16_output, input, weight, bias, rows,
+                    INPUT_DIM, OUTPUT_DIM), "benchmark fused patch projection");
+            } else {
+                require_gpu(test, h3_gpu_linear_f32(
+                    test->gpu, f32_output, input, weight, bias, rows,
+                    INPUT_DIM, OUTPUT_DIM), "benchmark patch projection");
+                require_gpu(test, h3_gpu_cast_f32_to_bf16(
+                    test->gpu, bf16_output, f32_output,
+                    (uint32_t)output_count), "benchmark patch cast");
+            }
+        }
+        require_gpu(test, h3_gpu_submit(test->gpu),
+                    "submit patch projection benchmark");
+        double elapsed = monotonic_seconds() - start;
+        if (fused_pattern[run]) {
+            fused_seconds += elapsed;
+            fused_count++;
+        } else {
+            separate_seconds += elapsed;
+            separate_count++;
+        }
+    }
+    double separate = separate_seconds /
+        ((double)separate_count * (double)ITERATIONS);
+    double fused = fused_seconds /
+        ((double)fused_count * (double)ITERATIONS);
+    printf("patch projection %u rows: separate %.3f ms, fused %.3f ms, "
+           "ratio %.4f\n", rows, separate * 1000.0, fused * 1000.0,
+           fused / separate);
 }
 
 static void bench_gate_adaln_shape(test_context *test, uint32_t rows,
@@ -1200,6 +1258,17 @@ int main(int argc, char **argv) {
         cleanup(&test);
         return 0;
     }
+    const char *patch_rows = getenv("H3_BENCH_PATCH_PROJECTION");
+    if (patch_rows) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(patch_rows, &end, 10);
+        if (end == patch_rows || *end || !parsed || parsed > UINT32_MAX)
+            die("H3_BENCH_PATCH_PROJECTION must be a row count");
+        bench_patch_projection(&test,
+            parsed == 1 ? 2835 : (uint32_t)parsed);
+        cleanup(&test);
+        return 0;
+    }
     if (getenv("H3_BENCH_SDPA")) {
         bench_h3_sdpa(&test);
         cleanup(&test);
@@ -1219,7 +1288,10 @@ int main(int argc, char **argv) {
         float *bias = malloc(PATCH_OUT * sizeof(*bias));
         float *scalar = malloc(output_count * sizeof(*scalar));
         float *tiled = malloc(output_count * sizeof(*tiled));
-        require(input && weight && bias && scalar && tiled,
+        uint16_t *legacy_bf16 = malloc(output_count * sizeof(*legacy_bf16));
+        uint16_t *fused_bf16 = malloc(output_count * sizeof(*fused_bf16));
+        require(input && weight && bias && scalar && tiled && legacy_bf16 &&
+                fused_bf16,
                 "patch tile host allocation failed");
         for (size_t index = 0; index < input_count; index++)
             input[index] = (float)((int)(index % 17) - 8) * 0.03125f;
@@ -1237,6 +1309,10 @@ int main(int argc, char **argv) {
             &test, h3_gpu_tensor_new_f32(test.gpu, output_count));
         h3_gpu_tensor *tiled_output = own(
             &test, h3_gpu_tensor_new_f32(test.gpu, output_count));
+        h3_gpu_tensor *legacy_bf16_output = own(
+            &test, h3_gpu_tensor_new_bf16(test.gpu, output_count));
+        h3_gpu_tensor *fused_bf16_output = own(
+            &test, h3_gpu_tensor_new_bf16(test.gpu, output_count));
         setenv("H3_SCALAR_PATCH", "1", 1);
         require_gpu(&test, h3_gpu_begin(test.gpu),
                     "begin scalar patch stream");
@@ -1259,7 +1335,28 @@ int main(int argc, char **argv) {
                 "cannot read tiled patch output");
         require(memcmp(scalar, tiled, output_count * sizeof(*scalar)) == 0,
                 "tiled patch output differs from scalar F32");
+        require_gpu(&test, h3_gpu_begin(test.gpu),
+                    "begin fused patch/cast stream");
+        require_gpu(&test, h3_gpu_cast_f32_to_bf16(
+            test.gpu, legacy_bf16_output, tiled_output,
+            (uint32_t)output_count),
+                    "standalone patch BF16 cast");
+        require_gpu(&test, h3_gpu_patch_linear_bf16(
+            test.gpu, fused_bf16_output, gpu_input, gpu_weight, gpu_bias,
+            PATCH_ROWS, PATCH_IN, PATCH_OUT), "fused patch BF16 linear");
+        require_gpu(&test, h3_gpu_submit(test.gpu),
+                    "submit fused patch/cast stream");
+        require(h3_gpu_tensor_read_bf16(
+                    legacy_bf16_output, legacy_bf16, output_count),
+                "cannot read standalone patch BF16 output");
+        require(h3_gpu_tensor_read_bf16(
+                    fused_bf16_output, fused_bf16, output_count),
+                "cannot read fused patch BF16 output");
+        require(memcmp(legacy_bf16, fused_bf16,
+                       output_count * sizeof(*legacy_bf16)) == 0,
+                "fused patch projection differs from linear plus cast");
         free(input); free(weight); free(bias); free(scalar); free(tiled);
+        free(legacy_bf16); free(fused_bf16);
     }
     h3_gpu_stats setup_stats;
     require(h3_gpu_get_stats(test.gpu, &setup_stats),

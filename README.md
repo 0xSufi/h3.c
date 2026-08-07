@@ -198,10 +198,15 @@ step. Full fox and surfer sequences remained clean and measured 29.9/38.4 dB
 against the F32-head renders. `H3_DIT_F32_FINAL=1` restores the close-reference
 head and its extra activation buffers.
 The F32 `96->5376` video and `32->5376` audio patch projections use a dedicated
-16x16 cooperative tile, retaining F32 weights, activations and accumulation.
+16x16 cooperative tile, retaining F32 weights, inputs and accumulation while
+rounding the tile result directly to BF16.
 Paired production-shape measurements are 1.77x faster on M3 and 1.62-1.78x
 on M5; the complete generated RGB stream is byte-identical to the scalar path.
-`H3_SCALAR_PATCH=1` selects that scalar diagnostic path.
+Fusing the final cast improves the 2835-row tile itself from 2.499 to 1.734 ms
+on M3 and 1.555 to 1.186 ms on M5, and removes 38.27/59.66 MiB of F32 scratch
+at 512/864-class geometry. `H3_DISABLE_FUSED_PATCH_CAST=1` restores the tiled
+F32 output plus standalone cast; `H3_SCALAR_PATCH=1` selects the scalar
+diagnostic path.
 The DiT core is split into two ordered Metal command buffers so GPU execution
 of the first part overlaps CPU encoding of the second. Thermal-balanced ABBA
 measurements select a 60%-depth split on M5 (30/50, 27/45, and 24/40), with

@@ -399,7 +399,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             return NULL;
         }
         NSMutableArray<NSString *> *names = [@[
-            @"h3_linear_f32", @"h3_linear_f32_tiled", @"h3_silu_f32",
+            @"h3_linear_f32", @"h3_linear_f32_tiled",
+            @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
             @"h3_cast_f32_to_bf16",
             @"h3_cast_bf16_to_f32",
             @"h3_rms_norm_f32",
@@ -1001,6 +1002,61 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         });
+}
+
+int h3_gpu_patch_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (output_dim != 5376 || (input_dim != 32 && input_dim != 96)) {
+        h3_gpu_set_error(gpu, @"unsupported fused patch projection shape");
+        return 0;
+    }
+    if (!h3_gpu_require_elements(gpu, input, input_count,
+                                 @"patch projection input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count,
+                                 @"patch projection weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count,
+                                 @"patch projection output") ||
+        TENSOR(output).dtype != H3_GPU_BF16 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_dim,
+                                           @"patch projection bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32)) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_f32_tiled_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch the fused F32/BF16 tile");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                                  (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_silu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
