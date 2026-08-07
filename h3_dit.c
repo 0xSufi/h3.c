@@ -319,7 +319,7 @@ static int configure_token_reduction(h3_dit *dit, int requested,
     const char *enabled = getenv("H3_TOKEN_REDUCTION");
     if (!requested &&
         (!enabled || !*enabled || !strcmp(enabled, "0"))) return 1;
-    unsigned begin = 5, end = 30;
+    unsigned begin = 4, end = 30;
     const char *range = getenv("H3_TOKEN_REDUCTION_BLOCKS");
     if (range && *range) {
         char *middle = NULL;
