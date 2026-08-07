@@ -86,6 +86,18 @@ transformer-core residual while still refreshing the patch projection and
 timestep-dependent final head at every denoiser step. `--core-reuse 6` is the
 validated aggressive limit; values above 6 lose subject fidelity. Core reuse
 and whole-velocity `--reuse` are intentionally mutually exclusive.
+`--token-reduction` is an independent aggressive DiT mode. After block 9 it
+pairs adjacent horizontal target-video tokens while leaving text, audio,
+conditions, and reference tokens exact. The complete full-resolution state is
+kept as a bypass; before block 30 each token is restored as its original value
+plus the update learned by its pair, so within-pair detail is not discarded.
+On a thermal-balanced 512x512x22, 19-forward M5 Max A/B this reduced denoise
+time from 37.65 to 31.66 seconds (15.9%). Final video/audio latent relative L2
+was 4.90%/12.15%. Independent fox/snow and surfer/wave renders remained sharp,
+coherent, and semantically correct. It changes composition and is therefore
+opt-in rather than the close-reference default. `H3_TOKEN_REDUCTION_BLOCKS`
+can override the validated `10:30` block interval for development experiments;
+`H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
 `--render-width` and `--render-height` run the model and VAE on a lower
 same-aspect internal canvas, then high-quality vImage-scale RGB frames to the
 requested output size before callbacks, terminal display, and encoding. This is an

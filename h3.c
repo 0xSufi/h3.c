@@ -195,6 +195,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "core reuse must be in [1, 6]");
         return 0;
     }
+    if (params->token_reduction != 0 && params->token_reduction != 1) {
+        h3_set_error(ctx, "token reduction must be zero or one");
+        return 0;
+    }
     if (params->core_reuse > 1 && params->denoise_reuse > 1) {
         h3_set_error(ctx, "core reuse and denoiser reuse cannot be combined");
         return 0;
@@ -886,6 +890,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
+            params->token_reduction,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -893,6 +898,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
+            params->token_reduction,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {

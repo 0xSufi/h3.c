@@ -44,6 +44,11 @@ struct h3_dit {
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
+    int token_reduction;
+    int token_reduction_active;
+    unsigned token_reduction_begin;
+    unsigned token_reduction_end;
+    float token_reduction_scale;
     int bf16_final;
     unsigned core_reuse_interval;
     unsigned core_forward_count;
@@ -66,10 +71,15 @@ struct h3_dit {
     uint32_t audio_target_start;
     uint32_t video_target_start;
     uint32_t sequence;
+    uint32_t reduced_sequence;
+    uint32_t reduced_video_rows;
     h3_gpu_tensor *refined_text;
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
+    h3_gpu_tensor *reduced_rope_cos;
+    h3_gpu_tensor *reduced_rope_sin;
     h3_gpu_tensor **row_maps;
+    h3_gpu_tensor **reduced_row_maps;
     h3_gpu_tensor **final_audio_maps;
     h3_gpu_tensor **final_video_maps;
     h3_gpu_tensor *video_patch_w;
@@ -98,6 +108,10 @@ struct h3_dit {
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
     h3_gpu_tensor *attention_output;
+    h3_gpu_tensor *token_pool_pairs;
+    h3_gpu_tensor *token_expand_parents;
+    h3_gpu_tensor *token_original;
+    h3_gpu_tensor *token_baseline;
     h3_gpu_tensor *mod_mlp;
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *activated;
@@ -294,6 +308,96 @@ static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
     return 1;
 }
 
+static int configure_token_reduction(h3_dit *dit, int requested,
+                                     char *error, size_t error_size) {
+    const char *enabled = getenv("H3_TOKEN_REDUCTION");
+    if (!requested &&
+        (!enabled || !*enabled || !strcmp(enabled, "0"))) return 1;
+    unsigned begin = 10, end = 30;
+    const char *range = getenv("H3_TOKEN_REDUCTION_BLOCKS");
+    if (range && *range) {
+        char *middle = NULL;
+        unsigned long parsed_begin = strtoul(range, &middle, 10);
+        if (middle == range || *middle != ':') {
+            fail(error, error_size,
+                 "H3_TOKEN_REDUCTION_BLOCKS must be BEGIN:END");
+            return 0;
+        }
+        char *tail = NULL;
+        unsigned long parsed_end = strtoul(middle + 1, &tail, 10);
+        if (tail == middle + 1 || *tail || parsed_begin >= parsed_end ||
+            parsed_end > H3_DIT_BLOCKS) {
+            fail(error, error_size,
+                 "token-reduction block range must satisfy 0 <= BEGIN < END <= 50");
+            return 0;
+        }
+        begin = (unsigned)parsed_begin;
+        end = (unsigned)parsed_end;
+    }
+    float scale = 1.0f;
+    const char *scale_text = getenv("H3_TOKEN_REDUCTION_SCALE");
+    if (scale_text && *scale_text) {
+        char *tail = NULL;
+        scale = strtof(scale_text, &tail);
+        if (tail == scale_text || *tail || !isfinite(scale) ||
+            scale < 0.0f || scale > 2.0f) {
+            fail(error, error_size,
+                 "H3_TOKEN_REDUCTION_SCALE must be in [0, 2]");
+            return 0;
+        }
+    }
+    uint32_t spatial_height = (uint32_t)dit->latent_h / 2;
+    uint32_t spatial_width = (uint32_t)dit->latent_w / 2;
+    uint32_t reduced_width = (spatial_width + 1) / 2;
+    uint64_t reduced_video =
+        (uint64_t)(uint32_t)dit->latent_t * spatial_height * reduced_width;
+    if (!spatial_height || !spatial_width ||
+        (uint64_t)(uint32_t)dit->latent_t * spatial_height * spatial_width !=
+            dit->video_rows ||
+        dit->video_target_start + dit->video_rows != dit->sequence ||
+        reduced_video > UINT32_MAX ||
+        reduced_video > UINT32_MAX - dit->video_target_start) {
+        fail(error, error_size,
+             "token reduction requires the target video to end the packed layout");
+        return 0;
+    }
+    dit->token_reduction = 1;
+    dit->token_reduction_begin = begin;
+    dit->token_reduction_end = end;
+    dit->token_reduction_scale = scale;
+    dit->reduced_video_rows = (uint32_t)reduced_video;
+    dit->reduced_sequence = dit->video_target_start +
+                            dit->reduced_video_rows;
+    return 1;
+}
+
+static void token_pool_sources(const h3_dit *dit, uint32_t reduced_row,
+                               uint32_t *first, uint32_t *second) {
+    if (reduced_row < dit->video_target_start) {
+        *first = reduced_row;
+        *second = reduced_row;
+        return;
+    }
+    uint32_t spatial_width = (uint32_t)dit->latent_w / 2;
+    uint32_t reduced_width = (spatial_width + 1) / 2;
+    uint32_t local = reduced_row - dit->video_target_start;
+    uint32_t source = dit->video_target_start +
+        (local / reduced_width) * spatial_width +
+        (local % reduced_width) * 2;
+    *first = source;
+    *second = source + ((source - dit->video_target_start) % spatial_width + 1 <
+                        spatial_width ? 1u : 0u);
+}
+
+static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
+    if (full_row < dit->video_target_start) return full_row;
+    uint32_t spatial_width = (uint32_t)dit->latent_w / 2;
+    uint32_t reduced_width = (spatial_width + 1) / 2;
+    uint32_t local = full_row - dit->video_target_start;
+    return dit->video_target_start + (local / spatial_width) * reduced_width +
+           (local % spatial_width) / 2;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
@@ -463,11 +567,20 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     }
     free_tensor(&inverse_tensor);
     size_t count = (size_t)dit->sequence * ROPE_HALF;
+    size_t reduced_count = dit->token_reduction ?
+        (size_t)dit->reduced_sequence * ROPE_HALF : 0;
     float *cosines = malloc(count * sizeof(*cosines));
     float *sines = malloc(count * sizeof(*sines));
-    if (!cosines || !sines) {
+    float *reduced_cosines = reduced_count ?
+        malloc(reduced_count * sizeof(*reduced_cosines)) : NULL;
+    float *reduced_sines = reduced_count ?
+        malloc(reduced_count * sizeof(*reduced_sines)) : NULL;
+    if (!cosines || !sines ||
+        (reduced_count && (!reduced_cosines || !reduced_sines))) {
         free(cosines);
         free(sines);
+        free(reduced_cosines);
+        free(reduced_sines);
         fail(error, error_size, "out of memory allocating DiT RoPE tables");
         return 0;
     }
@@ -485,13 +598,49 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
             }
         }
     }
+    for (uint32_t row = 0; row < dit->reduced_sequence; row++) {
+        uint32_t first, second;
+        token_pool_sources(dit, row, &first, &second);
+        float axes[] = {
+            (float)((dit->layout.positions[first].t +
+                     dit->layout.positions[second].t) * 0.5),
+            (float)((dit->layout.positions[first].h +
+                     dit->layout.positions[second].h) * 0.5),
+            (float)((dit->layout.positions[first].w +
+                     dit->layout.positions[second].w) * 0.5)
+        };
+        for (uint32_t axis = 0; axis < 3; axis++) {
+            for (uint32_t frequency = 0; frequency < ROPE_FREQS; frequency++) {
+                size_t index = (size_t)row * ROPE_HALF +
+                               axis * ROPE_FREQS + frequency;
+                float angle = axes[axis] * inverse[frequency];
+                reduced_cosines[index] = cosf(angle);
+                reduced_sines[index] = sinf(angle);
+            }
+        }
+    }
     h3_gpu_tensor *cos_f32 = h3_gpu_tensor_from_f32(dit->gpu, cosines, count);
     h3_gpu_tensor *sin_f32 = h3_gpu_tensor_from_f32(dit->gpu, sines, count);
+    h3_gpu_tensor *reduced_cos_f32 = reduced_count ?
+        h3_gpu_tensor_from_f32(dit->gpu, reduced_cosines, reduced_count) : NULL;
+    h3_gpu_tensor *reduced_sin_f32 = reduced_count ?
+        h3_gpu_tensor_from_f32(dit->gpu, reduced_sines, reduced_count) : NULL;
     free(cosines);
     free(sines);
+    free(reduced_cosines);
+    free(reduced_sines);
     dit->rope_cos = h3_gpu_tensor_new_bf16(dit->gpu, count);
     dit->rope_sin = h3_gpu_tensor_new_bf16(dit->gpu, count);
-    int ok = cos_f32 && sin_f32 && dit->rope_cos && dit->rope_sin;
+    if (reduced_count) {
+        dit->reduced_rope_cos = h3_gpu_tensor_new_bf16(
+            dit->gpu, reduced_count);
+        dit->reduced_rope_sin = h3_gpu_tensor_new_bf16(
+            dit->gpu, reduced_count);
+    }
+    int ok = cos_f32 && sin_f32 && dit->rope_cos && dit->rope_sin &&
+        (!reduced_count || (reduced_cos_f32 && reduced_sin_f32 &&
+                            dit->reduced_rope_cos &&
+                            dit->reduced_rope_sin));
     if (ok) {
         ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                     "begin RoPE setup") &&
@@ -500,7 +649,18 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
                  error, error_size, "RoPE cosine cast") &&
              gpu_op(dit, h3_gpu_cast_f32_to_bf16(
                  dit->gpu, dit->rope_sin, sin_f32, (uint32_t)count),
-                 error, error_size, "RoPE sine cast") &&
+                 error, error_size, "RoPE sine cast");
+        if (ok && reduced_count) {
+            ok = gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+                     dit->gpu, dit->reduced_rope_cos, reduced_cos_f32,
+                     (uint32_t)reduced_count), error, error_size,
+                     "reduced RoPE cosine cast") &&
+                 gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+                     dit->gpu, dit->reduced_rope_sin, reduced_sin_f32,
+                     (uint32_t)reduced_count), error, error_size,
+                     "reduced RoPE sine cast");
+        }
+        if (ok) ok =
              gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                     "submit RoPE setup");
     } else if (!error || !*error) {
@@ -509,6 +669,8 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     }
     free_tensor(&cos_f32);
     free_tensor(&sin_f32);
+    free_tensor(&reduced_cos_f32);
+    free_tensor(&reduced_sin_f32);
     return ok;
 }
 
@@ -516,17 +678,23 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
                         char *error, size_t error_size) {
     int steps = h3_dit_schedule_steps(dit->schedule);
     dit->row_maps = calloc((size_t)steps, sizeof(*dit->row_maps));
+    if (dit->token_reduction)
+        dit->reduced_row_maps = calloc((size_t)steps,
+                                       sizeof(*dit->reduced_row_maps));
     dit->final_audio_maps = calloc((size_t)steps,
                                    sizeof(*dit->final_audio_maps));
     dit->final_video_maps = calloc((size_t)steps,
                                    sizeof(*dit->final_video_maps));
     uint32_t *rows = malloc((size_t)dit->sequence * sizeof(*rows));
+    uint32_t *reduced = dit->token_reduction ?
+        malloc((size_t)dit->reduced_sequence * sizeof(*reduced)) : NULL;
     uint32_t *audio = malloc((size_t)dit->audio_rows * sizeof(*audio));
     uint32_t *video = malloc((size_t)dit->video_rows * sizeof(*video));
     if (!dit->row_maps || !dit->final_audio_maps || !dit->final_video_maps ||
+        (dit->token_reduction && (!dit->reduced_row_maps || !reduced)) ||
         !rows || !audio || !video) {
         fail(error, error_size, "out of memory allocating modulation row maps");
-        free(rows); free(audio); free(video);
+        free(rows); free(reduced); free(audio); free(video);
         return 0;
     }
     for (int step = 0; step < steps; step++) {
@@ -534,8 +702,18 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
                                      text->tags, text->tokens, rows,
                                      dit->sequence)) {
             fail(error, error_size, "cannot construct modulation row map");
-            free(rows); free(audio); free(video);
+            free(rows); free(reduced); free(audio); free(video);
             return 0;
+        }
+        if (dit->token_reduction) {
+            for (uint32_t row = 0; row < dit->reduced_sequence; row++) {
+                uint32_t first, second;
+                token_pool_sources(dit, row, &first, &second);
+                (void)second;
+                reduced[row] = rows[first];
+            }
+            dit->reduced_row_maps[step] = h3_gpu_tensor_from_u32(
+                dit->gpu, reduced, dit->reduced_sequence);
         }
         uint32_t audio_row = h3_dit_schedule_audio_row(dit->schedule, step);
         uint32_t video_row = h3_dit_schedule_video_row(dit->schedule, step);
@@ -549,15 +727,50 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
             dit->gpu, audio, dit->audio_rows);
         dit->final_video_maps[step] = h3_gpu_tensor_from_u32(
             dit->gpu, video, dit->video_rows);
-        if (!dit->row_maps[step] || !dit->final_audio_maps[step] ||
+        if (!dit->row_maps[step] ||
+            (dit->token_reduction && !dit->reduced_row_maps[step]) ||
+            !dit->final_audio_maps[step] ||
             !dit->final_video_maps[step]) {
             fail(error, error_size, "cannot allocate modulation row maps: %s",
                  h3_gpu_error(dit->gpu));
-            free(rows); free(audio); free(video);
+            free(rows); free(reduced); free(audio); free(video);
             return 0;
         }
     }
-    free(rows); free(audio); free(video);
+    free(rows); free(reduced); free(audio); free(video);
+    return 1;
+}
+
+static int prepare_token_reduction_maps(h3_dit *dit, char *error,
+                                        size_t error_size) {
+    if (!dit->token_reduction) return 1;
+    size_t pair_count = (size_t)dit->reduced_sequence * 2;
+    uint32_t *pairs = malloc(pair_count * sizeof(*pairs));
+    uint32_t *parents = malloc((size_t)dit->sequence * sizeof(*parents));
+    if (!pairs || !parents) {
+        free(pairs);
+        free(parents);
+        fail(error, error_size,
+             "out of memory allocating token-reduction maps");
+        return 0;
+    }
+    for (uint32_t row = 0; row < dit->reduced_sequence; row++)
+        token_pool_sources(dit, row, &pairs[(size_t)row * 2],
+                           &pairs[(size_t)row * 2 + 1]);
+    for (uint32_t row = 0; row < dit->sequence; row++)
+        parents[row] = token_reduced_parent(dit, row);
+    dit->token_pool_pairs = h3_gpu_tensor_from_u32(
+        dit->gpu, pairs, pair_count);
+    dit->token_expand_parents = h3_gpu_tensor_from_u32(
+        dit->gpu, parents, dit->sequence);
+    free(pairs);
+    free(parents);
+    if (!dit->token_pool_pairs || !dit->token_expand_parents) {
+        fail(error, error_size,
+             "cannot allocate token-reduction map tensors: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
     return 1;
 }
 
@@ -755,6 +968,18 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
+    if (dit->token_reduction) {
+        dit->token_original = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+        dit->token_baseline = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)dit->reduced_sequence * HIDDEN);
+        if (!dit->token_original || !dit->token_baseline) {
+            fail(error, error_size,
+                 "cannot allocate token-reduction residual state: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
     if (dit->core_reuse_interval > 1) {
         dit->core_input = h3_gpu_tensor_new_bf16(
             dit->gpu, sequence * HIDDEN);
@@ -787,6 +1012,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         const h3_sigma_schedule *sigmas,
                         unsigned active_blocks,
                         unsigned core_reuse_interval,
+                        int token_reduction,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -815,7 +1041,9 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->core_reuse_interval = core_reuse_interval;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
-        !validate_layout(dit, text, error, error_size)) goto failed;
+        !validate_layout(dit, text, error, error_size) ||
+        !configure_token_reduction(dit, token_reduction,
+                                   error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -850,6 +1078,7 @@ static h3_dit *load_dit(const char *weight_directory,
     }
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
@@ -875,10 +1104,11 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
+                         int token_reduction,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks, core_reuse_interval,
+                    active_blocks, core_reuse_interval, token_reduction,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -891,6 +1121,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
+                         int token_reduction,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -898,10 +1129,47 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks, core_reuse_interval,
+                    active_blocks, core_reuse_interval, token_reduction,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
+}
+
+static int enter_token_reduction(h3_dit *dit, char *error,
+                                 size_t error_size) {
+    uint32_t full_elements = dit->sequence * HIDDEN;
+    uint32_t reduced_elements = dit->reduced_sequence * HIDDEN;
+    if (!gpu_op(dit, h3_gpu_copy_bf16(
+            dit->gpu, dit->token_original, 0, dit->hidden, 0, full_elements),
+            error, error_size, "save full token residual") ||
+        !gpu_op(dit, h3_gpu_token_pool_bf16(
+            dit->gpu, dit->attention_output, dit->token_original,
+            dit->token_pool_pairs, dit->reduced_sequence, HIDDEN),
+            error, error_size, "pool video tokens")) return 0;
+    h3_gpu_tensor *swap = dit->hidden;
+    dit->hidden = dit->attention_output;
+    dit->attention_output = swap;
+    if (!gpu_op(dit, h3_gpu_copy_bf16(
+            dit->gpu, dit->token_baseline, 0, dit->hidden, 0,
+            reduced_elements), error, error_size,
+            "save pooled token baseline")) return 0;
+    dit->token_reduction_active = 1;
+    return 1;
+}
+
+static int leave_token_reduction(h3_dit *dit, char *error,
+                                 size_t error_size) {
+    if (!gpu_op(dit, h3_gpu_token_expand_delta_bf16(
+            dit->gpu, dit->attention_output, dit->token_original,
+            dit->hidden, dit->token_baseline, dit->token_expand_parents,
+            dit->sequence, HIDDEN, dit->video_target_start,
+            dit->token_reduction_scale), error, error_size,
+            "restore full video-token grid")) return 0;
+    h3_gpu_tensor *swap = dit->hidden;
+    dit->hidden = dit->attention_output;
+    dit->attention_output = swap;
+    dit->token_reduction_active = 0;
+    return 1;
 }
 
 static int run_block(h3_dit *dit, unsigned index, int step,
@@ -909,8 +1177,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     h3_dit_block *weight = &dit->blocks[index];
     const h3_gpu_tensor *modulation = h3_dit_schedule_block(dit->schedule,
                                                             index);
-    h3_gpu_tensor *row_map = dit->row_maps[step];
-    uint32_t rows = dit->sequence;
+    h3_gpu_tensor *row_map = dit->token_reduction_active ?
+        dit->reduced_row_maps[step] : dit->row_maps[step];
+    h3_gpu_tensor *rope_cos = dit->token_reduction_active ?
+        dit->reduced_rope_cos : dit->rope_cos;
+    h3_gpu_tensor *rope_sin = dit->token_reduction_active ?
+        dit->reduced_rope_sin : dit->rope_sin;
+    uint32_t rows = dit->token_reduction_active ?
+        dit->reduced_sequence : dit->sequence;
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
@@ -921,7 +1195,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         weight->qkv, NULL, rows, HIDDEN, INNER * 3), "DiT QKV");
     OP(h3_gpu_grouped_qkv_rope_bf16(
         dit->gpu, dit->query, dit->key, dit->value,
-        dit->qkv, weight->q_norm, weight->k_norm, dit->rope_cos, dit->rope_sin,
+        dit->qkv, weight->q_norm, weight->k_norm, rope_cos, rope_sin,
         rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f), "DiT QK norm/RoPE");
     OP(h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads, dit->query, dit->key,
         dit->value, rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -1009,6 +1283,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         !dit->core_residual_ready ||
         dit->core_forward_count % dit->core_reuse_interval == 0 ||
         step == h3_dit_schedule_steps(dit->schedule) - 1;
+    int use_token_reduction = evaluate_core && dit->token_reduction &&
+        !getenv("H3_DISABLE_TOKEN_REDUCTION");
     uint32_t hidden_elements = dit->sequence * HIDDEN;
     if (evaluate_core && dit->core_reuse_interval > 1)
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
@@ -1018,6 +1294,12 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            if (use_token_reduction &&
+                block == dit->token_reduction_begin &&
+                !enter_token_reduction(dit, error, error_size)) return 0;
+            if (use_token_reduction &&
+                block == dit->token_reduction_end &&
+                !leave_token_reduction(dit, error, error_size)) return 0;
             if (!dit->block_active[block]) continue;
             if (!run_block(dit, block, step, error, error_size)) return 0;
             completed_blocks++;
@@ -1026,6 +1308,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 completed_blocks % command_blocks == 0)
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
         }
+        if (use_token_reduction &&
+            dit->token_reduction_end == H3_DIT_BLOCKS &&
+            !leave_token_reduction(dit, error, error_size)) return 0;
         if (dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
                                dit->core_input, hidden_elements),
@@ -1630,16 +1915,21 @@ void h3_dit_free(h3_dit *dit) {
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
+    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
     if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->final_audio_maps[step]);
     if (dit->final_video_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->final_video_maps[step]);
     free(dit->row_maps);
+    free(dit->reduced_row_maps);
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
+    free_tensor(&dit->reduced_rope_cos);
+    free_tensor(&dit->reduced_rope_sin);
     free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
@@ -1653,7 +1943,9 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_projected); FREE(audio_projected); FREE(hidden);
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
-    FREE(attention_heads); FREE(attention_output); FREE(mod_mlp); FREE(fc1);
+    FREE(attention_heads); FREE(attention_output);
+    FREE(token_pool_pairs); FREE(token_expand_parents);
+    FREE(token_original); FREE(token_baseline); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);

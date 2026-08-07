@@ -1362,6 +1362,68 @@ kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
                                   h3_bf16_to_f32(right[gid]));
 }
 
+struct h3_token_pool_args {
+    uint rows;
+    uint width;
+};
+
+/* The pair table is [output row, {first, second}]. Singleton rows repeat their
+ * source index so non-video prefixes remain bit exact. */
+kernel void h3_token_pool_bf16(
+                         device const ushort *input [[buffer(0)]],
+                         device const uint2 *pairs [[buffer(1)]],
+                         device ushort *output [[buffer(2)]],
+                         constant h3_token_pool_args &args [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint2 pair = pairs[row];
+    ushort first = input[pair.x * args.width + column];
+    if (pair.x == pair.y) {
+        output[row * args.width + column] = first;
+    } else {
+        float average = (h3_bf16_to_f32(first) +
+                         h3_bf16_to_f32(
+                             input[pair.y * args.width + column])) * 0.5f;
+        output[row * args.width + column] = h3_f32_to_bf16(average);
+    }
+}
+
+struct h3_token_expand_args {
+    uint rows;
+    uint width;
+    uint exact_prefix_rows;
+    float update_scale;
+};
+
+/* Restore the full grid while retaining the original within-pair detail. The
+ * reduced stack contributes only its update relative to the pooled baseline. */
+kernel void h3_token_expand_delta_bf16(
+                         device const ushort *original [[buffer(0)]],
+                         device const ushort *reduced [[buffer(1)]],
+                         device const ushort *baseline [[buffer(2)]],
+                         device const uint *parents [[buffer(3)]],
+                         device ushort *output [[buffer(4)]],
+                         constant h3_token_expand_args &args [[buffer(5)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint parent = parents[row];
+    uint destination = row * args.width + column;
+    uint reduced_index = parent * args.width + column;
+    if (row < args.exact_prefix_rows) {
+        output[destination] = reduced[reduced_index];
+    } else {
+        float update = h3_bf16_to_f32(reduced[reduced_index]) -
+                       h3_bf16_to_f32(baseline[reduced_index]);
+        output[destination] = h3_f32_to_bf16(
+            h3_bf16_to_f32(original[destination]) +
+            args.update_scale * update);
+    }
+}
+
 struct h3_euler_args {
     uint sample_offset;
     uint elements;

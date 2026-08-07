@@ -404,6 +404,144 @@ static void run_sampler_ab(h3_dit *dit, float *video, float *audio,
     free(reference_audio);
 }
 
+static void run_token_reduction_ab(h3_dit *dit, float *video, float *audio,
+                                   float *video_velocity,
+                                   float *audio_velocity) {
+    char error[512];
+    float *video_reference = malloc(VIDEO_ELEMENTS * sizeof(*video_reference));
+    float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
+    if (!video_reference || !audio_reference)
+        die("out of memory allocating token-reduction AB references");
+    setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    memcpy(video_reference, video_velocity,
+           VIDEO_ELEMENTS * sizeof(*video_reference));
+    memcpy(audio_reference, audio_velocity,
+           AUDIO_ELEMENTS * sizeof(*audio_reference));
+    unsetenv("H3_DISABLE_TOKEN_REDUCTION");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+
+    static const int candidate_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0;
+    double candidate_seconds = 0.0;
+    int baseline_count = 0;
+    int candidate_count = 0;
+    double video_relative = 0.0, audio_relative = 0.0;
+    double video_absolute = 0.0, audio_absolute = 0.0;
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        if (candidate_pattern[run]) unsetenv("H3_DISABLE_TOKEN_REDUCTION");
+        else setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (candidate_pattern[run]) {
+            video_relative = relative_l2(
+                video_velocity, video_reference, VIDEO_ELEMENTS,
+                &video_absolute);
+            audio_relative = relative_l2(
+                audio_velocity, audio_reference, AUDIO_ELEMENTS,
+                &audio_absolute);
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  token reduction candidate %.3fs video relL2 %.6g; "
+                   "audio relL2 %.6g\n", elapsed, video_relative,
+                   audio_relative);
+        } else {
+            if (memcmp(video_reference, video_velocity,
+                       VIDEO_ELEMENTS * sizeof(*video_reference)) ||
+                memcmp(audio_reference, audio_velocity,
+                       AUDIO_ELEMENTS * sizeof(*audio_reference)))
+                die("token-reduction baseline changed output bytes");
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  token reduction baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_TOKEN_REDUCTION");
+    printf("DiT token reduction AB baseline %.4fs, candidate %.4fs, "
+           "ratio %.4f; video relL2 %.6g max %.6g; audio relL2 %.6g "
+           "max %.6g\n", baseline_seconds / baseline_count,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           video_relative, video_absolute, audio_relative, audio_absolute);
+    free(video_reference);
+    free(audio_reference);
+}
+
+static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
+                                   float *audio) {
+    char error[512];
+    float *initial_video = malloc(VIDEO_ELEMENTS * sizeof(*initial_video));
+    float *initial_audio = malloc(AUDIO_ELEMENTS * sizeof(*initial_audio));
+    float *reference_video = malloc(VIDEO_ELEMENTS * sizeof(*reference_video));
+    float *reference_audio = malloc(AUDIO_ELEMENTS * sizeof(*reference_audio));
+    if (!initial_video || !initial_audio || !reference_video || !reference_audio)
+        die("out of memory allocating token-reduction denoise AB state");
+    memcpy(initial_video, video, VIDEO_ELEMENTS * sizeof(*initial_video));
+    memcpy(initial_audio, audio, AUDIO_ELEMENTS * sizeof(*initial_audio));
+    static const int candidate_pattern[] = {0, 1, 1, 0};
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0, have_reference = 0;
+    double video_relative = 0.0, audio_relative = 0.0;
+    double video_absolute = 0.0, audio_absolute = 0.0;
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        memcpy(video, initial_video, VIDEO_ELEMENTS * sizeof(*video));
+        memcpy(audio, initial_audio, AUDIO_ELEMENTS * sizeof(*audio));
+        if (candidate_pattern[run]) unsetenv("H3_DISABLE_TOKEN_REDUCTION");
+        else setenv("H3_DISABLE_TOKEN_REDUCTION", "1", 1);
+        double start = seconds();
+        if (!h3_dit_denoise_euler(dit, video, audio, 1, NULL, NULL,
+                                  error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (!have_reference && !candidate_pattern[run]) {
+            memcpy(reference_video, video,
+                   VIDEO_ELEMENTS * sizeof(*reference_video));
+            memcpy(reference_audio, audio,
+                   AUDIO_ELEMENTS * sizeof(*reference_audio));
+            have_reference = 1;
+        }
+        if (candidate_pattern[run]) {
+            video_relative = relative_l2(video, reference_video,
+                                         VIDEO_ELEMENTS, &video_absolute);
+            audio_relative = relative_l2(audio, reference_audio,
+                                         AUDIO_ELEMENTS, &audio_absolute);
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  token reduction denoise candidate %.3fs video relL2 "
+                   "%.6g; audio relL2 %.6g\n", elapsed, video_relative,
+                   audio_relative);
+        } else {
+            if (have_reference &&
+                (memcmp(video, reference_video,
+                        VIDEO_ELEMENTS * sizeof(*reference_video)) ||
+                 memcmp(audio, reference_audio,
+                        AUDIO_ELEMENTS * sizeof(*reference_audio))))
+                die("token-reduction denoise baseline changed output bytes");
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  token reduction denoise baseline %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_TOKEN_REDUCTION");
+    printf("DiT token reduction denoise AB baseline %.4fs, candidate %.4fs, "
+           "ratio %.4f; video relL2 %.6g max %.6g; audio relL2 %.6g max "
+           "%.6g\n", baseline_seconds / baseline_count,
+           candidate_seconds / candidate_count,
+           candidate_seconds * baseline_count /
+               (baseline_seconds * candidate_count),
+           video_relative, video_absolute, audio_relative, audio_absolute);
+    free(initial_video); free(initial_audio);
+    free(reference_video); free(reference_audio);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -431,9 +569,12 @@ int main(int argc, char **argv) {
     h3_sigma_schedule sigmas;
     char error[512];
     int sampler_ab = getenv("H3_BENCH_SAMPLER_AB") != NULL;
+    int token_reduction_ab =
+        getenv("H3_BENCH_TOKEN_REDUCTION_AB") != NULL;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
-        !(sampler_ab ? h3_serving_schedule_build(20, &sigmas)
-                     : h3_schedule_build(20, &sigmas)))
+        !((sampler_ab || token_reduction_ab)
+              ? h3_serving_schedule_build(20, &sigmas)
+              : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
@@ -449,7 +590,7 @@ int main(int argc, char **argv) {
     double load_start = seconds();
     h3_dit *dit = h3_dit_load_t2va(
         weights, "h3_shaders.metal", &text, &layout, &sigmas, active_blocks, 1,
-        NULL, NULL, error, sizeof(error));
+        0, NULL, NULL, error, sizeof(error));
     if (!dit) die(error);
     double load_seconds = seconds() - load_start;
 
@@ -502,6 +643,20 @@ int main(int argc, char **argv) {
     if (sampler_ab) {
         run_sampler_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT 512/%u-layer load %.3fs before sampler AB\n",
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (token_reduction_ab) {
+        if (!strcmp(getenv("H3_BENCH_TOKEN_REDUCTION_AB"), "denoise"))
+            run_token_reduction_denoise_ab(dit, video, audio);
+        else
+            run_token_reduction_ab(dit, video, audio, video_velocity,
+                                   audio_velocity);
+        printf("DiT 512/%u-layer load %.3fs before token reduction AB\n",
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);

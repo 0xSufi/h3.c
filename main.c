@@ -25,6 +25,7 @@ static void usage(const char *program) {
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
+        "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
@@ -149,6 +150,7 @@ int main(int argc, char **argv) {
            OPT_FRAMES, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
            OPT_CORE_REUSE,
+           OPT_TOKEN_REDUCTION,
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
@@ -166,6 +168,7 @@ int main(int argc, char **argv) {
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
+        {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"seed", required_argument, NULL, OPT_SEED},
         {"first-frame", required_argument, NULL, OPT_FIRST},
         {"last-frame", required_argument, NULL, OPT_LAST},
@@ -217,6 +220,7 @@ int main(int argc, char **argv) {
             case OPT_CORE_REUSE:
                 params.core_reuse = parse_int(optarg, "core reuse");
                 break;
+            case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SEED: params.seed = parse_u64(optarg, "seed"); break;
             case OPT_FIRST: params.first_frame = optarg; break;
             case OPT_LAST: params.last_frame = optarg; break;

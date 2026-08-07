@@ -414,6 +414,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+            @"h3_token_pool_bf16", @"h3_token_expand_delta_bf16",
             @"h3_euler_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
@@ -2961,6 +2962,65 @@ int h3_gpu_sub_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_token_pool_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *pairs, uint32_t rows,
+                           uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    size_t elements = (size_t)rows * width;
+    if (!rows || !width ||
+        !h3_gpu_require_bf16(gpu, input, elements, @"token pool input") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"token pool output") ||
+        !h3_gpu_require_elements(gpu, pairs, (size_t)rows * 2,
+                                 @"token pool pairs") ||
+        TENSOR(pairs).dtype != H3_GPU_U32) return 0;
+    typedef struct { uint32_t rows, width; } token_pool_args;
+    token_pool_args args = {rows, width};
+    return h3_gpu_dispatch_2d(gpu, @"h3_token_pool_bf16", width, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(pairs).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_token_expand_delta_bf16(
+                           h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *original,
+                           const h3_gpu_tensor *reduced,
+                           const h3_gpu_tensor *baseline,
+                           const h3_gpu_tensor *parents, uint32_t rows,
+                           uint32_t width, uint32_t exact_prefix_rows,
+                           float update_scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t elements = (size_t)rows * width;
+    if (!rows || !width || exact_prefix_rows > rows ||
+        !h3_gpu_require_bf16(gpu, original, elements,
+                             @"token expand original") ||
+        !h3_gpu_require_bf16(gpu, output, elements,
+                             @"token expand output") ||
+        !h3_gpu_require_bf16(gpu, reduced, 1, @"token expand reduced") ||
+        !h3_gpu_require_bf16(gpu, baseline, 1, @"token expand baseline") ||
+        !h3_gpu_require_elements(gpu, parents, rows,
+                                 @"token expand parents") ||
+        TENSOR(parents).dtype != H3_GPU_U32) return 0;
+    typedef struct {
+        uint32_t rows, width, exact_prefix_rows;
+        float update_scale;
+    } token_expand_args;
+    token_expand_args args = {rows, width, exact_prefix_rows, update_scale};
+    return h3_gpu_dispatch_2d(gpu, @"h3_token_expand_delta_bf16", width, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(original).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(reduced).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(baseline).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(parents).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
         });
 }
 
