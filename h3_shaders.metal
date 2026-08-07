@@ -1555,6 +1555,57 @@ kernel void h3_quantize_bf16_int8_groups_scalar128(
     }
 }
 
+/* The selected 1,024-wide grouped quantizer assigns exactly eight values to
+ * each of 128 threads. Keep them private across max reduction and emission so
+ * the quantization pass does not reread the BF16 activation row. */
+kernel void h3_quantize_bf16_int8_groups_scalar128_cached(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    constexpr uint THREADS = 128;
+    constexpr uint VALUES = 8;
+    uint row_base = row * args.columns;
+    if (row >= args.rows) {
+        for (uint column = tid; column < args.columns; column += THREADS)
+            output[row_base + column] = 0;
+        for (uint group = tid; group < args.groups; group += THREADS)
+            scales[row * args.groups + group] = 1.0f;
+        return;
+    }
+    threadgroup float scratch[4];
+    for (uint group = 0; group < args.groups; group++) {
+        uint start = group * args.group_size;
+        thread bfloat values[VALUES];
+        float local_max = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < VALUES; slot++) {
+            uint local = tid + slot * THREADS;
+            bfloat value = input[row_base + start + local];
+            values[slot] = value;
+            local_max = max(local_max, fabs((float)value));
+        }
+        float max_abs = h3_int8_reduce_max4(
+            local_max, scratch, simdgroup, lane);
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0) scales[row * args.groups + group] = scale;
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < VALUES; slot++) {
+            uint local = tid + slot * THREADS;
+            int quantized = (int)rint((float)values[slot] * inverse);
+            output[row_base + start + local] =
+                (int8_t)clamp(quantized, -127, 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 /* Int8 H3 QKV projection. Checkpoint columns are grouped as
  * [head, q/k/v, dimension], so each 128-column TensorOps tile writes one
  * complete stream/head directly in head-major SDPA layout. */

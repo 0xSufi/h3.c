@@ -451,6 +451,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
             [names addObject:
+                @"h3_quantize_bf16_int8_groups_scalar128_cached"];
+            [names addObject:
                 @"h3_qkv_project_split_int8_nax_r128_morton4"];
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_nax_r128_morton4"];
@@ -2785,8 +2787,14 @@ static int h3_gpu_quantize_bf16_int8_groups(
     const char *quantizer_override = getenv("H3_INT8_GROUP_QUANT_128");
     if (quantizer_override)
         scalar128 = *quantizer_override && strcmp(quantizer_override, "0");
+    BOOL cached128 = scalar128 && group_size == 1024;
+    const char *cache_override = getenv("H3_INT8_GROUP_QUANT_128_CACHE");
+    if (cache_override)
+        cached128 = cached128 && *cache_override &&
+            strcmp(cache_override, "0");
     NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
-        @"h3_quantize_bf16_int8_groups" : scalar128 ?
+        @"h3_quantize_bf16_int8_groups" : cached128 ?
+        @"h3_quantize_bf16_int8_groups_scalar128_cached" : scalar128 ?
         @"h3_quantize_bf16_int8_groups_scalar128" :
         @"h3_quantize_bf16_int8_groups_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);

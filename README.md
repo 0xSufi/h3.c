@@ -631,9 +631,12 @@ Use `--use-slower-bf16-mlp` to force the portable close-reference MPS/BF16 MLP
 path for numerical comparison. Older Metal hardware selects that path
 automatically when the required native TensorOps kernels are unavailable.
 For FC2 activation quantization, sequences of at most 2,048 rows use an exact
-128-thread reduction; larger sequences retain the measured 256-thread kernel.
-`--use-slower-grouped-quantizer` forces the latter at every size for A/B
-comparison.
+128-thread reduction. Each thread retains its eight BF16 input values while
+computing the group maximum, avoiding a second device-memory read when it emits
+the int8 values; crossed M5 measurements improved complete 512 forwards by
+about 0.2-0.8% without changing any output byte. Larger sequences retain the
+measured 256-thread kernel. `--use-slower-grouped-quantizer` forces the latter
+at every size for A/B comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
