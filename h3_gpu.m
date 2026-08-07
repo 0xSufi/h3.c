@@ -463,6 +463,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
+            [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
             [names addObject:
@@ -2859,8 +2860,12 @@ int h3_gpu_linear_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             input_dim, 1.0f, @"int8 linear input")) return 0;
     BOOL local_scales = !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_INT8_LOCAL_SCALES") == NULL;
+    BOOL known_linear = local_scales && rows <= 2048 && input_dim == 7168 &&
+        output_dim == 5376 &&
+        getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
+        gpu, known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
+             local_scales ? @"h3_linear_int8_local_scales_nax_r128" :
                             @"h3_linear_int8_nax_r128");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
         h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");

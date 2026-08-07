@@ -616,6 +616,13 @@ direct loads because the two forms tie there. Both are byte-identical and
 improve complete forwards by about 0.2-0.7% where selected. Use
 `--use-slower-uncached-int8-scales` to restore direct device-scale loads.
 
+For sequences of at most 2,048 rows, the H3 attention-output projection also
+compiles its 7,168-by-5,376 shape into the TensorOps kernel. The result remains
+byte-identical while saving about 0.2-0.8% in crossed complete 512-forward
+measurements. Larger sequences retain the dynamic-shape kernel because the
+specialization regresses there. `--use-slower-uncached-int8-scales` restores
+the general dynamic, direct-scale-load implementation.
+
 FC1 also uses an H3-specialized, compile-time 5,376-wide TensorOps loop. It is
 byte-identical to the generic loop and saves about 0.1-0.4% in crossed complete
 forwards. Use `--use-slower-dynamic-fc1-k` to restore the runtime-bound loop.

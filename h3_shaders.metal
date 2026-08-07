@@ -2191,7 +2191,8 @@ kernel void h3_linear_int8_nax_r128(
 
 /* Cache the two 128-value dequantization vectors once per projection tile.
  * The cooperative output fragment otherwise rereads them for every element. */
-kernel void h3_linear_int8_local_scales_nax_r128(
+template<uint INPUT_DIM, uint OUTPUT_DIM>
+kernel void h3_linear_int8_local_scales_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -2203,10 +2204,12 @@ kernel void h3_linear_int8_local_scales_nax_r128(
     constexpr uint TILE = 128;
     uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
     uint row_tiles = padded_rows / TILE;
-    uint column_tiles = args.output_dim / TILE;
+    uint output_dim = OUTPUT_DIM ? OUTPUT_DIM : args.output_dim;
+    uint column_tiles = output_dim / TILE;
     uint2 group = h3_morton_decode_compact(code, row_tiles, column_tiles);
     uint row_start = group.x * TILE;
     uint column_start = group.y * TILE;
+    uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
     threadgroup float local_input_scales[TILE];
     threadgroup float local_weight_scales[TILE];
     if (tid < TILE) {
@@ -2215,11 +2218,11 @@ kernel void h3_linear_int8_local_scales_nax_r128(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        input, dextents<int32_t, 2>((int)args.input_dim,
+        input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
     auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
-        weight, dextents<int32_t, 2>((int)args.input_dim,
-                                     (int)args.output_dim));
+        weight, dextents<int32_t, 2>((int)input_dim,
+                                     (int)output_dim));
     constexpr auto descriptor = matmul2d_descriptor(
         TILE, TILE, TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
@@ -2231,10 +2234,18 @@ kernel void h3_linear_int8_local_scales_nax_r128(
     #pragma clang loop unroll(full)
     for (ushort element = 0; element < accum.get_capacity(); element++)
         if (accum.is_valid_element(element)) accum[element] = 0;
-    for (uint k = 0; k < args.input_dim; k += TILE) {
-        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-        auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
-        mm.run(a, b, accum);
+    if (INPUT_DIM) {
+        for (uint k = 0; k < INPUT_DIM; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+    } else {
+        for (uint k = 0; k < input_dim; k += TILE) {
+            auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
+            auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
     }
     #pragma clang loop unroll(full)
     for (ushort element = 0; element < accum.get_capacity(); element++) {
@@ -2243,12 +2254,21 @@ kernel void h3_linear_int8_local_scales_nax_r128(
         uint row = row_start + (uint)index[1];
         uint column = column_start + (uint)index[0];
         if (row < args.rows)
-            output[row * args.output_dim + column] =
+            output[row * output_dim + column] =
                 (bfloat)((float)accum[element] *
                          local_input_scales[(uint)index[1]] *
                          local_weight_scales[(uint)index[0]]);
     }
 }
+
+typedef decltype(h3_linear_int8_local_scales_nax_r128_impl<0, 0>)
+    h3_linear_int8_local_scales_nax_r128_t;
+template [[host_name("h3_linear_int8_local_scales_nax_r128")]]
+kernel h3_linear_int8_local_scales_nax_r128_t
+    h3_linear_int8_local_scales_nax_r128_impl<0, 0>;
+template [[host_name("h3_linear_int8_local_scales_nax_r128_k7168")]]
+kernel h3_linear_int8_local_scales_nax_r128_t
+    h3_linear_int8_local_scales_nax_r128_impl<7168, 5376>;
 
 /* FC2 is more sensitive to a single scale spanning all 14336 activated
  * channels.  Retain one activation scale per 1024-wide K group, accumulate
