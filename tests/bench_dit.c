@@ -595,6 +595,68 @@ static void run_token_reduction_denoise_ab(h3_dit *dit, float *video,
     free(reference_video); free(reference_audio);
 }
 
+static void run_cross_adaln_ab(h3_dit *dit, float *video, float *audio,
+                               float *video_velocity,
+                               float *audio_velocity) {
+    char error[512];
+    static const int candidate_pattern[] = {
+        0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0
+    };
+    double baseline_seconds = 0.0, candidate_seconds = 0.0;
+    int baseline_count = 0, candidate_count = 0;
+    uint64_t video_hash = 0, audio_hash = 0;
+    setenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN", "1", 1);
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                        audio_velocity, error, sizeof(error))) die(error);
+    video_hash = hash_bytes(
+        video_velocity, VIDEO_ELEMENTS * sizeof(*video_velocity));
+    audio_hash = hash_bytes(
+        audio_velocity, AUDIO_ELEMENTS * sizeof(*audio_velocity));
+    unsetenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN");
+    if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                        audio_velocity, error, sizeof(error))) die(error);
+    if (hash_bytes(video_velocity,
+                   VIDEO_ELEMENTS * sizeof(*video_velocity)) != video_hash ||
+        hash_bytes(audio_velocity,
+                   AUDIO_ELEMENTS * sizeof(*audio_velocity)) != audio_hash)
+        die("cross-block AdaLN fusion warmup changed output bytes");
+    for (size_t run = 0;
+         run < sizeof(candidate_pattern) / sizeof(*candidate_pattern); run++) {
+        if (candidate_pattern[run])
+            unsetenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN");
+        else
+            setenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN", "1", 1);
+        double start = seconds();
+        if (!h3_dit_forward(dit, 6, video, audio, video_velocity,
+                            audio_velocity, error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        uint64_t current_video = hash_bytes(
+            video_velocity, VIDEO_ELEMENTS * sizeof(*video_velocity));
+        uint64_t current_audio = hash_bytes(
+            audio_velocity, AUDIO_ELEMENTS * sizeof(*audio_velocity));
+        if (run && (current_video != video_hash || current_audio != audio_hash))
+            die("cross-block AdaLN fusion changed output bytes");
+        video_hash = current_video;
+        audio_hash = current_audio;
+        if (candidate_pattern[run]) {
+            candidate_seconds += elapsed;
+            candidate_count++;
+            printf("  cross-block AdaLN fused %.3fs\n", elapsed);
+        } else {
+            baseline_seconds += elapsed;
+            baseline_count++;
+            printf("  cross-block AdaLN separate %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN");
+    double baseline = baseline_seconds / baseline_count;
+    double candidate = candidate_seconds / candidate_count;
+    printf("DiT cross-block AdaLN AB separate %.4fs, fused %.4fs, "
+           "ratio %.4f; hashes video %016llx audio %016llx\n",
+           baseline, candidate, candidate / baseline,
+           (unsigned long long)video_hash, (unsigned long long)audio_hash);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -624,8 +686,9 @@ int main(int argc, char **argv) {
     int sampler_ab = getenv("H3_BENCH_SAMPLER_AB") != NULL;
     int token_reduction_ab =
         getenv("H3_BENCH_TOKEN_REDUCTION_AB") != NULL;
+    int cross_adaln_ab = getenv("H3_BENCH_CROSS_ADALN_AB") != NULL;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
-        !((sampler_ab || token_reduction_ab)
+        !((sampler_ab || token_reduction_ab || cross_adaln_ab)
               ? h3_serving_schedule_build(20, &sigmas)
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
@@ -652,7 +715,8 @@ int main(int argc, char **argv) {
     double load_start = seconds();
     h3_dit *dit = h3_dit_load_t2va(
         weights, "h3_shaders.metal", &text, &layout, &sigmas, active_blocks, 1,
-        token_reduction_ab, NULL, NULL, error, sizeof(error));
+        token_reduction_ab || cross_adaln_ab,
+        NULL, NULL, error, sizeof(error));
     if (!dit) die(error);
     double load_seconds = seconds() - load_start;
 
@@ -709,6 +773,18 @@ int main(int argc, char **argv) {
     if (sampler_ab) {
         run_sampler_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT %ux%u/%u-layer load %.3fs before sampler AB\n",
+               (unsigned)CANVAS_W, (unsigned)CANVAS_H,
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (cross_adaln_ab) {
+        run_cross_adaln_ab(dit, video, audio, video_velocity,
+                           audio_velocity);
+        printf("DiT %ux%u/%u-layer load %.3fs before cross-block AdaLN AB\n",
                (unsigned)CANVAS_W, (unsigned)CANVAS_H,
                active_blocks, load_seconds);
         h3_dit_free(dit);

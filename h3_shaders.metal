@@ -1045,12 +1045,13 @@ struct h3_gate_adaln_args {
 kernel void h3_gate_adaln_bf16(
                          device const ushort *residual [[buffer(0)]],
                          device const ushort *branch [[buffer(1)]],
-                         device const ushort *modulation [[buffer(2)]],
+                         device const ushort *gate_modulation [[buffer(2)]],
                          device const uint *row_map [[buffer(3)]],
                          device const ushort *weight [[buffer(4)]],
-                         device ushort *gated_residual [[buffer(5)]],
-                         device ushort *output [[buffer(6)]],
-                         constant h3_gate_adaln_args &args [[buffer(7)]],
+                         device const ushort *norm_modulation [[buffer(5)]],
+                         device ushort *gated_residual [[buffer(6)]],
+                         device ushort *output [[buffer(7)]],
+                         constant h3_gate_adaln_args &args [[buffer(8)]],
                          uint3 group [[threadgroup_position_in_grid]],
                          uint3 thread_position
                              [[thread_position_in_threadgroup]],
@@ -1066,7 +1067,7 @@ kernel void h3_gate_adaln_bf16(
     for (uint column = tid; column < args.width; column += threads) {
         uint index = row * args.width + column;
         float gate = h3_bf16_to_f32(
-            modulation[base + args.gate_slot * args.width + column]);
+            gate_modulation[base + args.gate_slot * args.width + column]);
         ushort gated = h3_f32_to_bf16(
             h3_bf16_to_f32(residual[index]) +
             h3_bf16_to_f32(branch[index]) * gate);
@@ -1086,9 +1087,9 @@ kernel void h3_gate_adaln_bf16(
         float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
             h3_bf16_to_f32(weight[column]);
         float shift = h3_bf16_to_f32(
-            modulation[base + args.shift_slot * args.width + column]);
+            norm_modulation[base + args.shift_slot * args.width + column]);
         float scale = h3_bf16_to_f32(
-            modulation[base + args.scale_slot * args.width + column]);
+            norm_modulation[base + args.scale_slot * args.width + column]);
         output[row * args.width + column] =
             h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
     }

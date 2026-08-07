@@ -1302,7 +1302,8 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
 }
 
 static int run_block(h3_dit *dit, unsigned index, int step,
-                     int attention_adaln_ready,
+                     int attention_adaln_ready, int fuse_next_attention,
+                     unsigned next_index, int *next_attention_adaln_ready,
                      char *error, size_t error_size) {
     h3_dit_block *weight = &dit->blocks[index];
     const h3_gpu_tensor *modulation = h3_dit_schedule_block(dit->schedule,
@@ -1337,7 +1338,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     if (!getenv("H3_DISABLE_FUSED_GATE_ADALN")) {
         OP(h3_gpu_gate_adaln_bf16(
             dit->gpu, dit->hidden, dit->mod_mlp, dit->hidden,
-            dit->attention_output, weight->norm2, modulation, row_map,
+            dit->attention_output, weight->norm2, modulation, modulation,
+            row_map,
             rows, HIDDEN, SLOTS, 2, 3, 4, 1e-5f),
            "DiT fused attention gate and MLP AdaLN");
     } else {
@@ -1365,8 +1367,21 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
-    OP(h3_gpu_gate_bf16(dit->gpu, dit->hidden, dit->hidden, dit->mlp_output,
-        modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+    if (fuse_next_attention) {
+        h3_dit_block *next_weight = &dit->blocks[next_index];
+        const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
+            dit->schedule, next_index);
+        OP(h3_gpu_gate_adaln_bf16(
+            dit->gpu, dit->hidden, dit->mod_attention, dit->hidden,
+            dit->mlp_output, next_weight->norm1, modulation,
+            next_modulation, row_map, rows, HIDDEN, SLOTS, 5, 0, 1, 1e-5f),
+           "DiT fused MLP gate and next attention AdaLN");
+        *next_attention_adaln_ready = 1;
+    } else {
+        OP(h3_gpu_gate_bf16(
+            dit->gpu, dit->hidden, dit->hidden, dit->mlp_output,
+            modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+    }
 #undef OP
     return 1;
 }
@@ -1437,8 +1452,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
+        int carried_attention_adaln = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
-            int fused_token_adaln = 0;
+            int fused_token_adaln = carried_attention_adaln;
+            carried_attention_adaln = 0;
             if (use_token_reduction &&
                 block == dit->token_reduction_begin) {
                 fused_token_adaln = dit->block_active[block] &&
@@ -1459,7 +1476,17 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                                dit, error, error_size)) return 0;
             }
             if (!dit->block_active[block]) continue;
+            unsigned next_block = block + 1;
+            int next_is_token_boundary = use_token_reduction &&
+                (next_block == dit->token_reduction_begin ||
+                 next_block == token_reduction_end);
+            int fuse_next_attention =
+                !getenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN") &&
+                next_block < H3_DIT_BLOCKS &&
+                dit->block_active[next_block] && !next_is_token_boundary;
             if (!run_block(dit, block, step, fused_token_adaln,
+                           fuse_next_attention, next_block,
+                           &carried_attention_adaln,
                            error, error_size)) return 0;
             completed_blocks++;
             if (command_blocks &&

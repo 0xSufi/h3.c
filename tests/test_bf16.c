@@ -284,7 +284,8 @@ static void test_token_reduction_kernels(test_context *test) {
         "encode gate AdaLN reference");
     require_gpu(test, h3_gpu_gate_adaln_bf16(
         test->gpu, fused_gate_residual, fused_gate_adaln, expanded,
-        fused_expanded, norm, modulation, gpu_row_map, FULL_ROWS, WIDTH,
+        fused_expanded, norm, modulation, modulation, gpu_row_map,
+        FULL_ROWS, WIDTH,
         2, 0, 0, 1, 1e-5f),
         "encode fused gate AdaLN");
     require_gpu(test, h3_gpu_submit(test->gpu),
@@ -401,7 +402,8 @@ static void bench_gate_adaln_shape(test_context *test, uint32_t rows,
             "encode gate AdaLN norm warmup");
         require_gpu(test, h3_gpu_gate_adaln_bf16(
             test->gpu, fused_residual, fused_output, residual, branch, norm,
-            modulation, gpu_row_map, rows, WIDTH, SLOTS, 2, 3, 4, 1e-5f),
+            modulation, modulation, gpu_row_map, rows, WIDTH, SLOTS,
+            2, 3, 4, 1e-5f),
             "encode fused gate AdaLN warmup");
     }
     require_gpu(test, h3_gpu_submit(test->gpu),
@@ -421,7 +423,7 @@ static void bench_gate_adaln_shape(test_context *test, uint32_t rows,
             if (fused_pattern[sample]) {
                 require_gpu(test, h3_gpu_gate_adaln_bf16(
                     test->gpu, fused_residual, fused_output, residual, branch,
-                    norm, modulation, gpu_row_map, rows, WIDTH, SLOTS,
+                    norm, modulation, modulation, gpu_row_map, rows, WIDTH, SLOTS,
                     2, 3, 4, 1e-5f),
                     "encode fused gate AdaLN microbenchmark");
             } else {

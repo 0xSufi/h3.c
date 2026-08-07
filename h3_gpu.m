@@ -2576,7 +2576,8 @@ int h3_gpu_gate_adaln_bf16(
                      const h3_gpu_tensor *residual,
                      const h3_gpu_tensor *branch,
                      const h3_gpu_tensor *norm_weight,
-                     const h3_gpu_tensor *modulation,
+                     const h3_gpu_tensor *gate_modulation,
+                     const h3_gpu_tensor *norm_modulation,
                      const h3_gpu_tensor *row_map, uint32_t rows,
                      uint32_t width, uint32_t slots, uint32_t gate_slot,
                      uint32_t shift_slot, uint32_t scale_slot,
@@ -2592,8 +2593,10 @@ int h3_gpu_gate_adaln_bf16(
                              @"fused gate AdaLN branch") ||
         !h3_gpu_require_bf16(gpu, norm_weight, width,
                              @"fused gate AdaLN norm") ||
-        !h3_gpu_require_bf16(gpu, modulation, 1,
-                             @"fused gate AdaLN modulation") ||
+        !h3_gpu_require_bf16(gpu, gate_modulation, 1,
+                             @"fused gate AdaLN gate modulation") ||
+        !h3_gpu_require_bf16(gpu, norm_modulation, 1,
+                             @"fused gate AdaLN norm modulation") ||
         !h3_gpu_require_elements(gpu, row_map, rows,
                                  @"fused gate AdaLN row map") ||
         TENSOR(row_map).dtype != H3_GPU_U32 ||
@@ -2624,12 +2627,13 @@ int h3_gpu_gate_adaln_bf16(
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:TENSOR(residual).buffer offset:0 atIndex:0];
         [encoder setBuffer:TENSOR(branch).buffer offset:0 atIndex:1];
-        [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(gate_modulation).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:4];
-        [encoder setBuffer:TENSOR(gated_residual).buffer offset:0 atIndex:5];
-        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:6];
-        [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        [encoder setBuffer:TENSOR(norm_modulation).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(gated_residual).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:7];
+        [encoder setBytes:&args length:sizeof(args) atIndex:8];
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
