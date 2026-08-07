@@ -2828,6 +2828,11 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     uint32_t fc2_scale_groups = hidden_dim / 1024u;
     size_t activation_capacity = (size_t)padded_rows *
         MAX(input_dim, hidden_dim);
+    const char *stage = getenv("H3_INT8_MLP_STAGE");
+    BOOL int8_fc1 = !stage || (strcmp(stage, "fc2") &&
+                               strcmp(stage, "bf16"));
+    BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
+                               strcmp(stage, "bf16"));
     if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 127u ||
         (input_dim % 128) || (hidden_dim % 128) || (output_dim % 128) ||
         !h3_gpu_require_i8(gpu, quantized_activation, activation_capacity,
@@ -2845,12 +2850,12 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                            @"int8 MLP FC2 weight") ||
         !h3_gpu_require_f32(gpu, fc2_scales, output_dim,
                             @"int8 MLP FC2 scales") ||
-        !h3_gpu_require_bf16(gpu, fc1_bf16,
-                             (size_t)hidden_dim * 2 * input_dim,
-                             @"diagnostic BF16 MLP FC1 weight") ||
-        !h3_gpu_require_bf16(gpu, fc2_bf16,
-                             (size_t)output_dim * hidden_dim,
-                             @"diagnostic BF16 MLP FC2 weight") ||
+        (!int8_fc1 && !h3_gpu_require_bf16(
+            gpu, fc1_bf16, (size_t)hidden_dim * 2 * input_dim,
+            @"diagnostic BF16 MLP FC1 weight")) ||
+        (!int8_fc2 && !h3_gpu_require_bf16(
+            gpu, fc2_bf16, (size_t)output_dim * hidden_dim,
+            @"diagnostic BF16 MLP FC2 weight")) ||
         !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
                              @"int8 MLP input") ||
         !h3_gpu_require_bf16(gpu, activated,
@@ -2891,11 +2896,6 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         float parsed = strtof(clip_value, NULL);
         if (parsed >= 0.1f && parsed <= 1.0f) activation_clip = parsed;
     }
-    const char *stage = getenv("H3_INT8_MLP_STAGE");
-    BOOL int8_fc1 = !stage || (strcmp(stage, "fc2") &&
-                               strcmp(stage, "bf16"));
-    BOOL int8_fc2 = !stage || (strcmp(stage, "fc1") &&
-                               strcmp(stage, "bf16"));
     BOOL grouped_fc2 = int8_fc2 &&
         getenv("H3_INT8_UNGROUPED_FC2") == NULL;
     BOOL grouped_fc2_local = grouped_fc2 &&

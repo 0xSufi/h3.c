@@ -49,6 +49,7 @@ struct h3_dit {
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
+    int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
     int fused_patch_pack;
@@ -515,6 +516,10 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
         fail(error, error_size, "cannot quantize DiT MLP weights: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (!dit->keep_bf16_mlp) {
+        free_tensor(&block->fc1);
+        free_tensor(&block->fc2);
     }
     return 1;
 }
@@ -1324,6 +1329,10 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = dit->fused_mlp && h3_gpu_has_int8_mlp(dit->gpu);
+    dit->keep_bf16_mlp = dit->int8_mlp &&
+        (getenv("H3_INT8_KEEP_BF16_MLP") ||
+         getenv("H3_BENCH_INT8_MLP_AB") ||
+         getenv("H3_INT8_MLP_STAGE"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -1536,7 +1545,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp && !getenv("H3_DISABLE_INT8_MLP")) {
+    if (dit->int8_mlp &&
+        (!getenv("H3_DISABLE_INT8_MLP") ||
+         !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
             dit->gpu, mlp_output, dit->activated, dit->int8_activation,
             dit->int8_activation_scales, dit->mod_mlp,

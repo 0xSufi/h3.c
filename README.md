@@ -572,8 +572,10 @@ fragments instead of repeatedly spilling a 32 KiB threadgroup tile. A fixed
 25.80 seconds with int8 on M5 Max. Beginning, middle, and final decoded frames
 retained the same subject, composition, and motion; small edge and fur details
 can differ. The current diagnostic implementation retains both BF16 and int8
-MLP weights, increasing that render's peak tensor storage from 36.4 to 47.3
-GiB; eliminating the duplicate BF16 weights is ongoing work.
+MLP weights only when an A/B diagnostic requests them. Normal int8 loading
+releases each block's BF16 FC1/FC2 buffers after their submitted quantization
+finishes, reducing measured peak tensor storage to 25.9 GiB from the BF16
+path's 36.4 GiB. Runtime weight quantization still adds startup time.
 
 ```sh
 H3_INT8_MLP=1 ./h3 --profile -d ./MiniMax-H3 \
