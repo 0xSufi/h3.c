@@ -1749,9 +1749,9 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
     }
 }
 
-/* QKV variant that caches the row and checkpoint-column scale vectors. The
- * first half of scratch is safely recycled for inverse RMS after every
- * cooperative fragment has consumed its projection scales. */
+/* QKV variant that caches the row and checkpoint-column scale vectors. After
+ * every cooperative fragment has consumed the scales, the first half is
+ * recycled for inverse RMS and the second half for Q/K normalization weights. */
 kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
@@ -1824,33 +1824,37 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
                          scratch[TILE + column]);
     }
     if (stream < 2) {
+        device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
         threadgroup_barrier(mem_flags::mem_device |
                             mem_flags::mem_threadgroup);
         uint row = row_start + tid;
-        if (tid < TILE && row < args.rows) {
-            float sum = 0.0f;
-            if (args.head_major == 2) {
-                device const bfloat4 *destination4 =
-                    reinterpret_cast<device const bfloat4 *>(destination);
-                uint vector_base = row * (TILE / 4);
-                for (uint vector = 0; vector < TILE / 4; vector++) {
-                    float4 elements = float4(destination4[vector_base + vector]);
-                    sum = fma(elements.x, elements.x, sum);
-                    sum = fma(elements.y, elements.y, sum);
-                    sum = fma(elements.z, elements.z, sum);
-                    sum = fma(elements.w, elements.w, sum);
+        if (tid < TILE) {
+            scratch[TILE + tid] = (float)norm_weight[tid];
+            if (row < args.rows) {
+                float sum = 0.0f;
+                if (args.head_major == 2) {
+                    device const bfloat4 *destination4 =
+                        reinterpret_cast<device const bfloat4 *>(destination);
+                    uint vector_base = row * (TILE / 4);
+                    for (uint vector = 0; vector < TILE / 4; vector++) {
+                        float4 elements =
+                            float4(destination4[vector_base + vector]);
+                        sum = fma(elements.x, elements.x, sum);
+                        sum = fma(elements.y, elements.y, sum);
+                        sum = fma(elements.z, elements.z, sum);
+                        sum = fma(elements.w, elements.w, sum);
+                    }
+                } else {
+                    for (uint dimension = 0; dimension < TILE; dimension++) {
+                        float element =
+                            (float)destination[row * TILE + dimension];
+                        sum = fma(element, element, sum);
+                    }
                 }
-            } else {
-                for (uint dimension = 0; dimension < TILE; dimension++) {
-                    float element =
-                        (float)destination[row * TILE + dimension];
-                    sum = fma(element, element, sum);
-                }
+                scratch[tid] = rsqrt(sum / float(TILE) + args.epsilon);
             }
-            scratch[tid] = rsqrt(sum / float(TILE) + args.epsilon);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
         for (uint unit = tid; unit < TILE * NORMALIZED_UNITS; unit += 256) {
             uint local_row = unit / NORMALIZED_UNITS;
             uint part = unit - local_row * NORMALIZED_UNITS;
@@ -1861,9 +1865,9 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
             if (part < ROPE_PAIRS) {
                 uint upper = part + ROPE_PAIRS;
                 float lower_value = (float)destination[base + part] * inv *
-                                    (float)norm_weight[part];
+                                    scratch[TILE + part];
                 float upper_value = (float)destination[base + upper] * inv *
-                                    (float)norm_weight[upper];
+                                    scratch[TILE + upper];
                 float c = (float)rope_cos[
                     global_row * args.rope_half + part];
                 float s = (float)rope_sin[
@@ -1876,7 +1880,7 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4(
                 uint dimension = part + ROPE_PAIRS;
                 destination[base + dimension] = (bfloat)(
                     (float)destination[base + dimension] * inv *
-                    (float)norm_weight[dimension]);
+                    scratch[TILE + dimension]);
             }
         }
     }
