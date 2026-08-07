@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 #include "h3_safetensors.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -223,6 +224,106 @@ static void run_mps_command_ab(h3_dit *dit, float *video, float *audio,
     free(audio_reference);
 }
 
+static double relative_l2(const float *got, const float *want, size_t count,
+                          double *maximum_absolute) {
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    double maximum = 0.0;
+    for (size_t index = 0; index < count; index++) {
+        double delta = (double)got[index] - want[index];
+        double magnitude = fabs(delta);
+        squared_error += delta * delta;
+        squared_reference += (double)want[index] * want[index];
+        if (magnitude > maximum) maximum = magnitude;
+    }
+    *maximum_absolute = maximum;
+    return sqrt(squared_error / (squared_reference > 1e-30
+                                 ? squared_reference : 1e-30));
+}
+
+static void run_sampler_ab(h3_dit *dit, float *video, float *audio,
+                           float *video_velocity, float *audio_velocity) {
+    char error[512];
+    float *initial_video = malloc(VIDEO_ELEMENTS * sizeof(*initial_video));
+    float *initial_audio = malloc(AUDIO_ELEMENTS * sizeof(*initial_audio));
+    float *reference_video = malloc(VIDEO_ELEMENTS * sizeof(*reference_video));
+    float *reference_audio = malloc(AUDIO_ELEMENTS * sizeof(*reference_audio));
+    if (!initial_video || !initial_audio || !reference_video || !reference_audio)
+        die("out of memory allocating sampler AB state");
+    memcpy(initial_video, video, VIDEO_ELEMENTS * sizeof(*initial_video));
+    memcpy(initial_audio, audio, AUDIO_ELEMENTS * sizeof(*initial_audio));
+
+    /* Populate the shape-keyed MPSGraph caches outside the measured runs. */
+    if (!h3_dit_forward(dit, 0, video, audio, video_velocity, audio_velocity,
+                        error, sizeof(error))) die(error);
+    static const int gpu_pattern[] = {0, 1, 1, 0, 1, 0, 0, 1};
+    double cpu_seconds = 0.0;
+    double gpu_seconds = 0.0;
+    int cpu_count = 0;
+    int gpu_count = 0;
+    int have_reference = 0;
+    const char *gpu_command_blocks = getenv("H3_BENCH_GPU_COMMAND_BLOCKS");
+    double video_rel = 0.0, audio_rel = 0.0;
+    double video_abs = 0.0, audio_abs = 0.0;
+    for (size_t run = 0; run < sizeof(gpu_pattern) / sizeof(*gpu_pattern);
+         run++) {
+        memcpy(video, initial_video, VIDEO_ELEMENTS * sizeof(*video));
+        memcpy(audio, initial_audio, AUDIO_ELEMENTS * sizeof(*audio));
+        if (gpu_pattern[run]) {
+            unsetenv("H3_CPU_SAMPLER");
+            setenv("H3_GPU_SAMPLER", "1", 1);
+            if (gpu_command_blocks)
+                setenv("H3_DIT_COMMAND_BLOCKS", gpu_command_blocks, 1);
+        } else {
+            setenv("H3_CPU_SAMPLER", "1", 1);
+            unsetenv("H3_GPU_SAMPLER");
+            if (gpu_command_blocks) unsetenv("H3_DIT_COMMAND_BLOCKS");
+        }
+        double start = seconds();
+        if (!h3_dit_denoise_euler(dit, video, audio, 3, NULL, NULL,
+                                  error, sizeof(error))) die(error);
+        double elapsed = seconds() - start;
+        if (!have_reference && !gpu_pattern[run]) {
+            memcpy(reference_video, video,
+                   VIDEO_ELEMENTS * sizeof(*reference_video));
+            memcpy(reference_audio, audio,
+                   AUDIO_ELEMENTS * sizeof(*reference_audio));
+            have_reference = 1;
+        }
+        if (gpu_pattern[run]) {
+            video_rel = relative_l2(video, reference_video, VIDEO_ELEMENTS,
+                                    &video_abs);
+            audio_rel = relative_l2(audio, reference_audio, AUDIO_ELEMENTS,
+                                    &audio_abs);
+            gpu_seconds += elapsed;
+            gpu_count++;
+            printf("  sampler AB GPU %.3fs video relL2 %.6g max %.6g; "
+                   "audio relL2 %.6g max %.6g\n", elapsed, video_rel,
+                   video_abs, audio_rel, audio_abs);
+        } else {
+            if (have_reference &&
+                (memcmp(video, reference_video, sizeof(*video) * VIDEO_ELEMENTS) ||
+                 memcmp(audio, reference_audio, sizeof(*audio) * AUDIO_ELEMENTS)))
+                die("repeated CPU sampler changed output bytes");
+            cpu_seconds += elapsed;
+            cpu_count++;
+            printf("  sampler AB CPU %.3fs\n", elapsed);
+        }
+    }
+    unsetenv("H3_GPU_SAMPLER");
+    unsetenv("H3_CPU_SAMPLER");
+    if (gpu_command_blocks) unsetenv("H3_DIT_COMMAND_BLOCKS");
+    printf("DiT sampler AB CPU %.4fs, GPU-chain %.4fs, ratio %.4f; "
+           "video relL2 %.6g max %.6g; audio relL2 %.6g max %.6g\n",
+           cpu_seconds / cpu_count, gpu_seconds / gpu_count,
+           gpu_seconds * cpu_count / (cpu_seconds * gpu_count),
+           video_rel, video_abs, audio_rel, audio_abs);
+    free(initial_video);
+    free(initial_audio);
+    free(reference_video);
+    free(reference_audio);
+}
+
 int main(int argc, char **argv) {
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
     const char *prompt_fixture = argc > 2 ? argv[2] :
@@ -249,8 +350,11 @@ int main(int argc, char **argv) {
     h3_layout layout;
     h3_sigma_schedule sigmas;
     char error[512];
+    int sampler_ab = getenv("H3_BENCH_SAMPLER_AB") != NULL;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
-        !h3_schedule_build(20, &sigmas)) die("cannot build benchmark layout");
+        !(sampler_ab ? h3_serving_schedule_build(20, &sigmas)
+                     : h3_schedule_build(20, &sigmas)))
+        die("cannot build benchmark layout");
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
     unsigned active_blocks = 50;
@@ -298,6 +402,16 @@ int main(int argc, char **argv) {
     if (getenv("H3_BENCH_MPS_COMMAND_AB")) {
         run_mps_command_ab(dit, video, audio, video_velocity, audio_velocity);
         printf("DiT 512/%u-layer load %.3fs before MPS-command AB\n",
+               active_blocks, load_seconds);
+        h3_dit_free(dit);
+        h3_layout_free(&layout);
+        free(text_values); free(video); free(audio);
+        free(video_velocity); free(audio_velocity);
+        return 0;
+    }
+    if (sampler_ab) {
+        run_sampler_ab(dit, video, audio, video_velocity, audio_velocity);
+        printf("DiT 512/%u-layer load %.3fs before sampler AB\n",
                active_blocks, load_seconds);
         h3_dit_free(dit);
         h3_layout_free(&layout);

@@ -111,6 +111,8 @@ struct h3_dit {
     h3_gpu_tensor *video_output;
     h3_gpu_tensor *audio_output_bf16;
     h3_gpu_tensor *video_output_bf16;
+    h3_gpu_tensor *previous_audio_velocity;
+    h3_gpu_tensor *previous_video_velocity;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -947,12 +949,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     return 1;
 }
 
-static int encode_forward(h3_dit *dit, int step, char *error,
+static int encode_forward(h3_dit *dit, int step, int begin, int submit,
+                          int disable_command_split, char *error,
                           size_t error_size) {
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
-    OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
+    if (begin) OP(h3_gpu_begin(dit->gpu), "begin DiT forward");
     OP(h3_gpu_linear_f32(dit->gpu, dit->video_projected_f32, dit->video_input,
         dit->video_patch_w, dit->video_patch_b, dit->video_total_rows,
         VIDEO_PATCH, HIDDEN), "video patch projection");
@@ -1003,7 +1006,8 @@ static int encode_forward(h3_dit *dit, int step, char *error,
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
     if (evaluate_core) {
-        unsigned command_blocks = command_block_interval(dit);
+        unsigned command_blocks = disable_command_split
+            ? 0 : command_block_interval(dit);
         unsigned completed_blocks = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             if (!dit->block_active[block]) continue;
@@ -1071,7 +1075,7 @@ static int encode_forward(h3_dit *dit, int step, char *error,
             dit->video_output, dit->video_rows * VIDEO_PATCH),
            "final video output cast");
     }
-    OP(h3_gpu_submit(dit->gpu), "submit DiT forward");
+    if (submit) OP(h3_gpu_submit(dit->gpu), "submit DiT forward");
 #undef OP
     return 1;
 }
@@ -1125,7 +1129,7 @@ int h3_dit_forward(h3_dit *dit, int step,
             (size_t)dit->audio_condition_rows * AUDIO_CHANNELS,
             audio_rows, audio_row_elements);
     if (!ok) fail(error, error_size, "cannot pack/write DiT input latents");
-    if (ok) ok = encode_forward(dit, step, error, error_size);
+    if (ok) ok = encode_forward(dit, step, 1, 1, 0, error, error_size);
     if (ok) ok = h3_gpu_tensor_read_bf16(dit->video_output_bf16, video_out,
                                          video_row_elements) &&
                  h3_gpu_tensor_read_bf16(dit->audio_output_bf16, audio_out,
@@ -1156,6 +1160,19 @@ int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats) {
     return dit && h3_gpu_get_stats(dit->gpu, stats);
 }
 
+static float extrapolation_ratio(float current_sigma, float last_sigma,
+                                 float previous_sigma, int have_previous) {
+    if (!have_previous) return 0.0f;
+    float denominator = last_sigma - previous_sigma;
+    float ratio = denominator != 0.0f
+        ? (current_sigma - last_sigma) / denominator : 0.0f;
+    /* Reuse intervals are deliberately small. This guard prevents malformed
+     * custom schedules from turning one cached evaluation into an explosion. */
+    if (ratio < -2.0f) ratio = -2.0f;
+    if (ratio > 2.0f) ratio = 2.0f;
+    return ratio;
+}
+
 static void extrapolate_velocity(float *output, const float *last,
                                  const float *previous, size_t count,
                                  float current_sigma, float last_sigma,
@@ -1164,13 +1181,8 @@ static void extrapolate_velocity(float *output, const float *last,
         memcpy(output, last, count * sizeof(*output));
         return;
     }
-    float denominator = last_sigma - previous_sigma;
-    float ratio = denominator != 0.0f
-        ? (current_sigma - last_sigma) / denominator : 0.0f;
-    /* Reuse intervals are deliberately small. This guard prevents malformed
-     * custom schedules from turning one cached evaluation into an explosion. */
-    if (ratio < -2.0f) ratio = -2.0f;
-    if (ratio > 2.0f) ratio = 2.0f;
+    float ratio = extrapolation_ratio(current_sigma, last_sigma,
+                                      previous_sigma, have_previous);
     for (size_t index = 0; index < count; index++)
         output[index] = last[index] +
                         ratio * (last[index] - previous[index]);
@@ -1224,6 +1236,196 @@ static int parse_reuse_steps(int steps, uint8_t *selected) {
         if (!*text) return -1;
     }
     return selected[0] && selected[steps - 1] ? count : -1;
+}
+
+static int gpu_sampler_requested(const h3_dit *dit) {
+    const char *cpu = getenv("H3_CPU_SAMPLER");
+    if (cpu && *cpu && strcmp(cpu, "0")) return 0;
+    const char *value = getenv("H3_GPU_SAMPLER");
+    if (value) return *value && strcmp(value, "0");
+    return h3_gpu_is_m5(dit->gpu);
+}
+
+static unsigned gpu_sampler_window(void) {
+    const char *value = getenv("H3_GPU_SAMPLER_WINDOW");
+    if (!value || !*value) return 1;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    return end != value && !*end && parsed >= 0 && parsed <= H3_MAX_STEPS
+        ? (unsigned)parsed : 1;
+}
+
+static int ensure_previous_velocities(h3_dit *dit, char *error,
+                                      size_t error_size) {
+    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
+    free_tensor(&dit->previous_video_velocity);
+    free_tensor(&dit->previous_audio_velocity);
+    dit->previous_video_velocity = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)dit->video_rows * VIDEO_PATCH);
+    dit->previous_audio_velocity = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)dit->audio_rows * AUDIO_CHANNELS);
+    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
+    free_tensor(&dit->previous_video_velocity);
+    free_tensor(&dit->previous_audio_velocity);
+    fail(error, error_size, "cannot allocate GPU Euler velocity cache: %s",
+         h3_gpu_error(dit->gpu));
+    return 0;
+}
+
+static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
+                             float *audio_latent, int reuse_interval,
+                             h3_dit_progress progress, void *progress_opaque,
+                             char *error, size_t error_size) {
+    uint8_t selected[H3_MAX_STEPS] = {0};
+    int selected_count = h3_dit_reuse_schedule(
+        dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
+    int custom_count = reuse_interval > 1 ?
+        parse_reuse_steps(dit->sigmas.steps, selected) : 0;
+    if (selected_count < 0 || custom_count < 0) {
+        fail(error, error_size,
+             "H3_REUSE_STEPS must be increasing and include 0 and %d",
+             dit->sigmas.steps - 1);
+        return 0;
+    }
+    if (custom_count > 0) selected_count = custom_count;
+    if (reuse_interval > 1 && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: %s GPU reuse schedule has %d evaluations\n",
+                custom_count > 0 ? "custom" : "selected", selected_count);
+    unsigned window = gpu_sampler_window();
+    int disable_command_split = window == 1 &&
+                                getenv("H3_DIT_COMMAND_BLOCKS") == NULL;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: GPU sampler encode window is %s; internal split "
+                "%s\n", window ? "bounded" : "unbounded",
+                disable_command_split ? "disabled" : "enabled");
+
+    size_t video_count = (size_t)dit->video_rows * VIDEO_PATCH;
+    size_t audio_count = (size_t)dit->audio_rows * AUDIO_CHANNELS;
+    size_t video_offset = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t audio_offset = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (video_count > UINT32_MAX || audio_count > UINT32_MAX ||
+        video_offset > UINT32_MAX - video_count ||
+        audio_offset > UINT32_MAX - audio_count ||
+        (reuse_interval > 1 &&
+         !ensure_previous_velocities(dit, error, error_size))) return 0;
+
+    float *video_rows = malloc(video_count * sizeof(*video_rows));
+    float *audio_rows = malloc(audio_count * sizeof(*audio_rows));
+    if (!video_rows || !audio_rows) {
+        fail(error, error_size, "out of memory packing GPU Euler latents");
+        free(video_rows);
+        free(audio_rows);
+        return 0;
+    }
+    int ok = h3_dit_patchify_video(video_latent, VIDEO_CHANNELS,
+        dit->latent_t, dit->latent_h, dit->latent_w, video_rows, video_count) &&
+        h3_dit_pack_audio(audio_latent, AUDIO_CHANNELS, dit->audio_t,
+                          audio_rows, audio_count) &&
+        h3_gpu_tensor_write_f32_range(dit->video_input, video_offset,
+                                      video_rows, video_count) &&
+        h3_gpu_tensor_write_f32_range(dit->audio_input, audio_offset,
+                                      audio_rows, audio_count);
+    if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
+
+    int last_evaluated = -1;
+    int previous_evaluated = -1;
+    unsigned pending_evaluations = 0;
+    int command_active = 0;
+    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
+        report(progress, progress_opaque, "denoise enqueue", step,
+               dit->sigmas.steps);
+        if (!command_active) {
+            ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                        "begin GPU Euler command chain");
+            command_active = ok;
+        }
+        if (!ok) break;
+        int evaluate = selected[step];
+        if (evaluate) {
+            if (last_evaluated >= 0 && reuse_interval > 1) {
+                ok = gpu_op(dit, h3_gpu_copy_bf16(
+                    dit->gpu, dit->previous_video_velocity, 0,
+                    dit->video_output_bf16, 0, video_count),
+                    error, error_size, "cache previous video velocity") &&
+                    gpu_op(dit, h3_gpu_copy_bf16(
+                    dit->gpu, dit->previous_audio_velocity, 0,
+                    dit->audio_output_bf16, 0, audio_count),
+                    error, error_size, "cache previous audio velocity");
+                if (ok) previous_evaluated = last_evaluated;
+            }
+            if (ok) ok = encode_forward(dit, step, 0, 0,
+                                        disable_command_split,
+                                        error, error_size);
+            if (ok) {
+                last_evaluated = step;
+                pending_evaluations++;
+            }
+        }
+        if (!ok) break;
+
+        float video_ratio = evaluate ? 0.0f : extrapolation_ratio(
+            dit->sigmas.video[step], dit->sigmas.video[last_evaluated],
+            previous_evaluated >= 0
+                ? dit->sigmas.video[previous_evaluated] : 0.0f,
+            previous_evaluated >= 0);
+        float audio_ratio = evaluate ? 0.0f : extrapolation_ratio(
+            dit->sigmas.audio[step], dit->sigmas.audio[last_evaluated],
+            previous_evaluated >= 0
+                ? dit->sigmas.audio[previous_evaluated] : 0.0f,
+            previous_evaluated >= 0);
+        const h3_gpu_tensor *previous_video = previous_evaluated >= 0
+            ? dit->previous_video_velocity : dit->video_output_bf16;
+        const h3_gpu_tensor *previous_audio = previous_evaluated >= 0
+            ? dit->previous_audio_velocity : dit->audio_output_bf16;
+        ok = gpu_op(dit, h3_gpu_euler_bf16(
+                dit->gpu, dit->video_input, video_offset,
+                dit->video_output_bf16, previous_video, (uint32_t)video_count,
+                dit->sigmas.video[step] - dit->sigmas.video[step + 1],
+                video_ratio), error, error_size, "GPU video Euler step") &&
+             gpu_op(dit, h3_gpu_euler_bf16(
+                dit->gpu, dit->audio_input, audio_offset,
+                dit->audio_output_bf16, previous_audio, (uint32_t)audio_count,
+                dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
+                audio_ratio), error, error_size, "GPU audio Euler step");
+        if (ok && evaluate) {
+            int finish = step + 1 == dit->sigmas.steps ||
+                         (window && pending_evaluations >= window);
+            ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
+                                    : h3_gpu_continue(dit->gpu),
+                        error, error_size,
+                        finish ? "submit GPU Euler window"
+                               : "continue GPU Euler command chain");
+            if (ok && finish) {
+                command_active = 0;
+                pending_evaluations = 0;
+            }
+        }
+        if (ok) report(progress, progress_opaque, "denoise enqueue", step + 1,
+                       dit->sigmas.steps);
+    }
+    if (ok && command_active)
+        ok = gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                    "submit GPU Euler denoise");
+    if (ok) ok = h3_gpu_tensor_read_f32_range(
+                     dit->video_input, video_offset, video_rows, video_count) &&
+                 h3_gpu_tensor_read_f32_range(
+                     dit->audio_input, audio_offset, audio_rows, audio_count);
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot read GPU Euler latents");
+    if (ok) ok = h3_dit_unpatchify_video(
+                     video_rows, VIDEO_CHANNELS, dit->latent_t, dit->latent_h,
+                     dit->latent_w, video_latent, h3_dit_video_elements(dit)) &&
+                 h3_dit_unpack_audio(audio_rows, AUDIO_CHANNELS, dit->audio_t,
+                                     audio_latent,
+                                     h3_dit_audio_elements(dit));
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot unpack GPU Euler latents");
+    free(video_rows);
+    free(audio_rows);
+    if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
+                   dit->sigmas.steps);
+    h3_gpu_profile_mark(dit->gpu, "GPU Euler denoise");
+    return ok;
 }
 
 int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
@@ -1311,6 +1513,10 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
     }
+    if (gpu_sampler_requested(dit))
+        return denoise_euler_gpu(dit, video_latent, audio_latent,
+                                 reuse_interval, progress, progress_opaque,
+                                 error, error_size);
     uint8_t selected[H3_MAX_STEPS] = {0};
     int selected_count = h3_dit_reuse_schedule(
         dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
@@ -1445,6 +1651,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);
+    FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
     h3_gpu_free(dit->gpu);

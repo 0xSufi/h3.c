@@ -152,6 +152,16 @@ one `MPSCommandBuffer` wrapper for their shared underlying Metal command buffer.
 Repeated thermal-balanced runs measured 1.0-1.6% faster on M3 Max; M5 measured
 neutral, so it retains fresh wrappers. `H3_REUSE_MPS_COMMAND=0` or `1` overrides
 the automatic selection. Results are byte-identical.
+On M5, the serving Euler sampler keeps its patch-packed F32 latents and cached
+BF16 velocities in Metal buffers. Each selected denoiser refresh is completed
+before the next is encoded, avoiding MPSGraph back-pressure while removing all
+intermediate latent/velocity readbacks and repacking. Two warm eight-run A/B
+sequences measured small 0.1% and 0.3% gains with byte-identical final latents;
+the path also saves roughly 16 bytes of transient host state per video-latent
+element (about 136 MB at the 768p shape). M3 and older GPUs retain the CPU
+sampler by default. `H3_CPU_SAMPLER=1` restores it on M5;
+`H3_GPU_SAMPLER=1` selects the GPU-state path explicitly, and
+`H3_GPU_SAMPLER_WINDOW=0` enables the slower unbounded encode-ahead diagnostic.
 
 The released checkpoint stores DiT QKV rows interleaved per attention head.
 Native Metal consumes that layout directly in the fused QK-normalization/RoPE
