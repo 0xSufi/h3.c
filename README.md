@@ -49,6 +49,19 @@ h3> The camera moves slowly around the subject.
 Use `!first clear` or `!last clear` to remove an anchor. Generated videos are
 written to the session directory printed at startup.
 
+For a general Ref2VA conditioning image, use `!ref-image PATH` instead. Images
+are appended in order and exposed to the model as `<Picture 1>`, `<Picture 2>`,
+and so on; filenames have no meaning to the model.
+
+```text
+h3> !ref-image person.png
+h3> Make the person shown in Picture 1 wave to the camera.
+```
+
+`!refs` lists the current order, `!ref-remove N` removes one entry, and
+`!refs clear` removes them all. Ref2VA references cannot be mixed with
+`!first`/`!last` anchors.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps
