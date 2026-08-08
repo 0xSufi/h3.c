@@ -151,21 +151,9 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
-    const int fixed_tail = evaluations >= 3 && evaluations < 20;
-    const float tail_base = 1.0f - 18.0f / 20.0f;
+    float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
-        float base;
-        if (!fixed_tail) {
-            base = 1.0f - (float)index / (float)evaluations;
-        } else if (index <= evaluations - 2) {
-            float fraction = (float)index / (float)(evaluations - 2);
-            base = 1.0f + (tail_base - 1.0f) * fraction;
-            if (index == evaluations - 2) base = tail_base;
-        } else if (index == evaluations - 1) {
-            base = 1.0f - 19.0f / 20.0f;
-        } else {
-            base = 0.0f;
-        }
+        float base = 1.0f - (float)index / denominator;
         schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
             (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
         schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /

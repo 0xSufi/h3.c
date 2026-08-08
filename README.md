@@ -75,20 +75,20 @@ For a very short iteration, request four denoising passes directly:
   -o outputs/fox-four-step.mp4
 ```
 
-`--steps N` always means exactly N denoising passes. Below 20, the experimental
-schedule keeps the final three positions of the 20-pass schedule and spaces
-the earlier positions evenly. For six passes, the video noise levels after the
-implicit `1.0` start are approximately `0.976, 0.936, 0.852, 0.571, 0.387, 0`.
-Keep `--reuse 1` at such small budgets so every requested pass runs the model.
-`--show` displays one preview after each pass.
+`--steps N` always means exactly N denoising passes. Four through seven passes
+use the same schedule that won the low-budget comparison; increasing from 4
+to 7 progressively improves detail and motion. Keep `--reuse 1` at such small
+budgets so every requested pass runs the model. `--show` displays one preview
+after each pass.
 
-This fixed-tail schedule remains experimental. It produced clean output at
-4--7 passes, but changed framing and motion in the automated fox comparison:
-its reference SSIM values were `0.494, 0.516, 0.564, 0.588`, versus
-`0.556, 0.576, 0.604, 0.673` for uniform spacing. On an independent surfer
-prompt, the four-pass score changed from `0.547` to `0.551`, while also moving
-to a more distant overhead composition. Evaluate the depicted subject and
-motion rather than treating SSIM alone as a quality verdict.
+Several tail-heavy schedules were evaluated because most visible cleanup
+happens late in a long run. They preserved too few early composition updates
+and produced woven texture, weak motion, or clipped colors. The retained mode
+uses the released linear base grid with one terminal point. On the 512-square,
+22-frame fox test, the selected four-pass result had 0.556 full-video SSIM
+against a 29-pass reference; an independent surfer test measured 0.547. The
+four-pass denoise took about 3.5 seconds on M5 Max, versus 26.4 seconds for the
+reference.
 
 ### 3. Move toward reference quality
 
@@ -345,21 +345,17 @@ environment variables retained for exact A/B diagnosis.
 
 The default sampler uses the released shifted video/audio schedule. `--steps`
 always names the number of denoising passes, with terminal zero added after the
-last pass. At 20 or more passes its base positions are uniform. Below 20, it
-retains the last three positions of the 20-pass grid and distributes all
-earlier positions uniformly over the preceding base interval. Whole-denoiser
-reuse evaluates the first and last pass plus every requested interval, then
-extrapolates skipped video and audio velocities on their independent
-schedules. With very small step counts, keep `--reuse 1`.
+last pass. Whole-denoiser reuse evaluates the first and last pass plus every
+requested interval, then extrapolates skipped video and audio velocities on
+their independent schedules. With very small step counts, keep `--reuse 1`.
 
-Earlier low-budget experiments found that the released linear base grid beat
+For the low-budget path, the released linear base grid won against
 actual-video-sigma linear spacing,
 quadratic and cubic warps, exact 30-point tail subsets, mild power warps,
 zero-order held full-grid velocities, linear velocity extrapolation, and RES.
 The more tail-heavy candidates often sharpened the subject but damaged motion
 or left a repetitive woven background; sparse RES and long extrapolation
-intervals failed much more visibly. The current fixed-three-position tail is a
-separate manual-evaluation experiment retained at the user's request.
+intervals failed much more visibly.
 
 Layer thinning ranks the checkpoint's actual AdaLN gates while protecting
 structurally important first and final blocks. Unused weights and schedule
