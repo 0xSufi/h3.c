@@ -51,6 +51,7 @@ static void usage(const char *program) {
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
         "      --show             Display a frame after every denoising step (M5)\n"
+        "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
@@ -241,7 +242,8 @@ int main(int argc, char **argv) {
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
-           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_PROFILE, OPT_INFO };
+           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
+           OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -288,6 +290,7 @@ int main(int argc, char **argv) {
         {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
+        {"zoom", required_argument, NULL, OPT_ZOOM},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
         {"help", no_argument, NULL, 'h'},
@@ -428,6 +431,12 @@ int main(int argc, char **argv) {
             }
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;
+            case OPT_ZOOM:
+                if (!h3_terminal_set_zoom(parse_int(optarg, "zoom"))) {
+                    fprintf(stderr, "h3: --zoom must be at least 1\n");
+                    return 2;
+                }
+                break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;
             default: usage(argv[0]); return 2;

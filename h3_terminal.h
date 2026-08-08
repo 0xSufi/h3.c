@@ -13,6 +13,11 @@ typedef enum {
 h3_terminal_protocol h3_terminal_detect(void);
 const char *h3_terminal_protocol_name(h3_terminal_protocol protocol);
 
+/* Terminal display dimensions default to 2x for macOS Retina displays. */
+int h3_terminal_set_zoom(int zoom);
+int h3_terminal_display_dimensions(int width, int height,
+                                   int *display_width, int *display_height);
+
 int h3_terminal_display_rgb24(h3_terminal_protocol protocol,
                               const uint8_t *rgb, int width, int height,
                               int stride, char *error, size_t error_size);

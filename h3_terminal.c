@@ -14,6 +14,10 @@
 
 extern char **environ;
 
+/* Match Iris: macOS graphical terminals otherwise display generated pixels at
+ * roughly half their intended logical size on Retina screens. */
+static int terminal_zoom = 2;
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -39,6 +43,22 @@ const char *h3_terminal_protocol_name(h3_terminal_protocol protocol) {
         case H3_TERM_ITERM2: return "iTerm2 inline images";
         default: return "none";
     }
+}
+
+int h3_terminal_set_zoom(int zoom) {
+    if (zoom < 1) return 0;
+    terminal_zoom = zoom;
+    return 1;
+}
+
+int h3_terminal_display_dimensions(int width, int height,
+                                   int *display_width, int *display_height) {
+    if (!display_width || !display_height || width < 1 || height < 1 ||
+        width > INT_MAX / terminal_zoom || height > INT_MAX / terminal_zoom)
+        return 0;
+    *display_width = width * terminal_zoom;
+    *display_height = height * terminal_zoom;
+    return 1;
 }
 
 static const char base64_table[] =
@@ -101,6 +121,12 @@ static int packed_rgb(const uint8_t *rgb, int width, int height, int stride,
 static int kitty_display(const uint8_t *pixels, size_t size,
                          int width, int height,
                          char *error, size_t error_size) {
+    int display_width = 0, display_height = 0;
+    if (!h3_terminal_display_dimensions(width, height,
+                                        &display_width, &display_height)) {
+        fail(error, error_size, "invalid Kitty display dimensions");
+        return 0;
+    }
     size_t encoded_length = 0;
     char *encoded = base64_encode(pixels, size, &encoded_length);
     if (!encoded) {
@@ -115,8 +141,9 @@ static int kitty_display(const uint8_t *pixels, size_t size,
         if (chunk > chunk_size) chunk = chunk_size;
         int more = offset + chunk < encoded_length;
         if (first) {
-            fprintf(stdout, "\033_Ga=T,f=24,t=d,s=%d,v=%d,m=%d;",
-                    width, height, more);
+            fprintf(stdout,
+                    "\033_Ga=T,f=24,t=d,s=%d,v=%d,w=%d,h=%d,m=%d;",
+                    width, height, display_width, display_height, more);
             first = 0;
         } else {
             fprintf(stdout, "\033_Gm=%d;", more);
@@ -228,6 +255,12 @@ failure:
 static int iterm2_display(const uint8_t *pixels, size_t size,
                           int width, int height,
                           char *error, size_t error_size) {
+    int display_width = 0, display_height = 0;
+    if (!h3_terminal_display_dimensions(width, height,
+                                        &display_width, &display_height)) {
+        fail(error, error_size, "invalid iTerm2 display dimensions");
+        return 0;
+    }
     char path[] = "/tmp/h3-terminal-XXXXXX.png";
     if (!encode_png(pixels, size, width, height, path, error, error_size))
         return 0;
@@ -243,7 +276,7 @@ static int iterm2_display(const uint8_t *pixels, size_t size,
         return 0;
     }
     fprintf(stdout, "\033]1337;File=inline=1;width=%dpx;height=%dpx:",
-            width, height);
+            display_width, display_height);
     int ok = fwrite(encoded, 1, encoded_length, stdout) == encoded_length;
     fputs("\a\n", stdout);
     fflush(stdout);

@@ -54,8 +54,10 @@ This is deliberately not the most aggressive configuration:
 - `--show` is optional. It supports Kitty/Ghostty and
   iTerm2/WezTerm/Konsole graphical protocols. It loads a resident preview VAE,
   displays one representative middle-video frame after every Euler transition,
-  and then displays all final frames. This adds preview decode time and roughly
-  10 GiB of temporary model residency; runs without `--show` are unchanged.
+  and then displays all final frames. Display dimensions default to 2x so the
+  image has its intended logical size on macOS Retina screens; use `--zoom 1`
+  on a non-HiDPI display. This adds preview decode time and roughly 10 GiB of
+  temporary model residency; runs without `--show` are unchanged.
 - `--profile` is optional and does not select a different generation path.
 
 The first process invocation also pays model loading and filesystem-cache
@@ -249,7 +251,9 @@ prompt, seed, resolution, frame count, and step count.
 ### 7. Preview frames and diagnose performance
 
 - `--show` displays a representative frame after every denoising transition,
-  followed by all frames from the completed video.
+  followed by all frames from the completed video. Like Iris, it advertises 2x
+  display dimensions by default for Retina terminals; `--zoom N` changes that
+  factor without resizing the generated video or the encoded terminal image.
 - `--frames-dir DIR` writes final callback frames as PPM files. Intermediate
   `--show` previews are not written there.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is

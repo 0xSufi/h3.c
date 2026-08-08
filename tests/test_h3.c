@@ -2,6 +2,7 @@
 #include "h3_dit.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
+#include "h3_terminal.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -378,6 +379,19 @@ static void test_metal_probe(void) {
     CHECK(info.apple_gpu_family > 0);
 }
 
+static void test_terminal_zoom(void) {
+    int width = 0, height = 0;
+    CHECK(h3_terminal_set_zoom(2));
+    CHECK(h3_terminal_display_dimensions(512, 288, &width, &height));
+    CHECK(width == 1024 && height == 576);
+    CHECK(h3_terminal_set_zoom(1));
+    CHECK(h3_terminal_display_dimensions(512, 288, &width, &height));
+    CHECK(width == 512 && height == 288);
+    CHECK(!h3_terminal_set_zoom(0));
+    CHECK(h3_terminal_set_zoom(2));
+    CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -390,6 +404,7 @@ int main(void) {
     test_rgb_resize();
     test_dit_row_conversions();
     test_metal_probe();
+    test_terminal_zoom();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }
