@@ -1,6 +1,10 @@
+# Local models, references, experiments, and generated media.
 misc/
 MiniMax-H3/
 outputs/
+.ruff_cache/
+
+# Compiler and test outputs.
 *.o
 *.d
 *.air
