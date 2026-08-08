@@ -60,8 +60,6 @@ typedef struct {
     int height;
     int frames;
     int steps;
-    /* Treat steps as a validated 4..7 model-forward budget. */
-    int fast_scheduler;
     uint64_t seed;
     const char *output_path;
     const char *first_frame;
@@ -116,7 +114,7 @@ typedef struct {
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    0, UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
+    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 

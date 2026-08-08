@@ -87,10 +87,10 @@ static void test_schedule(void) {
     CHECK(h3_time_shift_slope(0.5, 12.0, 3.0) > 0.0);
 
     CHECK(h3_serving_schedule_build(50, &schedule));
-    CHECK(schedule.steps == 49);
+    CHECK(schedule.steps == 50);
     CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
-    CHECK(schedule.video[49] == 0.0f && schedule.audio[49] == 0.0f);
-    float base = 24.0f / 49.0f;
+    CHECK(schedule.video[50] == 0.0f && schedule.audio[50] == 0.0f);
+    float base = 0.5f;
     CHECK(close_enough(schedule.video[25],
         12.0f * base / (1.0f + 11.0f * base), 1e-7));
     CHECK(close_enough(schedule.audio[25],
@@ -100,7 +100,7 @@ static void test_schedule(void) {
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
 
-    CHECK(h3_fast_schedule_build(4, &schedule));
+    CHECK(h3_serving_schedule_build(4, &schedule));
     CHECK(schedule.steps == 4);
     CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
     CHECK(close_enough(schedule.video[1], 36.0 / 37.0, 1e-7));
@@ -110,29 +110,29 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
-    CHECK(!h3_fast_schedule_build(3, &schedule));
-    CHECK(!h3_fast_schedule_build(8, &schedule));
+    CHECK(!h3_serving_schedule_build(1, &schedule));
+    CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
 }
 
 static void test_dit_reuse_schedule(void) {
-    uint8_t selected[49];
-    const int aggressive[] = {0, 3, 6, 10, 14, 18};
-    CHECK(h3_dit_reuse_schedule(19, 3, selected, sizeof(selected)) == 6);
-    for (int step = 0; step < 19; step++) {
+    uint8_t selected[50];
+    const int aggressive[] = {0, 3, 6, 9, 12, 15, 18, 19};
+    CHECK(h3_dit_reuse_schedule(20, 3, selected, sizeof(selected)) == 8);
+    for (int step = 0; step < 20; step++) {
         int expected = 0;
         for (size_t index = 0;
              index < sizeof(aggressive) / sizeof(*aggressive); index++)
             expected |= step == aggressive[index];
         CHECK(selected[step] == expected);
     }
-    CHECK(h3_dit_reuse_schedule(19, 2, selected, sizeof(selected)) == 10);
-    for (int step = 0; step < 19; step++)
-        CHECK(selected[step] == (step % 2 == 0));
-    CHECK(h3_dit_reuse_schedule(49, 3, selected, sizeof(selected)) == 17);
-    for (int step = 0; step < 49; step++)
-        CHECK(selected[step] == (step % 3 == 0 || step == 48));
-    CHECK(h3_dit_reuse_schedule(19, 1, selected, sizeof(selected)) == 19);
-    CHECK(h3_dit_reuse_schedule(19, 3, selected, 18) == -1);
+    CHECK(h3_dit_reuse_schedule(20, 2, selected, sizeof(selected)) == 11);
+    for (int step = 0; step < 20; step++)
+        CHECK(selected[step] == (step % 2 == 0 || step == 19));
+    CHECK(h3_dit_reuse_schedule(50, 3, selected, sizeof(selected)) == 18);
+    for (int step = 0; step < 50; step++)
+        CHECK(selected[step] == (step % 3 == 0 || step == 49));
+    CHECK(h3_dit_reuse_schedule(20, 1, selected, sizeof(selected)) == 20);
+    CHECK(h3_dit_reuse_schedule(20, 3, selected, 19) == -1);
 }
 
 static void check_segments(const h3_layout *layout,

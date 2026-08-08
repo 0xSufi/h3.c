@@ -2192,17 +2192,6 @@ int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
         selected_count < (size_t)steps) return -1;
     memset(selected, 0, (size_t)steps);
 
-    /* The serving 20-point grid has 19 Euler forwards. A uniform interval of
-     * three evaluates seven of them. This six-forward placement was selected
-     * after full-frame sweeps and validated on unrelated surfer/fox prompts. */
-    if (reuse_interval == 3 && steps == 19) {
-        static const uint8_t aggressive[] = {0, 3, 6, 10, 14, 18};
-        for (size_t index = 0;
-             index < sizeof(aggressive) / sizeof(*aggressive); index++)
-            selected[aggressive[index]] = 1;
-        return (int)(sizeof(aggressive) / sizeof(*aggressive));
-    }
-
     int count = 0;
     for (int step = 0; step < steps; step++) {
         if (reuse_interval == 1 || step == 0 || step == steps - 1 ||

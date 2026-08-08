@@ -147,28 +147,21 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
-int h3_serving_schedule_build(int points, h3_sigma_schedule *schedule) {
-    if (!schedule || points < 2 || points > H3_MAX_STEPS) return 0;
+int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
-    schedule->steps = points - 1;
-    float denominator = (float)(points - 1);
-    for (int index = 0; index < points; index++) {
+    schedule->steps = evaluations;
+    float denominator = (float)evaluations;
+    for (int index = 0; index <= evaluations; index++) {
         float base = 1.0f - (float)index / denominator;
         schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
             (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
         schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
             (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
     }
-    schedule->video[points - 1] = 0.0f;
-    schedule->audio[points - 1] = 0.0f;
+    schedule->video[evaluations] = 0.0f;
+    schedule->audio[evaluations] = 0.0f;
     return 1;
-}
-
-int h3_fast_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (evaluations < 4 || evaluations > 7) return 0;
-    /* At tiny budgets, the released linear base grid beat every tested tail
-     * warp. Add the terminal zero so --steps names actual model forwards. */
-    return h3_serving_schedule_build(evaluations + 1, schedule);
 }
 
 typedef struct {
