@@ -26,6 +26,29 @@ mkdir -p outputs
 mapping all weights or generating media. Run `./h3 --help` for the complete CLI
 reference.
 
+Without `-p`, the same binary starts an Iris-style interactive session:
+
+```sh
+./h3 -d ./MiniMax-H3 --width 512 --height 512 --steps 6
+```
+
+Type a prompt to generate a numbered video. The session keeps the exact BF16
+prompt conditioning, prepared DiT, and video decoder in memory, so repeating a
+prompt with another seed avoids loading and encoding them again. Useful commands
+are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, and
+`!cache`. Use `!help` for the full, short list.
+
+First/last-frame conditioning is persistent in the session:
+
+```text
+h3> !first opening.png
+h3> !last ending.png
+h3> The camera moves slowly around the subject.
+```
+
+Use `!first clear` or `!last clear` to remove an anchor. Generated videos are
+written to the session directory printed at startup.
+
 ### 2. Make a first fast video
 
 Start with the validated balanced preset. It generates 22 frames at 24 fps
