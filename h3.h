@@ -20,6 +20,13 @@ extern "C" {
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
 
+typedef struct {
+    size_t embedding_entries;
+    size_t embedding_bytes;
+    int prepared_dit;
+    int video_decoder;
+} h3_cache_info;
+
 typedef enum {
     H3_REFERENCE_IMAGE = 1,
     H3_REFERENCE_VIDEO = 2,
@@ -160,6 +167,12 @@ void h3_free(h3_ctx *ctx);
 const char *h3_last_error(const h3_ctx *ctx);
 const h3_device_info *h3_device(const h3_ctx *ctx);
 const h3_model_info *h3_model(const h3_ctx *ctx);
+
+/* Interactive-session reuse. Disabled by default so one-shot callers retain
+ * the original phase-by-phase memory lifetime. */
+void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
+void h3_cache_clear(h3_ctx *ctx);
+void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,

@@ -1,4 +1,5 @@
 #include "h3.h"
+#include "h3_cli.h"
 #include "h3_host.h"
 #include "h3_terminal.h"
 
@@ -13,8 +14,9 @@
 
 static void usage(const char *program) {
     fprintf(stderr,
-        "Usage: %s -d MODEL_DIR [--info]\n"
-        "       %s -d MODEL_DIR -p PROMPT [-o OUTPUT] [options]\n\n"
+        "Usage: %s -d MODEL_DIR [options]              # interactive\n"
+        "       %s -d MODEL_DIR -p PROMPT [-o OUTPUT] [options]\n"
+        "       %s -d MODEL_DIR --info\n\n"
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
@@ -55,7 +57,7 @@ static void usage(const char *program) {
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
-        program, program);
+        program, program, program);
 }
 
 static int parse_int(const char *value, const char *label) {
@@ -308,6 +310,7 @@ int main(int argc, char **argv) {
     int info = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
@@ -372,7 +375,10 @@ int main(int argc, char **argv) {
             case OPT_USE_SLOWER_GROUPED_QUANTIZER:
                 params.use_slower_grouped_quantizer = 1;
                 break;
-            case OPT_SEED: params.seed = parse_u64(optarg, "seed"); break;
+            case OPT_SEED:
+                params.seed = parse_u64(optarg, "seed");
+                seed_given = 1;
+                break;
             case OPT_FIRST: params.first_frame = optarg; break;
             case OPT_LAST: params.last_frame = optarg; break;
             case OPT_REF_IMAGE: {
@@ -442,7 +448,7 @@ int main(int argc, char **argv) {
             default: usage(argv[0]); return 2;
         }
     }
-    if (!model_dir || (!info && !prompt)) {
+    if (!model_dir) {
         usage(argv[0]);
         return 2;
     }
@@ -499,6 +505,10 @@ int main(int argc, char **argv) {
         if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
+    } else if (!info) {
+        int cli_status = h3_cli_run(ctx, model_dir, &params, show, seed_given);
+        h3_free(ctx);
+        return cli_status;
     }
     h3_free(ctx);
     return 0;

@@ -2088,6 +2088,40 @@ size_t h3_dit_audio_elements(const h3_dit *dit) {
         (size_t)dit->audio_t : 0;
 }
 
+int h3_dit_reset_run(h3_dit *dit,
+                     const float *condition_video_rows,
+                     size_t condition_video_elements,
+                     const float *condition_audio_rows,
+                     size_t condition_audio_elements,
+                     char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!dit) {
+        fail(error, error_size, "prepared DiT is absent");
+        return 0;
+    }
+    size_t wanted_video =
+        (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio =
+        (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video ||
+        condition_audio_elements != wanted_audio ||
+        (wanted_video && !condition_video_rows) ||
+        (wanted_audio && !condition_audio_rows)) {
+        fail(error, error_size, "prepared DiT condition rows do not match");
+        return 0;
+    }
+    if ((wanted_video && !h3_gpu_tensor_write_f32_range(
+             dit->video_input, 0, condition_video_rows, wanted_video)) ||
+        (wanted_audio && !h3_gpu_tensor_write_f32_range(
+             dit->audio_input, 0, condition_audio_rows, wanted_audio))) {
+        fail(error, error_size, "cannot refresh prepared DiT conditions");
+        return 0;
+    }
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+    return 1;
+}
+
 int h3_dit_forward(h3_dit *dit, int step,
                    const float *video_latent, const float *audio_latent,
                    float *video_velocity, float *audio_velocity,

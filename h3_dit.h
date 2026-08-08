@@ -71,6 +71,15 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
 
+/* Reset mutable sampler state and replace seed-dependent condition rows before
+ * reusing an otherwise identical prepared transformer. */
+int h3_dit_reset_run(h3_dit *dit,
+                     const float *condition_video_rows,
+                     size_t condition_video_elements,
+                     const float *condition_audio_rows,
+                     size_t condition_audio_elements,
+                     char *error, size_t error_size);
+
 size_t h3_dit_video_elements(const h3_dit *dit);
 size_t h3_dit_audio_elements(const h3_dit *dit);
 

@@ -22,6 +22,338 @@
 
 static char h3_global_error[512];
 
+typedef struct {
+    char *text;
+    size_t length;
+    size_t capacity;
+} h3_key;
+
+static void h3_conditioning_cache_clear(h3_ctx *ctx) {
+    if (!ctx) return;
+    free(ctx->conditioning_key);
+    free(ctx->conditioning_values);
+    free(ctx->conditioning_tags);
+    free(ctx->conditioning_video_rows);
+    free(ctx->conditioning_audio_rows);
+    free(ctx->conditioning_references);
+    ctx->conditioning_key = NULL;
+    ctx->conditioning_values = NULL;
+    ctx->conditioning_tags = NULL;
+    ctx->conditioning_video_rows = NULL;
+    ctx->conditioning_audio_rows = NULL;
+    ctx->conditioning_references = NULL;
+    ctx->conditioning_tokens = 0;
+    ctx->conditioning_width = 0;
+    ctx->conditioning_video_elements = 0;
+    ctx->conditioning_audio_elements = 0;
+    ctx->conditioning_reference_count = 0;
+    ctx->conditioning_present = 0;
+}
+
+void h3_cache_clear(h3_ctx *ctx) {
+    if (!ctx) return;
+    h3_conditioning_cache_clear(ctx);
+    h3_dit_free(ctx->dit);
+    ctx->dit = NULL;
+    free(ctx->dit_key);
+    ctx->dit_key = NULL;
+    h3_video_vae_decoder_free(ctx->video_decoder);
+    ctx->video_decoder = NULL;
+    free(ctx->video_decoder_key);
+    ctx->video_decoder_key = NULL;
+}
+
+void h3_cache_set_enabled(h3_ctx *ctx, int enabled) {
+    if (!ctx) return;
+    if (!enabled) h3_cache_clear(ctx);
+    ctx->cache_enabled = enabled != 0;
+}
+
+void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info) {
+    if (!info) return;
+    memset(info, 0, sizeof(*info));
+    if (!ctx) return;
+    if (ctx->conditioning_key) {
+        info->embedding_entries = 1;
+        info->embedding_bytes =
+            ctx->conditioning_tokens * ctx->conditioning_width *
+                sizeof(*ctx->conditioning_values) +
+            ctx->conditioning_tokens * sizeof(*ctx->conditioning_tags) +
+            ctx->conditioning_video_elements *
+                sizeof(*ctx->conditioning_video_rows) +
+            ctx->conditioning_audio_elements *
+                sizeof(*ctx->conditioning_audio_rows);
+    }
+    info->prepared_dit = ctx->dit != NULL;
+    info->video_decoder = ctx->video_decoder != NULL;
+}
+
+static int h3_key_append(h3_key *key, const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    va_list copy;
+    va_copy(copy, arguments);
+    int needed = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    if (needed < 0) {
+        va_end(arguments);
+        return 0;
+    }
+    size_t wanted = key->length + (size_t)needed + 1;
+    if (wanted > key->capacity) {
+        size_t capacity = key->capacity ? key->capacity : 256;
+        while (capacity < wanted) {
+            if (capacity > SIZE_MAX / 2) {
+                va_end(arguments);
+                return 0;
+            }
+            capacity *= 2;
+        }
+        char *grown = realloc(key->text, capacity);
+        if (!grown) {
+            va_end(arguments);
+            return 0;
+        }
+        key->text = grown;
+        key->capacity = capacity;
+    }
+    vsnprintf(key->text + key->length, key->capacity - key->length,
+              format, arguments);
+    va_end(arguments);
+    key->length += (size_t)needed;
+    return 1;
+}
+
+static int h3_key_file(h3_key *key, const char *role, const char *path) {
+    if (!path) return h3_key_append(key, "|%s=none", role);
+    struct stat status;
+    if (stat(path, &status) != 0)
+        return h3_key_append(key, "|%s=%zu:%s:missing", role,
+                             strlen(path), path);
+    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
+                         path, (long long)status.st_size,
+                         (long long)status.st_mtimespec.tv_sec,
+                         status.st_mtimespec.tv_nsec);
+}
+
+static char *h3_conditioning_key(const char *prompt, const h3_params *params,
+                                 int render_width, int render_height,
+                                 int ref2va) {
+    h3_key key = {0};
+    if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
+                       strlen(prompt), prompt)) goto failed;
+    if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
+    if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
+                       render_width, render_height, params->frames,
+                       params->reference_image_size) ||
+        !h3_key_file(&key, "first", params->first_frame) ||
+        !h3_key_file(&key, "last", params->last_frame)) goto failed;
+    for (size_t index = 0; index < params->reference_count; index++) {
+        const h3_reference *reference = &params->references[index];
+        if (!h3_key_append(&key, "|ref=%d:%d", reference->kind,
+                           reference->include_embedded_audio) ||
+            !h3_key_file(&key, "media", reference->path) ||
+            !h3_key_file(&key, "audio", reference->audio_path)) goto failed;
+    }
+    return key.text;
+failed:
+    free(key.text);
+    return NULL;
+}
+
+static char *h3_prepared_key(const char *conditioning,
+                             const h3_params *params,
+                             int render_width, int render_height) {
+    h3_key key = {0};
+    if (!h3_key_append(
+            &key,
+            "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
+            "|slow=%d%d%d%d%d%d%d%d%d%d",
+            conditioning, render_width, render_height, params->frames,
+            params->steps, params->dit_layers, params->core_reuse,
+            params->token_reduction, params->use_slower_bf16_mlp,
+            params->use_slower_bf16_qkv,
+            params->use_slower_bf16_attention_output,
+            params->use_slower_row_major_attention_output,
+            params->use_slower_unfused_int8_inputs,
+            params->use_slower_unfused_qkv_rope,
+            params->use_slower_scalar_qkv_rms,
+            params->use_slower_uncached_int8_scales,
+            params->use_slower_dynamic_fc1_k,
+            params->use_slower_grouped_quantizer)) {
+        free(key.text);
+        return NULL;
+    }
+    return key.text;
+}
+
+static int h3_text_embedding_copy(h3_text_embedding *destination,
+                                  const h3_text_embedding *source) {
+    memset(destination, 0, sizeof(*destination));
+    if (!source || !source->tokens || !source->width || !source->values ||
+        source->tokens > SIZE_MAX / source->width) return 0;
+    size_t elements = source->tokens * source->width;
+    if (elements > SIZE_MAX / sizeof(*destination->values)) return 0;
+    destination->values = malloc(elements * sizeof(*destination->values));
+    if (source->tags)
+        destination->tags = malloc(source->tokens * sizeof(*destination->tags));
+    if (!destination->values || (source->tags && !destination->tags)) {
+        h3_text_embedding_free(destination);
+        return 0;
+    }
+    memcpy(destination->values, source->values,
+           elements * sizeof(*destination->values));
+    if (source->tags)
+        memcpy(destination->tags, source->tags,
+               source->tokens * sizeof(*destination->tags));
+    destination->tokens = source->tokens;
+    destination->width = source->width;
+    destination->gpu_stats = source->gpu_stats;
+    return 1;
+}
+
+static int h3_conditioning_cache_store(
+        h3_ctx *ctx, const char *key, const h3_text_embedding *text,
+        const float *video, size_t video_elements,
+        const float *audio, size_t audio_elements,
+        const h3_layout_ref *references, size_t reference_count,
+        int conditioned) {
+    h3_text_embedding copy;
+    if (!h3_text_embedding_copy(&copy, text)) return 0;
+    float *video_copy = NULL;
+    float *audio_copy = NULL;
+    h3_layout_ref *reference_copy = NULL;
+    char *key_copy = strdup(key);
+    if (video_elements) {
+        video_copy = malloc(video_elements * sizeof(*video_copy));
+        if (video_copy) memcpy(video_copy, video,
+                               video_elements * sizeof(*video_copy));
+    }
+    if (audio_elements) {
+        audio_copy = malloc(audio_elements * sizeof(*audio_copy));
+        if (audio_copy) memcpy(audio_copy, audio,
+                               audio_elements * sizeof(*audio_copy));
+    }
+    if (reference_count) {
+        reference_copy = malloc(reference_count * sizeof(*reference_copy));
+        if (reference_copy) memcpy(reference_copy, references,
+                                   reference_count * sizeof(*reference_copy));
+    }
+    if (!key_copy || (video_elements && !video_copy) ||
+        (audio_elements && !audio_copy) ||
+        (reference_count && !reference_copy)) {
+        free(key_copy); free(video_copy); free(audio_copy); free(reference_copy);
+        h3_text_embedding_free(&copy);
+        return 0;
+    }
+    h3_conditioning_cache_clear(ctx);
+    ctx->conditioning_key = key_copy;
+    ctx->conditioning_tokens = copy.tokens;
+    ctx->conditioning_width = copy.width;
+    ctx->conditioning_values = copy.values;
+    ctx->conditioning_tags = copy.tags;
+    ctx->conditioning_video_rows = video_copy;
+    ctx->conditioning_video_elements = video_elements;
+    ctx->conditioning_audio_rows = audio_copy;
+    ctx->conditioning_audio_elements = audio_elements;
+    ctx->conditioning_references = reference_copy;
+    ctx->conditioning_reference_count = reference_count;
+    ctx->conditioning_present = conditioned;
+    return 1;
+}
+
+static int h3_conditioning_cache_load(
+        const h3_ctx *ctx, h3_text_embedding *text,
+        float **video, size_t *video_elements,
+        float **audio, size_t *audio_elements,
+        h3_layout_ref **references, size_t *reference_count,
+        int *conditioned) {
+    h3_text_embedding source = {
+        ctx->conditioning_tokens, ctx->conditioning_width,
+        ctx->conditioning_values, {0}, ctx->conditioning_tags};
+    if (!h3_text_embedding_copy(text, &source)) return 0;
+    *video = NULL;
+    *audio = NULL;
+    *references = NULL;
+    *video_elements = ctx->conditioning_video_elements;
+    *audio_elements = ctx->conditioning_audio_elements;
+    *reference_count = ctx->conditioning_reference_count;
+    *conditioned = ctx->conditioning_present;
+    if (*video_elements) {
+        *video = malloc(*video_elements * sizeof(**video));
+        if (*video) memcpy(*video, ctx->conditioning_video_rows,
+                           *video_elements * sizeof(**video));
+    }
+    if (*audio_elements) {
+        *audio = malloc(*audio_elements * sizeof(**audio));
+        if (*audio) memcpy(*audio, ctx->conditioning_audio_rows,
+                           *audio_elements * sizeof(**audio));
+    }
+    if (*reference_count) {
+        *references = malloc(*reference_count * sizeof(**references));
+        if (*references) memcpy(*references, ctx->conditioning_references,
+                                *reference_count * sizeof(**references));
+    }
+    if ((*video_elements && !*video) || (*audio_elements && !*audio) ||
+        (*reference_count && !*references)) {
+        h3_text_embedding_free(text);
+        free(*video); free(*audio); free(*references);
+        *video = NULL; *audio = NULL; *references = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static void h3_augment_span(float *values, size_t count, uint64_t seed) {
+    h3_rng rng;
+    h3_rng_seed(&rng, seed);
+    for (size_t index = 0; index < count; index++)
+        values[index] = 0.999f * values[index] +
+                        0.001f * h3_rng_normal(&rng);
+}
+
+static int h3_augment_conditions(const h3_params *params, int ref2va,
+                                 int render_width, int render_height,
+                                 const h3_layout_ref *references,
+                                 float *video, size_t video_elements,
+                                 float *audio, size_t audio_elements) {
+    size_t video_offset = 0;
+    size_t audio_offset = 0;
+    if (!ref2va) {
+        int latent_w, latent_h;
+        h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
+        size_t span = (size_t)h3_video_encoder_latent_t(1) *
+                      (size_t)latent_h * (size_t)latent_w / 4 * 96;
+        size_t count = (size_t)(params->first_frame != NULL) +
+                       (size_t)(params->last_frame != NULL);
+        if (count && (span > SIZE_MAX / count || span * count != video_elements))
+            return 0;
+        for (size_t index = 0; index < count; index++) {
+            h3_augment_span(video + video_offset, span, params->seed);
+            video_offset += span;
+        }
+        return video_offset == video_elements && audio_elements == 0;
+    }
+    for (size_t index = 0; index < params->reference_count; index++) {
+        const h3_layout_ref *reference = &references[index];
+        if (reference->kind != H3_LAYOUT_REF_AUDIO) {
+            size_t span = (size_t)reference->latent_t *
+                (size_t)reference->latent_h * (size_t)reference->latent_w /
+                4 * 96;
+            if (span > video_elements - video_offset) return 0;
+            h3_augment_span(video + video_offset, span, params->seed);
+            video_offset += span;
+        }
+        if (reference->audio_t) {
+            size_t span = (size_t)reference->audio_t * 2 * 32;
+            if (span > audio_elements - audio_offset) return 0;
+            h3_augment_span(audio + audio_offset, span, params->seed + 1);
+            audio_offset += span;
+        }
+    }
+    return video_offset == video_elements && audio_offset == audio_elements;
+}
+
 void h3_set_error(h3_ctx *ctx, const char *format, ...) {
     char *destination = ctx ? ctx->error : h3_global_error;
     va_list arguments;
@@ -125,6 +457,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
 
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
+    h3_cache_clear(ctx);
     free(ctx->model_dir);
     free(ctx);
 }
@@ -321,6 +654,39 @@ static void h3_video_encoder_progress_bridge(int completed, int total,
     h3_progress_emit(opaque, "video VAE encoder", completed, total);
 }
 
+static h3_video_vae_decoder *h3_acquire_video_decoder(
+        h3_ctx *ctx, const char *key, const char *weight_directory,
+        int latent_height, int latent_width, h3_video_vae_progress progress,
+        void *progress_opaque, int *cached, char *error, size_t error_size) {
+    *cached = 0;
+    if (ctx->cache_enabled && ctx->video_decoder &&
+        ctx->video_decoder_key && !strcmp(ctx->video_decoder_key, key)) {
+        *cached = 1;
+        fprintf(stderr, "h3: video VAE cache hit\n");
+        return ctx->video_decoder;
+    }
+    if (ctx->cache_enabled) {
+        h3_video_vae_decoder_free(ctx->video_decoder);
+        ctx->video_decoder = NULL;
+        free(ctx->video_decoder_key);
+        ctx->video_decoder_key = NULL;
+    }
+    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
+        weight_directory, "h3_shaders.metal", latent_height, latent_width,
+        progress, progress_opaque, error, error_size);
+    if (!decoder || !ctx->cache_enabled) return decoder;
+    char *key_copy = strdup(key);
+    if (!key_copy) {
+        fprintf(stderr, "h3: warning: could not retain video VAE cache key\n");
+        return decoder;
+    }
+    ctx->video_decoder = decoder;
+    ctx->video_decoder_key = key_copy;
+    *cached = 1;
+    fprintf(stderr, "h3: video VAE cache miss; decoder retained\n");
+    return decoder;
+}
+
 static void h3_vision_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "Qwen vision", completed, total);
 }
@@ -472,6 +838,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     h3_generation_progress progress = {ctx, params, 0};
+    h3_temporal_shape temporal = h3_temporal(params->frames);
+    int latent_w, latent_h;
+    h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
     h3_tokenizer *tokenizer = NULL;
     uint32_t *ids = NULL;
     size_t token_count = 0;
@@ -511,6 +880,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&waveform, 0, sizeof(waveform));
     uint8_t *rgb8 = NULL;
     h3_result *result = NULL;
+    char *conditioning_key = NULL;
+    char *prepared_key = NULL;
+    char *decoder_key = NULL;
+    int conditioning_hit = 0;
+    int conditioned = 0;
+    int dit_is_cached = 0;
+    int decoder_is_cached = 0;
     char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, ref2va ?
@@ -526,6 +902,59 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
+    conditioning_key = h3_conditioning_key(
+        prompt, params, render_width, render_height, ref2va);
+    if (!conditioning_key) {
+        h3_set_error(ctx, "out of memory constructing conditioning cache key");
+        goto cleanup;
+    }
+    prepared_key = h3_prepared_key(
+        conditioning_key, params, render_width, render_height);
+    if (!prepared_key) {
+        h3_set_error(ctx, "out of memory constructing prepared-model cache key");
+        goto cleanup;
+    }
+    h3_key decoder_cache_key = {0};
+    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d", vae_path,
+                       latent_h, latent_w)) {
+        h3_set_error(ctx, "out of memory constructing decoder cache key");
+        goto cleanup;
+    }
+    decoder_key = decoder_cache_key.text;
+    if (ctx->cache_enabled && ctx->video_decoder &&
+        (!ctx->video_decoder_key || strcmp(ctx->video_decoder_key, decoder_key))) {
+        h3_video_vae_decoder_free(ctx->video_decoder);
+        ctx->video_decoder = NULL;
+        free(ctx->video_decoder_key);
+        ctx->video_decoder_key = NULL;
+    }
+    if (ctx->cache_enabled && ctx->dit &&
+        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
+        h3_dit_free(ctx->dit);
+        ctx->dit = NULL;
+        free(ctx->dit_key);
+        ctx->dit_key = NULL;
+    }
+    conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
+        !strcmp(ctx->conditioning_key, conditioning_key);
+    char detail[512];
+    if (conditioning_hit) {
+        size_t cached_reference_count = 0;
+        if (!h3_conditioning_cache_load(
+                ctx, &text, &condition_video_rows, &condition_video_elements,
+                &condition_audio_rows, &condition_audio_elements,
+                &layout_references, &cached_reference_count, &conditioned) ||
+            cached_reference_count != (ref2va ? params->reference_count : 0)) {
+            h3_set_error(ctx, "cannot restore cached conditioning");
+            goto cleanup;
+        }
+        if (!ref2va) {
+            if (params->first_frame) keyframes[keyframe_count++] = 0;
+            if (params->last_frame)
+                keyframes[keyframe_count++] = temporal.frame_count - 1;
+        }
+        fprintf(stderr, "h3: conditioning cache hit\n");
+    } else {
     if (visual_capacity) {
         condition_pixels = calloc(visual_capacity, sizeof(*condition_pixels));
         condition_widths = calloc(visual_capacity, sizeof(*condition_widths));
@@ -555,7 +984,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    char detail[512];
     h3_progress_emit(&progress, "tokenizer", 0, 1);
     tokenizer = h3_tokenizer_load(tokenizer_path, detail, sizeof(detail));
     if (!tokenizer) {
@@ -564,10 +992,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     h3_progress_emit(&progress, "tokenizer", 1, 1);
     if (progress.cancelled) goto cleanup;
-    h3_temporal_shape temporal = h3_temporal(params->frames);
-    int latent_w, latent_h;
-    h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
-
     if (ref2va) {
         for (size_t index = 0; index < params->reference_count; index++) {
             const h3_reference *reference = &params->references[index];
@@ -758,11 +1182,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                              (size_t)channel;
                         rows[destination] = latent.values[source];
                     }
-            h3_rng condition_rng;
-            h3_rng_seed(&condition_rng, params->seed + 1);
-            for (size_t element = 0; element < elements; element++)
-                rows[element] = 0.999f * rows[element] +
-                                0.001f * h3_rng_normal(&condition_rng);
             condition_audio_elements += elements;
             total_audio_samples += (size_t)samples;
             layout_references[index].audio_t = latent.length;
@@ -876,17 +1295,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 goto cleanup;
             }
             h3_video_latent_free(&latent);
-            h3_rng condition_rng;
-            h3_rng_seed(&condition_rng, params->seed);
-            float *noise = malloc(row_elements * sizeof(*noise));
-            if (!noise) {
-                h3_set_error(ctx, "out of memory augmenting visual condition");
-                goto cleanup;
-            }
-            h3_rng_fill_normal(&condition_rng, noise, row_elements);
-            for (size_t element = 0; element < row_elements; element++)
-                rows[element] = 0.999f * rows[element] + 0.001f * noise[element];
-            free(noise);
             condition_offset += row_elements;
             if (progress.cancelled) goto cleanup;
         }
@@ -985,6 +1393,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    conditioned = visual_count != 0 || condition_audio_elements != 0;
+    if (ctx->cache_enabled) {
+        if (!h3_conditioning_cache_store(
+                ctx, conditioning_key, &text,
+                condition_video_rows, condition_video_elements,
+                condition_audio_rows, condition_audio_elements,
+                layout_references, ref2va ? params->reference_count : 0,
+                conditioned))
+            fprintf(stderr, "h3: warning: could not retain conditioning cache\n");
+        else
+            fprintf(stderr, "h3: conditioning cache miss; stored exact BF16\n");
+    }
+    }
+    if (conditioned && !h3_augment_conditions(
+            params, ref2va, render_width, render_height, layout_references,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements)) {
+        h3_set_error(ctx, "cannot apply seeded condition augmentation");
+        goto cleanup;
+    }
     if (progress.cancelled) goto cleanup;
 
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
@@ -1001,7 +1429,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
-    if (visual_count) {
+    if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
+        !strcmp(ctx->dit_key, prepared_key)) {
+        dit = ctx->dit;
+        dit_is_cached = 1;
+        if (!h3_dit_reset_run(
+                dit, condition_video_rows, condition_video_elements,
+                condition_audio_rows, condition_audio_elements,
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: prepared DiT cache hit\n");
+    } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
@@ -1040,6 +1480,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    if (ctx->cache_enabled && !dit_is_cached) {
+        char *key_copy = strdup(prepared_key);
+        if (!key_copy) {
+            fprintf(stderr, "h3: warning: could not retain prepared DiT key\n");
+        } else {
+            ctx->dit = dit;
+            ctx->dit_key = key_copy;
+            dit_is_cached = 1;
+            fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
+        }
+    }
     h3_text_embedding_free(&text);
     free(condition_video_rows);
     condition_video_rows = NULL;
@@ -1048,10 +1499,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (progress.cancelled) goto cleanup;
     if (params->preview_denoise) {
         h3_progress_emit(&progress, "preview VAE load", 0, 36);
-        preview_decoder = h3_video_vae_decoder_load(
-            vae_path, "h3_shaders.metal", latent_h, latent_w,
+        preview_decoder = h3_acquire_video_decoder(
+            ctx, decoder_key, vae_path, latent_h, latent_w,
             h3_preview_vae_progress_bridge, &progress,
-            detail, sizeof(detail));
+            &decoder_is_cached, detail, sizeof(detail));
+        if (preview_decoder && ctx->video_decoder == preview_decoder)
+            h3_progress_emit(&progress, "preview VAE load", 36, 36);
         if (!preview_decoder) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
@@ -1088,9 +1541,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             preview_decoder ? &live_preview : NULL,
             detail, sizeof(detail))) {
         if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
+        if (dit_is_cached) {
+            ctx->dit = NULL;
+            free(ctx->dit_key);
+            ctx->dit_key = NULL;
+            dit_is_cached = 0;
+        }
         goto cleanup;
     }
-    h3_dit_free(dit);
+    if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
     h3_progress_emit(&progress, "audio VAE", 0, 7);
@@ -1103,6 +1562,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    if (!preview_decoder && ctx->cache_enabled) {
+        h3_progress_emit(&progress, "video VAE load", 0, 36);
+        preview_decoder = h3_acquire_video_decoder(
+            ctx, decoder_key, vae_path, latent_h, latent_w,
+            h3_vae_progress_bridge, &progress,
+            &decoder_is_cached, detail, sizeof(detail));
+        if (preview_decoder && ctx->video_decoder == preview_decoder)
+            h3_progress_emit(&progress, "video VAE load", 36, 36);
+        if (!preview_decoder) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+    }
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
@@ -1179,6 +1651,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    free(conditioning_key);
+    free(prepared_key);
+    free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
     h3_tokenizer_free(tokenizer);
@@ -1204,8 +1679,8 @@ cleanup:
     free(condition_audio_rows);
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
-    h3_dit_free(dit);
-    h3_video_vae_decoder_free(preview_decoder);
+    if (!dit_is_cached) h3_dit_free(dit);
+    if (!decoder_is_cached) h3_video_vae_decoder_free(preview_decoder);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);

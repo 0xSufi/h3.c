@@ -15,12 +15,13 @@ LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
+CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity clean
 
 all: h3 libh3.a
 
-h3: main.o $(LIB_OBJ)
+h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 libh3.a: $(LIB_OBJ)
@@ -195,6 +196,10 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
+# Vendored from Iris. Keep the main project strict without rewriting this small
+# terminal editor for conversion diagnostics unrelated to H3.
+linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
+
 -include $(wildcard *.d tests/*.d)
 
 clean:
@@ -206,5 +211,5 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-		h3_dit_bench h3_dit_bench_864 \
-		libh3.a *.o *.d tests/*.o tests/*.d
+	h3_dit_bench h3_dit_bench_864 \
+	libh3.a *.o *.d tests/*.o tests/*.d
