@@ -334,8 +334,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
-        gpu.reuseMPSCommandDefault =
-            [gpu.device.name rangeOfString:@"M5"].location == NSNotFound;
+        gpu.reuseMPSCommandDefault = YES;
         gpu.inflightCommands = [NSMutableArray array];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
         gpu.gqaCache = [NSMutableDictionary dictionary];
