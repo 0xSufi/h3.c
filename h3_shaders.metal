@@ -2394,6 +2394,62 @@ kernel void h3_linear_int8_nax_r128(
     }
 }
 
+/* One-scale FC2 path. A static full-K product lets NAX own the
+ * complete 14336-wide reduction; scale loads overlap that long operation. */
+kernel void h3_linear_int8_nax_r128_full_k14336(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint TILE = 128;
+    constexpr uint INPUT_DIM = 14336;
+    constexpr uint OUTPUT_DIM = 5376;
+    uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
+    uint row_tiles = padded_rows / TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, OUTPUT_DIM / TILE);
+    uint row_start = group.x * TILE;
+    uint column_start = group.y * TILE;
+    threadgroup float local_input_scales[TILE];
+    threadgroup float local_weight_scales[TILE];
+    if (tid < TILE) {
+        local_input_scales[tid] = input_scales[row_start + tid];
+        local_weight_scales[tid] = weight_scales[column_start + tid];
+    }
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)INPUT_DIM,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)INPUT_DIM,
+                                     (int)OUTPUT_DIM));
+    constexpr auto descriptor = matmul2d_descriptor(
+        TILE, TILE, INPUT_DIM, false, true, true,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
+    auto a = x.slice<TILE, INPUT_DIM>(0, (int)row_start);
+    auto b = w.slice<INPUT_DIM, TILE>(0, (int)column_start);
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(a), decltype(b), int32_t>();
+    mm.run(a, b, accum);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = column_start + (uint)index[0];
+        if (row < args.rows)
+            output[row * OUTPUT_DIM + column] =
+                (bfloat)((float)accum[element] *
+                    local_input_scales[(uint)index[1]] *
+                    local_weight_scales[(uint)index[0]]);
+    }
+}
+
 /* Cache the two 128-value dequantization vectors once per projection tile.
  * The cooperative output fragment otherwise rereads them for every element. */
 template<uint INPUT_DIM, uint OUTPUT_DIM>

@@ -1532,6 +1532,7 @@ int main(int argc, char **argv) {
         .values = text_values
     };
     int ref_layout = getenv("H3_BENCH_REF_LAYOUT") != NULL;
+    int use_int8_row_fc2 = getenv("H3_BENCH_INT8_ROW_FC2") != NULL;
     h3_layout_ref references[] = {
         {H3_LAYOUT_REF_IMAGE, 0, 16, 24, 0},
         {H3_LAYOUT_REF_VIDEO, 3, 16, 24, 20},
@@ -1635,7 +1636,8 @@ int main(int argc, char **argv) {
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
-            use_slower_grouped_quantizer, video_condition,
+            use_slower_grouped_quantizer, use_int8_row_fc2,
+            video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
         free(video_condition);
@@ -1645,7 +1647,8 @@ int main(int argc, char **argv) {
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
-            use_slower_grouped_quantizer, NULL, NULL, error,
+            use_slower_grouped_quantizer, use_int8_row_fc2,
+            NULL, NULL, error,
             sizeof(error));
     }
     if (!dit) die(error);

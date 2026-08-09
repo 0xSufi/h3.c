@@ -163,6 +163,13 @@ These controls are independent unless noted otherwise:
 | Token reduction | off | optional | `--token-reduction` | Pairs horizontal video tokens inside middle blocks; faster but may change composition. |
 | Internal canvas | output size | `384x384` for 512 square output | `320x320` | Runs DiT/VAE smaller, then upscales with vImage. |
 
+On M5, `--use-int8-row-fc2` uses one activation scale per FC2 row and a single
+full-width TensorOps product. It is optional because it is less numerically
+conservative than grouped int8. It reduced complete denoiser forwards by about
+2.6% in reciprocal tests. Matched four-step fox and surfer videos kept the same
+subjects, setting, and motion (full-video SSIM 0.919 and 0.828). In the
+interactive session, use `!int8-row-fc2 on`.
+
 `--reuse` and `--core-reuse` are mutually exclusive. Layer thinning can be
 combined with either one.
 

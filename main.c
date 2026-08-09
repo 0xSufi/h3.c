@@ -32,6 +32,7 @@ static void usage(const char *program) {
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
+        "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
         "      --use-slower-bf16-qkv  Force close-reference BF16 QKV\n"
         "      --use-slower-bf16-attention-output  Force BF16 attention output\n"
@@ -231,6 +232,7 @@ int main(int argc, char **argv) {
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
+           OPT_USE_INT8_ROW_FC2,
            OPT_USE_SLOWER_BF16_MLP,
            OPT_USE_SLOWER_BF16_QKV,
            OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT,
@@ -261,6 +263,7 @@ int main(int argc, char **argv) {
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
+        {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-slower-bf16-mlp", no_argument, NULL,
          OPT_USE_SLOWER_BF16_MLP},
         {"use-slower-bf16-qkv", no_argument, NULL,
@@ -345,6 +348,9 @@ int main(int argc, char **argv) {
                 params.core_reuse = parse_int(optarg, "core reuse");
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
+            case OPT_USE_INT8_ROW_FC2:
+                params.use_int8_row_fc2 = 1;
+                break;
             case OPT_USE_SLOWER_BF16_MLP:
                 params.use_slower_bf16_mlp = 1;
                 break;

@@ -64,6 +64,7 @@ struct h3_dit {
     int use_slower_uncached_int8_scales;
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
+    int use_int8_row_fc2;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -1355,6 +1356,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_uncached_int8_scales,
                         int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
+                        int use_int8_row_fc2,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -1428,6 +1430,7 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_QKV") ||
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
+    dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -1486,6 +1489,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_uncached_int8_scales,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1499,6 +1503,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
+                    use_int8_row_fc2,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1522,6 +1527,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_uncached_int8_scales,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -1539,6 +1545,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
+                    use_int8_row_fc2,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -1751,7 +1758,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->fc1, weight->fc2,
             rows, HIDDEN, FFN, HIDDEN,
             dit->use_slower_grouped_quantizer,
-            dit->use_slower_dynamic_fc1_k, fused_int8_mlp_input),
+            dit->use_slower_dynamic_fc1_k, dit->use_int8_row_fc2,
+            fused_int8_mlp_input),
            "DiT int8 fused MLP");
     } else if (dit->nax_mlp && !getenv("H3_DISABLE_NAX_MLP")) {
         OP(h3_gpu_mlp_nax_bf16(dit->gpu, mlp_output, dit->activated,
