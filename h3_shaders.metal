@@ -2560,8 +2560,8 @@ kernel void h3_linear_int8_grouped_nax_r128x64(
 
 /* Same scaled K-group arithmetic as the threadgroup-tile version, but the
  * cooperative tensor assigns the same fragment element to the same thread
- * for every K slice. Keep those 64 FP32 totals private and eliminate 32 KiB
- * of threadgroup traffic plus the barrier after every scale group. */
+ * for every K slice. Keep those 64 FP32 totals private and issue two
+ * 512-wide scale-group products before draining either fragment. */
 kernel void h3_linear_int8_grouped_local_nax_r128x64(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
@@ -2573,7 +2573,7 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
                            ushort tid [[thread_index_in_threadgroup]]) {
     constexpr uint ROW_TILE = 128;
     constexpr uint COLUMN_TILE = 64;
-    constexpr uint K_TILE = 128;
+    constexpr uint K_TILE = 512;
     constexpr uint SCALE_GROUP = 1024;
     constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
     constexpr uint SCALE_GROUPS = 14;
@@ -2611,38 +2611,67 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
     matmul2d<descriptor, execution_simdgroups<8>> mm;
     matmul2d<first_descriptor, execution_simdgroups<8>> first_mm;
     thread float totals[FRAGMENT_CAPACITY];
-    for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
-        uint k_start = scale_group * SCALE_GROUP;
+    for (uint scale_group = 0; scale_group < scale_groups;
+         scale_group += 2) {
+        uint first_k = scale_group * SCALE_GROUP;
+        uint second_k = first_k + SCALE_GROUP;
         auto first_a = x.slice<ROW_TILE, K_TILE>(
-            (int)k_start, (int)row_start);
+            (int)first_k, (int)row_start);
         auto first_b = w.slice<K_TILE, COLUMN_TILE>(
-            (int)k_start, (int)column_start);
-        auto accum = mm.template get_destination_cooperative_tensor<
+            (int)first_k, (int)column_start);
+        auto first_accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
-        first_mm.run(first_a, first_b, accum);
+        first_mm.run(first_a, first_b, first_accum);
         #pragma clang loop unroll(full)
         for (uint k_tile = 1; k_tile < K_TILES_PER_GROUP; k_tile++) {
-            uint k = k_start + k_tile * K_TILE;
+            uint k = first_k + k_tile * K_TILE;
             auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
             auto b = w.slice<K_TILE, COLUMN_TILE>(
                 (int)k, (int)column_start);
-            mm.run(a, b, accum);
+            mm.run(a, b, first_accum);
+        }
+        auto second_a = x.slice<ROW_TILE, K_TILE>(
+            (int)second_k, (int)row_start);
+        auto second_b = w.slice<K_TILE, COLUMN_TILE>(
+            (int)second_k, (int)column_start);
+        auto second_accum = mm.template get_destination_cooperative_tensor<
+            decltype(second_a), decltype(second_b), int32_t>();
+        first_mm.run(second_a, second_b, second_accum);
+        #pragma clang loop unroll(full)
+        for (uint k_tile = 1; k_tile < K_TILES_PER_GROUP; k_tile++) {
+            uint k = second_k + k_tile * K_TILE;
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>(
+                (int)k, (int)column_start);
+            mm.run(a, b, second_accum);
         }
         if (scale_group == 0)
             threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++) {
-            if (!accum.is_valid_element(element)) continue;
-            auto index = accum.get_multidimensional_index(element);
-            uint row = row_start + (uint)index[1];
-            uint column = column_start + (uint)index[0];
-            float value = (float)accum[element] *
+        for (ushort element = 0; element < first_accum.get_capacity();
+             element++) {
+            if (!first_accum.is_valid_element(element)) continue;
+            auto index = first_accum.get_multidimensional_index(element);
+            float value = (float)first_accum[element] *
                 local_input_scales[(uint)index[1] * SCALE_GROUPS +
                                    scale_group] *
                 local_weight_scales[(uint)index[0]];
             if (scale_group == 0) totals[element] = value;
             else totals[element] += value;
-            if (scale_group + 1 == scale_groups && row < args.rows)
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < second_accum.get_capacity();
+             element++) {
+            if (!second_accum.is_valid_element(element)) continue;
+            auto index = second_accum.get_multidimensional_index(element);
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)second_accum[element] *
+                local_input_scales[(uint)index[1] * SCALE_GROUPS +
+                                   scale_group + 1] *
+                local_weight_scales[(uint)index[0]];
+            totals[element] += value;
+            if (scale_group + 2 == scale_groups && row < args.rows)
                 output[row * args.output_dim + column] =
                     (bfloat)totals[element];
         }
