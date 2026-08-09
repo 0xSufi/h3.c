@@ -3093,7 +3093,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         fc2.maxTotalThreadsPerThreadgroup < 256 || !fc2_grouped ||
         fc2_grouped.maxTotalThreadsPerThreadgroup < 128 ||
         !fc2_grouped_local ||
-        fc2_grouped_local.maxTotalThreadsPerThreadgroup < 128 ||
+        fc2_grouped_local.maxTotalThreadsPerThreadgroup < 256 ||
         !fc2_grouped_local128 ||
         fc2_grouped_local128.maxTotalThreadsPerThreadgroup < 256) {
         h3_gpu_set_error(gpu, @"device cannot dispatch M5 int8 MLP");
@@ -3193,7 +3193,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                          (grouped_fc2 && !grouped_fc2_local128 ?
                           64u : 128u)), 1, 1)
                  threadsPerThreadgroup:
-                    MTLSizeMake(grouped_fc2_local128 ? 256u :
+                    MTLSizeMake(grouped_fc2_local ? 256u :
                         grouped_fc2 ? 128u : 256u, 1, 1)];
         [encoder endEncoding];
     } else if (!h3_gpu_linear_bf16(

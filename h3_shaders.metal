@@ -2591,7 +2591,7 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
     constexpr auto descriptor = matmul2d_descriptor(
         ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    matmul2d<descriptor, execution_simdgroups<8>> mm;
     thread float totals[FRAGMENT_CAPACITY];
     for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
         uint k_start = scale_group * SCALE_GROUP;
