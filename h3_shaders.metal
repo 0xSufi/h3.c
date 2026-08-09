@@ -2569,12 +2569,14 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
                            device const float *weight_scales [[buffer(3)]],
                            device bfloat *output [[buffer(4)]],
                            constant linear_args &args [[buffer(5)]],
-                           uint code [[threadgroup_position_in_grid]]) {
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
     constexpr uint ROW_TILE = 128;
     constexpr uint COLUMN_TILE = 64;
     constexpr uint K_TILE = 128;
     constexpr uint SCALE_GROUP = 1024;
     constexpr uint K_TILES_PER_GROUP = SCALE_GROUP / K_TILE;
+    constexpr uint SCALE_GROUPS = 14;
     constexpr uint FRAGMENT_CAPACITY = 64;
     uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
     uint row_tiles = padded_rows / ROW_TILE;
@@ -2584,6 +2586,17 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
     uint row_start = group.x * ROW_TILE;
     uint column_start = group.y * COLUMN_TILE;
     uint scale_groups = args.input_dim / SCALE_GROUP;
+    threadgroup float local_input_scales[ROW_TILE * SCALE_GROUPS];
+    threadgroup float local_weight_scales[COLUMN_TILE];
+    for (uint local = tid; local < ROW_TILE * SCALE_GROUPS; local += 256) {
+        uint row = row_start + local / SCALE_GROUPS;
+        uint scale_group = local % SCALE_GROUPS;
+        local_input_scales[local] =
+            input_scales[row * SCALE_GROUPS + scale_group];
+    }
+    if (tid < COLUMN_TILE)
+        local_weight_scales[tid] = weight_scales[column_start + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)args.input_dim,
                                     (int)padded_rows));
@@ -2623,8 +2636,9 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
             uint row = row_start + (uint)index[1];
             uint column = column_start + (uint)index[0];
             float value = (float)accum[element] *
-                input_scales[row * scale_groups + scale_group] *
-                weight_scales[column];
+                local_input_scales[(uint)index[1] * SCALE_GROUPS +
+                                   scale_group] *
+                local_weight_scales[(uint)index[0]];
             if (scale_group == 0) totals[element] = value;
             else totals[element] += value;
             if (scale_group + 1 == scale_groups && row < args.rows)
