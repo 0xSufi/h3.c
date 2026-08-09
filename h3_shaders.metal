@@ -2431,22 +2431,24 @@ kernel void h3_linear_int8_local_scales_nax_r128_impl(
     constexpr auto descriptor = matmul2d_descriptor(
         TILE, TILE, TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto first_descriptor = matmul2d_descriptor(
+        TILE, TILE, TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
+    matmul2d<first_descriptor, execution_simdgroups<8>> first_mm;
     auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
     auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
     auto accum = mm.template get_destination_cooperative_tensor<
         decltype(first_a), decltype(first_b), int32_t>();
-    #pragma clang loop unroll(full)
-    for (ushort element = 0; element < accum.get_capacity(); element++)
-        if (accum.is_valid_element(element)) accum[element] = 0;
+    first_mm.run(first_a, first_b, accum);
     if (INPUT_DIM) {
-        for (uint k = 0; k < INPUT_DIM; k += TILE) {
+        for (uint k = TILE; k < INPUT_DIM; k += TILE) {
             auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
             auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
             mm.run(a, b, accum);
         }
     } else {
-        for (uint k = 0; k < input_dim; k += TILE) {
+        for (uint k = TILE; k < input_dim; k += TILE) {
             auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
             auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
             mm.run(a, b, accum);
