@@ -2135,7 +2135,7 @@ kernel h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4_t
 
 /* INPUT_DIM=5376 lets Metal schedule H3's fixed FC1 K loop without unrolling
  * its 42 TensorOps slices; zero retains the generic runtime-bound fallback. */
-template<uint INPUT_DIM>
+template<uint INPUT_DIM, uint K_TILE>
 kernel void h3_fc1_swiglu_int8_nax_r128_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
@@ -2160,28 +2160,28 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
         weight, dextents<int32_t, 2>((int)input_dim,
                                      (int)args.output_dim * 2));
     constexpr auto descriptor = matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true,
+        TILE, TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
     threadgroup bfloat gate_tile[TILE * TILE];
     {
-        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-        auto first_b = w.slice<TILE, TILE>(0, (int)column_start);
+        auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+        auto first_b = w.slice<K_TILE, TILE>(0, (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++)
             if (accum.is_valid_element(element)) accum[element] = 0;
         if (INPUT_DIM) {
-            for (uint k = 0; k < INPUT_DIM; k += TILE) {
-                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-                auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            for (uint k = 0; k < INPUT_DIM; k += K_TILE) {
+                auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+                auto b = w.slice<K_TILE, TILE>((int)k, (int)column_start);
                 mm.run(a, b, accum);
             }
         } else {
-            for (uint k = 0; k < input_dim; k += TILE) {
-                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-                auto b = w.slice<TILE, TILE>((int)k, (int)column_start);
+            for (uint k = 0; k < input_dim; k += K_TILE) {
+                auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+                auto b = w.slice<K_TILE, TILE>((int)k, (int)column_start);
                 mm.run(a, b, accum);
             }
         }
@@ -2199,8 +2199,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-        auto first_b = w.slice<TILE, TILE>(
+        auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+        auto first_b = w.slice<K_TILE, TILE>(
             0, (int)args.output_dim + (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
@@ -2208,16 +2208,16 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
         for (ushort element = 0; element < accum.get_capacity(); element++)
             if (accum.is_valid_element(element)) accum[element] = 0;
         if (INPUT_DIM) {
-            for (uint k = 0; k < INPUT_DIM; k += TILE) {
-                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-                auto b = w.slice<TILE, TILE>(
+            for (uint k = 0; k < INPUT_DIM; k += K_TILE) {
+                auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+                auto b = w.slice<K_TILE, TILE>(
                     (int)k, (int)args.output_dim + (int)column_start);
                 mm.run(a, b, accum);
             }
         } else {
-            for (uint k = 0; k < input_dim; k += TILE) {
-                auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-                auto b = w.slice<TILE, TILE>(
+            for (uint k = 0; k < input_dim; k += K_TILE) {
+                auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+                auto b = w.slice<K_TILE, TILE>(
                     (int)k, (int)args.output_dim + (int)column_start);
                 mm.run(a, b, accum);
             }
@@ -2239,14 +2239,17 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
     }
 }
 
-typedef decltype(h3_fc1_swiglu_int8_nax_r128_impl<0>)
+typedef decltype(h3_fc1_swiglu_int8_nax_r128_impl<0, 128>)
     h3_fc1_swiglu_int8_nax_r128_t;
 template [[host_name("h3_fc1_swiglu_int8_nax_r128")]]
 kernel h3_fc1_swiglu_int8_nax_r128_t
-    h3_fc1_swiglu_int8_nax_r128_impl<0>;
+    h3_fc1_swiglu_int8_nax_r128_impl<0, 128>;
 template [[host_name("h3_fc1_swiglu_int8_nax_r128_k5376")]]
 kernel h3_fc1_swiglu_int8_nax_r128_t
-    h3_fc1_swiglu_int8_nax_r128_impl<5376>;
+    h3_fc1_swiglu_int8_nax_r128_impl<5376, 128>;
+template [[host_name("h3_fc1_swiglu_int8_nax_r128_full_k5376")]]
+kernel h3_fc1_swiglu_int8_nax_r128_t
+    h3_fc1_swiglu_int8_nax_r128_impl<5376, 5376>;
 
 /* Gate and up use the same cooperative-fragment mapping. Preserve the gate's
  * existing BF16 rounding point in thread-private storage, then consume it

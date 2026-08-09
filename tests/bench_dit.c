@@ -598,6 +598,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     int local128_ab =
         getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") != NULL;
     int fc1local_ab = getenv("H3_BENCH_INT8_FC1_LOCAL_AB") != NULL;
+    int fc1full_ab = getenv("H3_BENCH_INT8_FC1_FULL_K_AB") != NULL;
     int fc1known_ab = getenv("H3_BENCH_INT8_FC1_KNOWN_AB") != NULL;
     int group_quant128_ab =
         getenv("H3_BENCH_INT8_GROUP_QUANT128_AB") != NULL;
@@ -606,6 +607,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     int group_quant128_cache_ab =
         getenv("H3_BENCH_INT8_GROUP_QUANT128_CACHE_AB") != NULL;
     int int8_ab = quant_ab || local_ab || local128_ab || fc1local_ab ||
+        fc1full_ab ||
         fc1known_ab ||
         group_quant128_cache_ab ||
         group_quant128_ab ||
@@ -616,6 +618,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
         local_ab ? "local grouped FC2" :
         local128_ab ? "128x128 local grouped FC2" :
         fc1local_ab ? "local FC1" :
+        fc1full_ab ? "full-K FC1" :
         fc1known_ab ? "compile-time-K FC1" :
         group_quant128_cache_ab ? "register-cached grouped quantizer" :
         group_quant128_ab ? (group_quant128_cached ?
@@ -630,10 +633,12 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     float *audio_reference = malloc(AUDIO_ELEMENTS * sizeof(*audio_reference));
     if (!video_reference || !audio_reference)
         die("out of memory allocating NAX MLP AB references");
-    if (quant_ab || local_ab || local128_ab || fc1local_ab || fc1known_ab ||
+    if (quant_ab || local_ab || local128_ab || fc1local_ab || fc1full_ab ||
+        fc1known_ab ||
         group_quant128_cache_ab ||
         group_quant128_ab) {
         unsetenv("H3_INT8_FC1_LOCAL");
+        if (fc1full_ab) setenv("H3_DISABLE_FC1_FULL_K", "1", 1);
         if (fc1known_ab) setenv("H3_INT8_FC1_KNOWN", "0", 1);
         else unsetenv("H3_INT8_FC1_KNOWN");
         unsetenv("H3_INT8_GROUP_QUANT_128_CACHE");
@@ -667,6 +672,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
         setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
     }
     else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+    else if (fc1full_ab) unsetenv("H3_DISABLE_FC1_FULL_K");
     else if (fc1known_ab) setenv("H3_INT8_FC1_KNOWN", "1", 1);
     else if (group_quant128_cache_ab)
         setenv("H3_INT8_GROUP_QUANT_128_CACHE", "1", 1);
@@ -718,6 +724,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 setenv("H3_INT8_GROUP_FC2_LOCAL128", "1", 1);
             }
             else if (fc1local_ab) setenv("H3_INT8_FC1_LOCAL", "1", 1);
+            else if (fc1full_ab) unsetenv("H3_DISABLE_FC1_FULL_K");
             else if (fc1known_ab) setenv("H3_INT8_FC1_KNOWN", "1", 1);
             else if (group_quant128_cache_ab)
                 setenv("H3_INT8_GROUP_QUANT_128_CACHE", "1", 1);
@@ -738,6 +745,8 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 setenv("H3_INT8_GROUP_FC2_LOCAL", "1", 1);
             }
             else if (fc1local_ab) unsetenv("H3_INT8_FC1_LOCAL");
+            else if (fc1full_ab)
+                setenv("H3_DISABLE_FC1_FULL_K", "1", 1);
             else if (fc1known_ab)
                 setenv("H3_INT8_FC1_KNOWN", "0", 1);
             else if (group_quant128_cache_ab)
@@ -755,6 +764,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
         double elapsed = seconds() - start;
         if (candidate_turn) {
             if ((quant_ab || local_ab || local128_ab || fc1local_ab ||
+                 fc1full_ab ||
                  fc1known_ab ||
                  group_quant128_cache_ab ||
                  group_quant128_ab) &&
@@ -765,6 +775,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 die(quant_ab ? "vec4 int8 quantizer changed output bytes" :
                     local128_ab ? "128x128 grouped FC2 changed output bytes" :
                     fc1local_ab ? "local FC1 changed output bytes" :
+                    fc1full_ab ? "full-K FC1 changed output bytes" :
                     fc1known_ab ? "compile-time-K FC1 changed output bytes" :
                     group_quant128_cache_ab ?
                         "register-cached grouped quantizer changed output bytes" :
@@ -786,6 +797,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
                 memcmp(audio_velocity, audio_reference,
                        AUDIO_ELEMENTS * sizeof(*audio_reference)))
                 die((quant_ab || local_ab || local128_ab || fc1local_ab ||
+                     fc1full_ab ||
                      fc1known_ab ||
                      group_quant128_cache_ab ||
                      group_quant128_ab) ?
@@ -801,6 +813,7 @@ static void run_nax_mlp_ab(h3_dit *dit, float *video, float *audio,
     unsetenv("H3_INT8_GROUP_FC2_LOCAL");
     unsetenv("H3_INT8_GROUP_FC2_LOCAL128");
     unsetenv("H3_INT8_FC1_LOCAL");
+    unsetenv("H3_DISABLE_FC1_FULL_K");
     unsetenv("H3_INT8_FC1_KNOWN");
     unsetenv("H3_INT8_GROUP_QUANT_128_CACHE");
     unsetenv("H3_INT8_GROUP_QUANT_128");
@@ -1710,6 +1723,7 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_INT8_GROUP_LOCAL_AB") ||
         getenv("H3_BENCH_INT8_GROUP_LOCAL128_AB") ||
         getenv("H3_BENCH_INT8_FC1_LOCAL_AB") ||
+        getenv("H3_BENCH_INT8_FC1_FULL_K_AB") ||
         getenv("H3_BENCH_INT8_FC1_KNOWN_AB") ||
         getenv("H3_BENCH_INT8_GROUP_QUANT128_CACHE_AB") ||
         getenv("H3_BENCH_INT8_GROUP_QUANT128_AB")) {
