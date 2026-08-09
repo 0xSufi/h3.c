@@ -819,7 +819,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                                    float *video_velocity,
                                    float *audio_velocity) {
     char error[512];
-    int head_major_attention_output =
+    int full_k_qkv = getenv("H3_BENCH_QKV_FULL_K_AB") != NULL;
+    int head_major_attention_output = !full_k_qkv &&
         getenv("H3_BENCH_HEAD_MAJOR_ATTENTION_OUT_AB") != NULL;
     int vector_gate_adaln = !head_major_attention_output &&
         getenv("H3_BENCH_VECTOR_GATE_ADALN_AB") != NULL;
@@ -843,7 +844,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         getenv("H3_BENCH_FUSED_INT8_MLP_INPUT_AB") != NULL;
     int attention_out = !fused_mlp_input &&
         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB") != NULL;
-    const char *disable = head_major_attention_output ?
+    const char *disable = full_k_qkv ?
+        "H3_DISABLE_QKV_FULL_K" : head_major_attention_output ?
         "H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT" : vector_gate_adaln ?
         "H3_DISABLE_VECTOR_GATE_ADALN" : vector_qkv_rope ?
         "H3_DISABLE_VECTOR_QKV_ROPE" : known_linear ?
@@ -858,7 +860,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
         "H3_DISABLE_INT8_ATTENTION_OUT" : "H3_DISABLE_INT8_QKV";
     const char *disable2 = fused_inputs ?
         "H3_DISABLE_FUSED_INT8_QKV_INPUT" : NULL;
-    const char *name = head_major_attention_output ?
+    const char *name = full_k_qkv ?
+        "full-K int8 QKV" : head_major_attention_output ?
         "head-major attention output" : vector_gate_adaln ?
         "vector fused int8 gate AdaLN" : vector_qkv_rope ?
         "vector fused int8 QKV RoPE" : known_linear ?
@@ -911,7 +914,8 @@ static void run_int8_projection_ab(h3_dit *dit, float *video, float *audio,
                             audio_velocity, error, sizeof(error))) die(error);
         double elapsed = seconds() - start;
         if (candidate) {
-            if ((head_major_attention_output || vector_gate_adaln ||
+            if ((full_k_qkv || head_major_attention_output ||
+                 vector_gate_adaln ||
                  vector_qkv_rope || known_linear) &&
                 (memcmp(video_velocity, video_reference,
                         VIDEO_ELEMENTS * sizeof(*video_reference)) ||
@@ -1534,6 +1538,7 @@ int main(int argc, char **argv) {
     int final_slice_ab = getenv("H3_BENCH_FINAL_SLICE_AB") != NULL;
     int final_head_ab = getenv("H3_BENCH_FINAL_HEAD_AB") != NULL;
     int int8_qkv_ab = getenv("H3_BENCH_INT8_QKV_AB") != NULL;
+    int full_k_qkv_ab = getenv("H3_BENCH_QKV_FULL_K_AB") != NULL;
     int head_major_attention_output_ab =
         getenv("H3_BENCH_HEAD_MAJOR_ATTENTION_OUT_AB") != NULL;
     int vector_gate_adaln_ab =
@@ -1639,7 +1644,8 @@ int main(int argc, char **argv) {
     }
     double load_seconds = seconds() - load_start;
 
-    if (head_major_attention_output_ab || vector_gate_adaln_ab ||
+    if (full_k_qkv_ab || head_major_attention_output_ab ||
+        vector_gate_adaln_ab ||
         vector_qkv_rope_ab ||
         known_int8_linear_ab ||
         int8_qkv_ab || int8_attention_out_ab ||

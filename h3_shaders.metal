@@ -1751,7 +1751,8 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
  * disjoint dimension pairs. The temporary device tile is the final head-major
  * output itself, so this adds only 512 bytes of threadgroup storage and removes
  * the separate per-row/per-four-head Q/K kernel dispatch. */
-kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
+template<uint K_TILE>
+kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -1791,19 +1792,19 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
         weight, dextents<int32_t, 2>(
             (int)args.input_dim, (int)args.heads * (int)TILE * 3));
     constexpr auto descriptor = matmul2d_descriptor(
-        TILE, TILE, TILE, false, true, true,
+        TILE, TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
-    auto first_a = x.slice<TILE, TILE>(0, (int)row_start);
-    auto first_b = w.slice<TILE, TILE>(0, (int)checkpoint_column);
+    auto first_a = x.slice<TILE, K_TILE>(0, (int)row_start);
+    auto first_b = w.slice<K_TILE, TILE>(0, (int)checkpoint_column);
     auto accum = mm.template get_destination_cooperative_tensor<
         decltype(first_a), decltype(first_b), int32_t>();
     #pragma clang loop unroll(full)
     for (ushort element = 0; element < accum.get_capacity(); element++)
         if (accum.is_valid_element(element)) accum[element] = 0;
-    for (uint k = 0; k < args.input_dim; k += TILE) {
-        auto a = x.slice<TILE, TILE>((int)k, (int)row_start);
-        auto b = w.slice<TILE, TILE>((int)k, (int)checkpoint_column);
+    for (uint k = 0; k < args.input_dim; k += K_TILE) {
+        auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
+        auto b = w.slice<K_TILE, TILE>((int)k, (int)checkpoint_column);
         mm.run(a, b, accum);
     }
     #pragma clang loop unroll(full)
@@ -1925,6 +1926,15 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4(
         }
     }
 }
+
+typedef decltype(h3_qkv_project_split_int8_rope_nax_r128_morton4_impl<128>)
+    h3_qkv_project_split_int8_rope_nax_r128_morton4_t;
+template [[host_name("h3_qkv_project_split_int8_rope_nax_r128_morton4")]]
+kernel h3_qkv_project_split_int8_rope_nax_r128_morton4_t
+    h3_qkv_project_split_int8_rope_nax_r128_morton4_impl<128>;
+template [[host_name("h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4")]]
+kernel h3_qkv_project_split_int8_rope_nax_r128_morton4_t
+    h3_qkv_project_split_int8_rope_nax_r128_morton4_impl<5376>;
 
 /* QKV variant that caches the row and checkpoint-column scale vectors. After
  * every cooperative fragment has consumed the scales, the first half is
