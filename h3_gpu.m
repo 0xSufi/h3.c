@@ -462,6 +462,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4"];
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4"];
+            [names addObject:
+                @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
@@ -3894,10 +3896,12 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     BOOL local_scales = fused_rope && rows > 2048 &&
         !use_slower_uncached_int8_scales &&
         getenv("H3_DISABLE_QKV_LOCAL_SCALES") == NULL;
-    BOOL full_k = fused_rope && !local_scales && input_dim == 5376u &&
+    BOOL full_k = fused_rope && input_dim == 5376u &&
         getenv("H3_DISABLE_QKV_FULL_K") == NULL;
     id<MTLComputePipelineState> projection = h3_gpu_pipeline(
-        gpu, local_scales ?
+        gpu, local_scales && full_k ?
+            @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4" :
+            local_scales ?
             @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4" :
             full_k ?
             @"h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4" :
