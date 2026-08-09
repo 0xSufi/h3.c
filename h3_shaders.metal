@@ -2153,6 +2153,7 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
     uint row_start = group.x * TILE;
     uint column_start = group.y * TILE;
     uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
+    constexpr bool FULL_PRODUCT = INPUT_DIM != 0 && K_TILE == INPUT_DIM;
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
@@ -2161,7 +2162,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
                                      (int)args.output_dim * 2));
     constexpr auto descriptor = matmul2d_descriptor(
         TILE, TILE, K_TILE, false, true, true,
-        matmul2d_descriptor::mode::multiply_accumulate);
+        FULL_PRODUCT ? matmul2d_descriptor::mode::multiply :
+                       matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
     threadgroup bfloat gate_tile[TILE * TILE];
     {
@@ -2169,9 +2171,11 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
         auto first_b = w.slice<K_TILE, TILE>(0, (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
-        #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++)
-            if (accum.is_valid_element(element)) accum[element] = 0;
+        if constexpr (!FULL_PRODUCT) {
+            #pragma clang loop unroll(full)
+            for (ushort element = 0; element < accum.get_capacity(); element++)
+                if (accum.is_valid_element(element)) accum[element] = 0;
+        }
         if (INPUT_DIM) {
             for (uint k = 0; k < INPUT_DIM; k += K_TILE) {
                 auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
@@ -2204,9 +2208,11 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
             0, (int)args.output_dim + (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
-        #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++)
-            if (accum.is_valid_element(element)) accum[element] = 0;
+        if constexpr (!FULL_PRODUCT) {
+            #pragma clang loop unroll(full)
+            for (ushort element = 0; element < accum.get_capacity(); element++)
+                if (accum.is_valid_element(element)) accum[element] = 0;
+        }
         if (INPUT_DIM) {
             for (uint k = 0; k < INPUT_DIM; k += K_TILE) {
                 auto a = x.slice<TILE, K_TILE>((int)k, (int)row_start);
