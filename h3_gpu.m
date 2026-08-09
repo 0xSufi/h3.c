@@ -2770,7 +2770,10 @@ static int h3_gpu_quantize_bf16_int8_rows(
         !h3_gpu_require_f32(gpu, scales, dispatch_rows,
                             @"int8 quantization scales") ||
         !h3_gpu_require_command(gpu)) return 0;
-    NSString *kernel = getenv("H3_INT8_VECTOR_QUANT") ?
+    BOOL vector_quantizer =
+        [label isEqualToString:@"int8 MLP FC2 input"] ||
+        getenv("H3_INT8_VECTOR_QUANT");
+    NSString *kernel = vector_quantizer ?
         @"h3_quantize_bf16_int8_rows" :
         @"h3_quantize_bf16_int8_rows_scalar";
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kernel);
