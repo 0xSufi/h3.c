@@ -2591,7 +2591,11 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
     constexpr auto descriptor = matmul2d_descriptor(
         ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto first_descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply);
     matmul2d<descriptor, execution_simdgroups<8>> mm;
+    matmul2d<first_descriptor, execution_simdgroups<8>> first_mm;
     thread float totals[FRAGMENT_CAPACITY];
     for (uint scale_group = 0; scale_group < scale_groups; scale_group++) {
         uint k_start = scale_group * SCALE_GROUP;
@@ -2601,11 +2605,9 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
             (int)k_start, (int)column_start);
         auto accum = mm.template get_destination_cooperative_tensor<
             decltype(first_a), decltype(first_b), int32_t>();
+        first_mm.run(first_a, first_b, accum);
         #pragma clang loop unroll(full)
-        for (ushort element = 0; element < accum.get_capacity(); element++)
-            if (accum.is_valid_element(element)) accum[element] = 0;
-        #pragma clang loop unroll(full)
-        for (uint k_tile = 0; k_tile < K_TILES_PER_GROUP; k_tile++) {
+        for (uint k_tile = 1; k_tile < K_TILES_PER_GROUP; k_tile++) {
             uint k = k_start + k_tile * K_TILE;
             auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
             auto b = w.slice<K_TILE, COLUMN_TILE>(
