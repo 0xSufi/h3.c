@@ -2596,7 +2596,6 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
     }
     if (tid < COLUMN_TILE)
         local_weight_scales[tid] = weight_scales[column_start + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)args.input_dim,
                                     (int)padded_rows));
@@ -2629,6 +2628,8 @@ kernel void h3_linear_int8_grouped_local_nax_r128x64(
                 (int)k, (int)column_start);
             mm.run(a, b, accum);
         }
+        if (scale_group == 0)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
         for (ushort element = 0; element < accum.get_capacity(); element++) {
             if (!accum.is_valid_element(element)) continue;
