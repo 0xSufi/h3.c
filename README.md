@@ -240,6 +240,17 @@ that every tiny canvas has good model quality. H3-Base is a 768p model.
 | `320x320` internal to `512x512` | Validated aggressive scaling point. |
 | `256x256` | Native fast-preview canvas with automatic low-resolution RoPE adaptation. |
 
+For a fast native 256-square preview:
+
+```sh
+./h3 -d ./MiniMax-H3 \
+  -p "A red fox walks through fresh snow in a pine forest." \
+  --width 256 --height 256 \
+  --frames 22 --steps 20 \
+  --layers 50 --reuse 1 \
+  -o outputs/fox-256.mp4
+```
+
 At 256 square, H3 has only an `8x8` effective spatial-token grid, so it has less
 room for fine detail and complex composition. H3 automatically halves spatial
 RoPE coordinates at exactly 256 square. This removed repeating lattice
