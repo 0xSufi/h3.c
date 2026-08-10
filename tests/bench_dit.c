@@ -1634,7 +1634,7 @@ int main(int argc, char **argv) {
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 0,
+            active_blocks, 1, enable_token_reduction, 1.0f, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             video_condition,
@@ -1645,7 +1645,7 @@ int main(int argc, char **argv) {
     } else {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 0,
+            active_blocks, 1, enable_token_reduction, 1.0f, 0,
             0, 0, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             NULL, NULL, error,

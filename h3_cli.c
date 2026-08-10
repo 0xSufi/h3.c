@@ -161,6 +161,7 @@ static void print_help(void) {
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
+    puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
     puts("  !first [PATH|clear]      Set, show, or clear first frame");
     puts("  !last [PATH|clear]       Set, show, or clear last frame");
     puts("  !ref-image PATH          Append an ordered Ref2VA image");
@@ -191,6 +192,8 @@ static void print_status(const h3_cli_state *state) {
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
+    printf("Spatial RoPE: %s\n", state->params.use_reference_rope ?
+           "released reference" : "native 256 adapted");
     if (state->random_seed) puts("Seed: random");
     else printf("Seed: %" PRIu64 "\n", state->params.seed);
     printf("First: %s\n", state->first_frame ? state->first_frame : "none");
@@ -585,6 +588,14 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         else {
             state->params.use_int8_row_fc2 = value;
             printf("FC2 int8 row scaling: %s\n", value ? "on" : "off");
+        }
+    } else if (!strcasecmp(command, "reference-rope")) {
+        int value;
+        if (!parse_toggle(argument, state->params.use_reference_rope, &value))
+            fprintf(stderr, "h3: use on or off\n");
+        else {
+            state->params.use_reference_rope = value;
+            printf("Reference spatial RoPE: %s\n", value ? "on" : "off");
         }
     } else if (!strcasecmp(command, "first")) set_anchor(state, 1, argument);
     else if (!strcasecmp(command, "last")) set_anchor(state, 0, argument);

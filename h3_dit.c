@@ -76,6 +76,7 @@ struct h3_dit {
     unsigned token_reduction_early_steps;
     unsigned token_reduction_early_end;
     float token_reduction_scale;
+    float spatial_rope_scale;
     int bf16_final;
     unsigned core_reuse_interval;
     unsigned core_forward_count;
@@ -716,6 +717,7 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
         return 0;
     }
     free_tensor(&inverse_tensor);
+    float spatial_scale = dit->spatial_rope_scale;
     size_t count = (size_t)dit->sequence * ROPE_HALF;
     size_t reduced_count = dit->token_reduction ?
         (size_t)dit->reduced_sequence * ROPE_HALF : 0;
@@ -736,8 +738,8 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     }
     for (uint32_t row = 0; row < dit->sequence; row++) {
         float axes[] = {(float)dit->layout.positions[row].t,
-                        (float)dit->layout.positions[row].h,
-                        (float)dit->layout.positions[row].w};
+                        (float)dit->layout.positions[row].h * spatial_scale,
+                        (float)dit->layout.positions[row].w * spatial_scale};
         for (uint32_t axis = 0; axis < 3; axis++) {
             for (uint32_t frequency = 0; frequency < ROPE_FREQS; frequency++) {
                 size_t index = (size_t)row * ROPE_HALF +
@@ -755,9 +757,9 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
             (float)((dit->layout.positions[first].t +
                      dit->layout.positions[second].t) * 0.5),
             (float)((dit->layout.positions[first].h +
-                     dit->layout.positions[second].h) * 0.5),
+                     dit->layout.positions[second].h) * 0.5) * spatial_scale,
             (float)((dit->layout.positions[first].w +
-                     dit->layout.positions[second].w) * 0.5)
+                     dit->layout.positions[second].w) * 0.5) * spatial_scale
         };
         for (uint32_t axis = 0; axis < 3; axis++) {
             for (uint32_t frequency = 0; frequency < ROPE_FREQS; frequency++) {
@@ -1346,6 +1348,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         unsigned active_blocks,
                         unsigned core_reuse_interval,
                         int token_reduction,
+                        float spatial_rope_scale,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
                         int use_slower_bf16_attention_output,
@@ -1365,6 +1368,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
+        !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f ||
         active_blocks < H3_DIT_BLOCKS / 2 ||
         active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
         core_reuse_interval > 6) {
@@ -1383,6 +1387,7 @@ static h3_dit *load_dit(const char *weight_directory,
      * Keep the old path available for close-reference diagnosis. */
     dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
+    dit->spatial_rope_scale = spatial_rope_scale;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
@@ -1479,6 +1484,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
+                         float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
@@ -1494,6 +1500,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
+                    spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
                     use_slower_row_major_attention_output,
@@ -1517,6 +1524,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
+                         float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
@@ -1536,6 +1544,7 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
+                    spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
                     use_slower_row_major_attention_output,
