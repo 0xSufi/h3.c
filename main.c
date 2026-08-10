@@ -27,7 +27,7 @@ static void usage(const char *program) {
         "      --render-height N  Lower internal model height (optional)\n"
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
-        "      --steps N          Denoising passes (default: 50)\n"
+        "      --steps N          Denoising passes (default: 20)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"

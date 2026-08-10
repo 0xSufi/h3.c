@@ -69,6 +69,9 @@ static void test_temporal_and_canvas(void) {
 }
 
 static void test_schedule(void) {
+    h3_params defaults = H3_PARAMS_DEFAULT;
+    CHECK(defaults.steps == 20);
+
     h3_sigma_schedule schedule;
     CHECK(h3_schedule_build(20, &schedule));
     CHECK(schedule.steps == 20);

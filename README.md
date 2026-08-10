@@ -82,7 +82,7 @@ timings:
 
 This is deliberately not the most aggressive configuration:
 
-- `--steps 20` performs 20 denoising passes instead of the default 50.
+- `--steps 20` performs the default 20 denoising passes.
 - `--reuse 2` computes 11 fresh denoiser velocities instead of all 20 and
   extrapolates the skipped transitions.
 - `--layers 45` runs 45 of the 50 transformer blocks, reducing both time and
@@ -131,7 +131,8 @@ reference.
 ### 3. Move toward reference quality
 
 Change one control at a time when evaluating quality. First restore all layers,
-then all denoiser evaluations, and finally the default 50-pass schedule:
+then all denoiser evaluations, and finally raise the default 20-pass schedule
+to the slower 50-pass reference:
 
 ```sh
 ./h3 --profile \
@@ -143,10 +144,10 @@ then all denoiser evaluations, and finally the default 50-pass schedule:
   -o outputs/fox-close.mp4
 ```
 
-The defaults are `--steps 50 --layers 50 --reuse 1`, so those three options may
-also be omitted. This close path performs 50 complete 50-block denoiser
-forwards. It is much more expensive than the first command, but is the right
-oracle when a fast mode changes the subject, anatomy, motion, or composition.
+The defaults are `--steps 20 --layers 50 --reuse 1`; keep `--steps 50`
+explicit for this close path. It performs 50 complete 50-block denoiser
+forwards and is much more expensive than the default, but is the right oracle
+when a fast mode changes the subject, anatomy, motion, or composition.
 Numerical pixel identity with MLX is not expected because the random-number and
 execution engines differ; the depicted content and motion should agree.
 
@@ -154,7 +155,7 @@ execution engines differ; the depicted content and motion should agree.
 
 These controls are independent unless noted otherwise:
 
-| Control | Close/default | Fast-quality | Aggressive | Main impact |
+| Control | Slow reference | Default | Aggressive | Main impact |
 |---|---:|---:|---:|---|
 | Denoising passes | `--steps 50` | `--steps 20` | `--steps 4..7` | The number always names actual denoising passes. |
 | Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 steps: 20, 11, or 8 fresh DiT evaluations. |
