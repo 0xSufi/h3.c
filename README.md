@@ -238,12 +238,14 @@ that every tiny canvas has good model quality. H3-Base is a 768p model.
 | `1024x768`, `768x1024` | Valid 4:3 and 3:4 768p-class canvases. |
 | `384x384` internal to `512x512` | Validated fast-quality scaling point. |
 | `320x320` internal to `512x512` | Validated aggressive scaling point. |
-| `256x256` | Accepted by the parser but not quality-supported; it may produce garbage. |
+| `256x256` | Validated for native prompt-to-video with the default 20-step close path; expect less detail. |
 
-At 256 square, H3 has only an `8x8` effective spatial-token grid. Do not use it
-as the first correctness test, and especially do not combine it with token
-reduction. If a 256 square deliverable is required, generate at 512 and
-downscale the encoded result:
+At 256 square, H3 has only an `8x8` effective spatial-token grid, so it has less
+room for fine detail and complex composition. Start with the unmodified default
+path (`--steps 20 --layers 50 --reuse 1`) and keep token reduction off. Native
+256 was checked with animal, portrait, and vehicle prompts, and the optimized
+M5 path was also compared visually with the slower BF16 path. For maximum
+quality, generate at 512 and downscale the encoded result:
 
 ```sh
 ffmpeg -i outputs/fox-fast.mp4 -vf scale=256:256 outputs/fox-256.mp4
@@ -482,11 +484,10 @@ recognizable photorealistic result. Both values must be multiples of 32; the
 exact output canvas remains the default.
 For square 512 output, 384 is the fast-quality point and 320 is the validated
 aggressive point. The latter produced a coherent walking fox and repeated at
-8.02 seconds of DiT versus about 15.82 seconds natively. An earlier single-prompt
-256 internal test remained recognizable but softened the face and legs and was
-slightly slower overall than 320. Subsequent manual 256 square output produced
-garbage, so 256 is mechanically allowed for diagnosis but is not a supported
-quality preset.
+8.02 seconds of DiT versus about 15.82 seconds natively. Native 256 output is
+also coherent with the current sampler and kernels, but its `8x8` spatial-token
+grid visibly softens faces, limbs, and small objects. It is useful for quick
+composition tests, not as a substitute for a 512- or 768-class final render.
 The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
