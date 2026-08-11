@@ -168,12 +168,13 @@ static char *h3_prepared_key(const char *conditioning,
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d"
+            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
+            params->ssd_streaming,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,
@@ -543,6 +544,15 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->use_reference_rope != 0 &&
         params->use_reference_rope != 1) {
         h3_set_error(ctx, "reference RoPE must be zero or one");
+        return 0;
+    }
+    if (params->ssd_streaming != 0 && params->ssd_streaming != 1) {
+        h3_set_error(ctx, "SSD streaming must be zero or one");
+        return 0;
+    }
+    if (params->ssd_streaming && params->use_int8_row_fc2) {
+        h3_set_error(ctx, "SSD streaming uses original BF16 weights and cannot "
+                         "be combined with int8 row FC2");
         return 0;
     }
     if (params->use_int8_row_fc2 && params->use_slower_bf16_mlp) {
@@ -1469,6 +1479,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
+            params->ssd_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
@@ -1489,6 +1500,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
+            params->ssd_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,

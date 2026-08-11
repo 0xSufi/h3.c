@@ -719,8 +719,10 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                    sizeof(float), H3_GPU_F32, "F32");
 }
 
-int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
+static int h3_gpu_tensor_read_file_bf16_mode(
+                                 h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,
+                                 int uncached,
                                  char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!opaque || !path || !*path ||
@@ -744,6 +746,11 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
                      strerror(errno));
         return 0;
     }
+#ifdef F_NOCACHE
+    if (uncached) (void)fcntl(descriptor, F_NOCACHE, 1);
+#else
+    (void)uncached;
+#endif
     unsigned char *destination = TENSOR(opaque).buffer.contents;
     size_t completed = 0;
     while (completed < bytes) {
@@ -765,6 +772,20 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
     }
     close(descriptor);
     return 1;
+}
+
+int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_bf16_mode(
+        opaque, path, file_offset, elements, 0, error, error_size);
+}
+
+int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
+                                   uint64_t file_offset, size_t elements,
+                                   char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_bf16_mode(
+        opaque, path, file_offset, elements, 1, error, error_size);
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {

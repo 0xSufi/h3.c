@@ -59,6 +59,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  char *error, size_t error_size);
+/* As above, but ask Darwin to avoid retaining a second copy in the file cache.
+ * Intended for large sequential weight streams whose destination is the only
+ * useful resident copy. */
+int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
+                                   uint64_t file_offset, size_t elements,
+                                   char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);

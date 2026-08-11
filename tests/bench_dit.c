@@ -1618,6 +1618,8 @@ int main(int argc, char **argv) {
         final_slice_ab || final_head_ab;
     int use_slower_grouped_quantizer =
         getenv("H3_BENCH_USE_SLOWER_GROUPED_QUANTIZER") != NULL;
+    int ssd_streaming = getenv("H3_BENCH_SSD_STREAMING") != NULL;
+    int all_bf16 = getenv("H3_BENCH_ALL_BF16") != NULL;
     h3_dit *dit;
     if (ref_layout) {
         size_t video_condition_elements =
@@ -1634,8 +1636,8 @@ int main(int argc, char **argv) {
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 1.0f, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
+            active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
+            all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             video_condition,
             video_condition_elements, audio_condition,
@@ -1645,8 +1647,8 @@ int main(int argc, char **argv) {
     } else {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
-            active_blocks, 1, enable_token_reduction, 1.0f, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
+            active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
+            all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             NULL, NULL, error,
             sizeof(error));
@@ -1872,8 +1874,18 @@ int main(int argc, char **argv) {
     }
 
     static const int steps[] = {0, 3, 6, 9, 12, 15, 18};
+    size_t forward_count = sizeof(steps) / sizeof(*steps);
+    const char *forward_count_value = getenv("H3_BENCH_FORWARD_COUNT");
+    if (forward_count_value && *forward_count_value) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(forward_count_value, &end, 10);
+        if (end == forward_count_value || *end || parsed < 1 ||
+            parsed > forward_count)
+            die("H3_BENCH_FORWARD_COUNT must be in [1, 7]");
+        forward_count = (size_t)parsed;
+    }
     double forward_start = seconds();
-    for (size_t index = 0; index < sizeof(steps) / sizeof(*steps); index++) {
+    for (size_t index = 0; index < forward_count; index++) {
         double step_start = seconds();
         if (!h3_dit_forward(dit, steps[index], video, audio,
                             video_velocity, audio_velocity,
@@ -1886,10 +1898,15 @@ int main(int argc, char **argv) {
                seconds() - step_start);
     }
     double forward_seconds = seconds() - forward_start;
-    printf("DiT %ux%u load %.3fs, seven forwards %.3fs, combined %.3fs\n",
+    printf("DiT %ux%u load %.3fs, %zu forwards %.3fs, combined %.3fs; "
+           "hashes video %016llx audio %016llx\n",
            (unsigned)CANVAS_W, (unsigned)CANVAS_H,
-           load_seconds, forward_seconds,
-           load_seconds + forward_seconds);
+           load_seconds, forward_count, forward_seconds,
+           load_seconds + forward_seconds,
+           (unsigned long long)hash_bytes(
+               video_velocity, VIDEO_ELEMENTS * sizeof(*video_velocity)),
+           (unsigned long long)hash_bytes(
+               audio_velocity, AUDIO_ELEMENTS * sizeof(*audio_velocity)));
 
     h3_dit_free(dit);
     h3_layout_free(&layout);

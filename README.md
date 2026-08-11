@@ -128,6 +128,28 @@ against a 29-pass reference; an independent surfer test measured 0.547. The
 four-pass denoise took about 3.5 seconds on M5 Max, versus 26.4 seconds for the
 reference.
 
+For a low-memory run, add `--ssd-streaming`:
+
+```sh
+./h3 --profile \
+  -d ./MiniMax-H3 \
+  -p "A red fox walks through fresh snow in a pine forest." \
+  --width 512 --height 512 --frames 22 --steps 20 \
+  --layers 50 --reuse 1 --ssd-streaming \
+  -o outputs/fox-ssd.mp4
+```
+
+This uses the original BF16 checkpoint without conversion or quantization. It
+keeps two DiT blocks in memory and reads the next block from SSD while the GPU
+runs the current one. On M5 Max, tracked DiT storage fell from about 36.5 GiB to
+2.0 GiB at 512 square and 2.1 GiB at 864x480. A warm 50-block forward measured
+1.35 versus 2.49 seconds at 512 square, and 2.14 versus 2.68 seconds at 864x480.
+The streamed and resident BF16 results were byte-identical in both checks.
+
+SSD streaming is an explicit memory/speed tradeoff and is not the default. It
+cannot be combined with `--use-int8-row-fc2`. In an interactive session, use
+`!ssd-streaming on`.
+
 ### 3. Move toward reference quality
 
 Change one control at a time when evaluating quality. First restore all layers,
@@ -514,6 +536,16 @@ layer. The default ring depth is two layers on M3/older hardware and three on
 M5, where the target machine has 128 GiB. `H3_QWEN_PREFETCH=0` restores the
 single-layer synchronous reference path; values 1-8 select the worker count,
 and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
+
+`--ssd-streaming` is a separate, more aggressive residency mode for the DiT.
+Only its small per-block normalization weights remain resident. Two complete
+BF16 matrix slots alternate while a background reader fills the next slot in
+checkpoint-offset order; the current Metal command buffer runs concurrently.
+Darwin uncached reads avoid retaining a second copy in the filesystem cache.
+The first active block is prefetched again during the final block, so a cached
+interactive DiT is ready for its next denoiser evaluation. Measurements reached
+about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
+read throughput, and the part of the read wait that was not hidden by GPU work.
 
 ### Metal 4 and TensorOps paths
 
