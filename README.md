@@ -143,8 +143,15 @@ This uses the original BF16 checkpoint without conversion or quantization. It
 keeps two DiT blocks in memory and reads the next block from SSD while the GPU
 runs the current one. On M5 Max, tracked DiT storage fell from about 36.5 GiB to
 2.0 GiB at 512 square and 2.1 GiB at 864x480. A warm 50-block forward measured
-1.35 versus 2.49 seconds at 512 square, and 2.14 versus 2.68 seconds at 864x480.
-The streamed and resident BF16 results were byte-identical in both checks.
+1.35 versus 2.49 seconds at 512 square (84% slower), and 2.14 versus 2.68
+seconds at 864x480 (26% slower). These are comparisons against the same
+full-residency BF16 path, and the results were byte-identical in both checks.
+
+The 2.0--2.1 GiB figure is the DiT's tracked tensor storage, not total system
+RAM. Prompt encoding and the two VAEs run in separate phases rather than adding
+their full peaks to it; the OS, media buffers, and output resolution still need
+headroom. `--show` keeps a preview VAE resident and adds roughly 10 GiB, so omit
+it for the lowest-memory run.
 
 SSD streaming is an explicit memory/speed tradeoff and is not the default. It
 cannot be combined with `--use-int8-row-fc2`. In an interactive session, use
