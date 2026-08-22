@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -733,15 +734,57 @@ static void h3_vision_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "Qwen vision", completed, total);
 }
 
-static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
-    uint8_t *output = malloc(count);
-    if (!output) return NULL;
-    for (size_t index = 0; index < count; index++) {
+typedef struct {
+    const float *rgb;
+    uint8_t *output;
+    size_t begin, end;
+} h3_u8_span;
+
+static void h3_rgb_f32_to_u8_range(const float *rgb, uint8_t *output,
+                                   size_t begin, size_t end) {
+    for (size_t index = begin; index < end; index++) {
         float scaled = rgb[index] * 255.0f;
         if (scaled < 0.0f) scaled = 0.0f;
         if (scaled > 255.0f) scaled = 255.0f;
         output[index] = (uint8_t)lrintf(scaled);
     }
+}
+
+static void *h3_rgb_f32_to_u8_thread(void *opaque) {
+    h3_u8_span *span = (h3_u8_span *)opaque;
+    h3_rgb_f32_to_u8_range(span->rgb, span->output, span->begin, span->end);
+    return NULL;
+}
+
+/* Element-wise and write-disjoint, so threading cannot change any output
+ * byte; a full 15 s clip is ~450M elements. */
+static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
+    uint8_t *output = malloc(count);
+    if (!output) return NULL;
+    enum { WORKERS = 8 };
+    if (count >= (size_t)32 << 20) {
+        pthread_t threads[WORKERS];
+        h3_u8_span spans[WORKERS];
+        int started = 0;
+        for (int worker = 1; worker < WORKERS; worker++) {
+            spans[started].rgb = rgb;
+            spans[started].output = output;
+            spans[started].begin = count * worker / WORKERS;
+            spans[started].end = count * (worker + 1) / WORKERS;
+            if (pthread_create(&threads[started], NULL,
+                               h3_rgb_f32_to_u8_thread, &spans[started]) != 0) {
+                h3_rgb_f32_to_u8_range(rgb, output, spans[started].begin,
+                                       count);
+                break;
+            }
+            started++;
+        }
+        h3_rgb_f32_to_u8_range(rgb, output, 0, count / WORKERS);
+        for (int worker = 0; worker < started; worker++)
+            pthread_join(threads[worker], NULL);
+        return output;
+    }
+    h3_rgb_f32_to_u8_range(rgb, output, 0, count);
     return output;
 }
 

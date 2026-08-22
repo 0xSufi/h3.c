@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -530,6 +531,63 @@ static int load_resident_weights(vae_context *vae,
 /* Tiled decoding keeps every VAE weight resident for the duration of the phase.
  * This uses about 9 GiB after the DiT has been retired, avoids rereading 9 GiB
  * per spatial tile, and permits one command-buffer chain per tile. */
+/* Frame-parallel helper for the CPU unpack/stitch scatter loops: frames
+ * are independent, so they split across worker threads. H3_VAE_CPU_THREADS
+ * overrides the worker count (1 restores the single-thread reference,
+ * 0/unset picks up to 10). Falls back inline if a thread fails to start. */
+typedef void (*vae_frame_fn)(void *context, int frame);
+typedef struct {
+    void *context;
+    vae_frame_fn fn;
+    int begin, end;
+} vae_frame_span;
+
+static void *vae_frame_thread(void *opaque) {
+    vae_frame_span *span = (vae_frame_span *)opaque;
+    for (int frame = span->begin; frame < span->end; frame++)
+        span->fn(span->context, frame);
+    return NULL;
+}
+
+static int vae_cpu_threads(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("H3_VAE_CPU_THREADS");
+        long parsed = value && *value ? strtol(value, NULL, 10) : 0;
+        cached = parsed >= 1 && parsed <= 64 ? (int)parsed : 10;
+    }
+    return cached;
+}
+
+static void vae_parallel_frames(void *context, vae_frame_fn fn, int count) {
+    int workers = vae_cpu_threads();
+    if (workers > count) workers = count;
+    if (workers <= 1) {
+        for (int frame = 0; frame < count; frame++) fn(context, frame);
+        return;
+    }
+    pthread_t threads[64];
+    vae_frame_span spans[64];
+    int started = 0;
+    for (int worker = 1; worker < workers; worker++) {
+        spans[started].context = context;
+        spans[started].fn = fn;
+        spans[started].begin = (count * worker) / workers;
+        spans[started].end = (count * (worker + 1)) / workers;
+        if (pthread_create(&threads[started], NULL, vae_frame_thread,
+                           &spans[started]) != 0) {
+            /* Cover this span and everything after it inline. */
+            spans[started].end = count;
+            vae_frame_thread(&spans[started]);
+            break;
+        }
+        started++;
+    }
+    for (int frame = 0; frame < count / workers; frame++) fn(context, frame);
+    for (int worker = 0; worker < started; worker++)
+        pthread_join(threads[worker], NULL);
+}
+
 static int run_resident_tile(vae_context *vae, char *error,
                              size_t error_size) {
     float zeros[HIDDEN];
@@ -576,6 +634,50 @@ static int run_resident_tile(vae_context *vae, char *error,
     return 1;
 }
 
+typedef struct {
+    const float *rows;
+    float *rgb;
+    int first_frame;
+    int output_frames;
+    int pixel_h, pixel_w;
+    int latent_h, latent_w;
+} unpack_ctx;
+
+static void unpack_one_frame(void *opaque, int output_frame) {
+    const unpack_ctx *job = (const unpack_ctx *)opaque;
+    static const float mean[] = {0.485f, 0.456f, 0.406f};
+    static const float deviation[] = {0.229f, 0.224f, 0.225f};
+    int frame = job->first_frame + output_frame;
+    int decoded_t = frame + FRAME_OFFSET;
+    if (job->output_frames == FIRST_CHUNK_FRAMES && frame >= 17)
+        decoded_t += 3;
+    int patch_t = decoded_t / 4;
+    int within_t = decoded_t % 4;
+    for (int y = 0; y < job->pixel_h; y++) {
+        int patch_y = y / 16, within_y = y % 16;
+        for (int x = 0; x < job->pixel_w; x++) {
+            int patch_x = x / 16, within_x = x % 16;
+            size_t patch = ((size_t)patch_t * (size_t)job->latent_h +
+                (size_t)patch_y) * (size_t)job->latent_w +
+                (size_t)patch_x;
+            for (int channel = 0; channel < 3; channel++) {
+                size_t component = ((((size_t)channel * 4 +
+                    (size_t)within_t) * 16 + (size_t)within_y) * 16 +
+                    (size_t)within_x);
+                float value = job->rows[patch * OUTPUT_PATCH + component] *
+                              deviation[channel] + mean[channel];
+                if (value < 0.0f) value = 0.0f;
+                if (value > 1.0f) value = 1.0f;
+                size_t destination = (((size_t)output_frame *
+                    (size_t)job->pixel_h +
+                    (size_t)y) * (size_t)job->pixel_w + (size_t)x) * 3 +
+                    (size_t)channel;
+                job->rgb[destination] = value;
+            }
+        }
+    }
+}
+
 static int unpack_frame_range(vae_context *vae, int first_frame,
                               int frame_count, h3_video_frames *output,
                               char *error, size_t error_size) {
@@ -601,39 +703,9 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
         fail(error, error_size, "cannot read video VAE output patches");
         return 0;
     }
-    static const float mean[] = {0.485f, 0.456f, 0.406f};
-    static const float deviation[] = {0.229f, 0.224f, 0.225f};
-    for (int output_frame = 0; output_frame < frame_count; output_frame++) {
-        int frame = first_frame + output_frame;
-        int decoded_t = frame + FRAME_OFFSET;
-        if (vae->output_frames == FIRST_CHUNK_FRAMES && frame >= 17)
-            decoded_t += 3;
-        int patch_t = decoded_t / 4;
-        int within_t = decoded_t % 4;
-        for (int y = 0; y < pixel_h; y++) {
-            int patch_y = y / 16, within_y = y % 16;
-            for (int x = 0; x < pixel_w; x++) {
-                int patch_x = x / 16, within_x = x % 16;
-                size_t patch = ((size_t)patch_t * (size_t)vae->latent_h +
-                    (size_t)patch_y) * (size_t)vae->latent_w +
-                    (size_t)patch_x;
-                for (int channel = 0; channel < 3; channel++) {
-                    size_t component = ((((size_t)channel * 4 +
-                        (size_t)within_t) * 16 + (size_t)within_y) * 16 +
-                        (size_t)within_x);
-                    float value = rows[patch * OUTPUT_PATCH + component] *
-                                  deviation[channel] + mean[channel];
-                    if (value < 0.0f) value = 0.0f;
-                    if (value > 1.0f) value = 1.0f;
-                    size_t destination = (((size_t)output_frame *
-                        (size_t)pixel_h +
-                        (size_t)y) * (size_t)pixel_w + (size_t)x) * 3 +
-                        (size_t)channel;
-                    rgb[destination] = value;
-                }
-            }
-        }
-    }
+    unpack_ctx job = {rows, rgb, first_frame, vae->output_frames,
+                      pixel_h, pixel_w, vae->latent_h, vae->latent_w};
+    vae_parallel_frames(&job, unpack_one_frame, frame_count);
     free(rows);
     output->frames = frame_count;
     output->height = pixel_h;
@@ -758,6 +830,68 @@ static float *extract_latent_tile(const float *latent, int full_t,
     return tile;
 }
 
+typedef struct {
+    float **tiles;
+    const tile_axis *y_axis, *x_axis;
+    float *rgb;
+    int full_h, full_w;
+} stitch_ctx;
+
+static void stitch_one_frame(void *opaque, int frame) {
+    const stitch_ctx *job = (const stitch_ctx *)opaque;
+    const tile_axis *y_axis = job->y_axis, *x_axis = job->x_axis;
+    for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
+        for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
+            int index = tile_y * x_axis->count + tile_x;
+            const float *current = job->tiles[index];
+            const float *above = tile_y ? job->tiles[index - x_axis->count]
+                                        : NULL;
+            const float *left = tile_x ? job->tiles[index - 1] : NULL;
+            int overlap_y = tile_y ? y_axis->overlaps[tile_y - 1] : 0;
+            int overlap_x = tile_x ? x_axis->overlaps[tile_x - 1] : 0;
+            int keep_h = y_axis->length -
+                (tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0);
+            int keep_w = x_axis->length -
+                (tile_x + 1 < x_axis->count ? x_axis->overlaps[tile_x] : 0);
+            for (int y = 0; y < keep_h; y++)
+                for (int x = 0; x < keep_w; x++)
+                    for (int channel = 0; channel < 3; channel++) {
+                        size_t local = (((size_t)frame *
+                            (size_t)y_axis->length + (size_t)y) *
+                            (size_t)x_axis->length + (size_t)x) * 3 +
+                            (size_t)channel;
+                        float value = current[local];
+                        if (above && y < overlap_y) {
+                            size_t top = (((size_t)frame *
+                                (size_t)y_axis->length +
+                                (size_t)(y_axis->length - overlap_y + y)) *
+                                (size_t)x_axis->length + (size_t)x) * 3 +
+                                (size_t)channel;
+                            float alpha = (float)y / (float)overlap_y;
+                            value = above[top] * (1.0f - alpha) +
+                                    value * alpha;
+                        }
+                        if (left && x < overlap_x) {
+                            size_t prior = (((size_t)frame *
+                                (size_t)y_axis->length + (size_t)y) *
+                                (size_t)x_axis->length +
+                                (size_t)(x_axis->length - overlap_x + x)) *
+                                3 + (size_t)channel;
+                            float alpha = (float)x / (float)overlap_x;
+                            value = left[prior] * (1.0f - alpha) +
+                                    value * alpha;
+                        }
+                        size_t destination = (((size_t)frame *
+                            (size_t)job->full_h +
+                            (size_t)(y_axis->starts[tile_y] + y)) *
+                            (size_t)job->full_w +
+                            (size_t)(x_axis->starts[tile_x] + x)) * 3 +
+                            (size_t)channel;
+                        job->rgb[destination] = value;
+                    }
+        }
+}
+
 static int stitch_tiles(float **tiles, const tile_axis *y_axis,
                         const tile_axis *x_axis, int frame_count,
                         h3_video_frames *output,
@@ -771,56 +905,8 @@ static int stitch_tiles(float **tiles, const tile_axis *y_axis,
         fail(error, error_size, "out of memory stitching video VAE tiles");
         return 0;
     }
-    for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
-        for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
-            int index = tile_y * x_axis->count + tile_x;
-            const float *current = tiles[index];
-            const float *above = tile_y ? tiles[index - x_axis->count] : NULL;
-            const float *left = tile_x ? tiles[index - 1] : NULL;
-            int overlap_y = tile_y ? y_axis->overlaps[tile_y - 1] : 0;
-            int overlap_x = tile_x ? x_axis->overlaps[tile_x - 1] : 0;
-            int keep_h = y_axis->length -
-                (tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0);
-            int keep_w = x_axis->length -
-                (tile_x + 1 < x_axis->count ? x_axis->overlaps[tile_x] : 0);
-            for (int frame = 0; frame < frame_count; frame++)
-                for (int y = 0; y < keep_h; y++)
-                    for (int x = 0; x < keep_w; x++)
-                        for (int channel = 0; channel < 3; channel++) {
-                            size_t local = (((size_t)frame *
-                                (size_t)y_axis->length + (size_t)y) *
-                                (size_t)x_axis->length + (size_t)x) * 3 +
-                                (size_t)channel;
-                            float value = current[local];
-                            if (above && y < overlap_y) {
-                                size_t top = (((size_t)frame *
-                                    (size_t)y_axis->length +
-                                    (size_t)(y_axis->length - overlap_y + y)) *
-                                    (size_t)x_axis->length + (size_t)x) * 3 +
-                                    (size_t)channel;
-                                float alpha = (float)y / (float)overlap_y;
-                                value = above[top] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            if (left && x < overlap_x) {
-                                size_t prior = (((size_t)frame *
-                                    (size_t)y_axis->length + (size_t)y) *
-                                    (size_t)x_axis->length +
-                                    (size_t)(x_axis->length - overlap_x + x)) *
-                                    3 + (size_t)channel;
-                                float alpha = (float)x / (float)overlap_x;
-                                value = left[prior] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            size_t destination = (((size_t)frame *
-                                (size_t)full_h +
-                                (size_t)(y_axis->starts[tile_y] + y)) *
-                                (size_t)full_w +
-                                (size_t)(x_axis->starts[tile_x] + x)) * 3 +
-                                (size_t)channel;
-                            rgb[destination] = value;
-                        }
-        }
+    stitch_ctx job = {tiles, y_axis, x_axis, rgb, full_h, full_w};
+    vae_parallel_frames(&job, stitch_one_frame, frame_count);
     output->frames = frame_count;
     output->height = full_h;
     output->width = full_w;
