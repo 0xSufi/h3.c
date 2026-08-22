@@ -641,6 +641,46 @@ static void run_suite(h3_gpu *gpu) {
         free(ref); free(refh); free(got); free(goth);
     }
 
+    /* ---- 6c. SDPA f32 at head_dim 64 (FA2 route through bf16) ----
+     * On sm_80+ h3_cuda_sdpa routes non-causal f32 SDPA at head_dim 64/128
+     * through the bf16 FA2 kernel (the video VAE decoder's attention shape),
+     * rounding Q/K/V to bf16 in the workspace and widening the result;
+     * H3_CUDA_SDPA_F32_EXACT=1 keeps the f32 kernels. The inputs here are
+     * bf16-representable, so the f32 reference sees the same values and the
+     * check holds the route to the bf16 output rounding (abs 1e-2); in the
+     * naive pass the exact f32 kernel runs and 1e-5 applies. seq 130 crosses
+     * the 128-row Q tile and the 64-row KV tile. */
+    {
+        const uint32_t sseq = 130, sh = 3, shd = 64;
+        const size_t sc = (size_t)sseq * sh * shd;
+        float scale = 0.125f;
+        uint16_t *q = bf16_buf(sc), *k = bf16_buf(sc), *v = bf16_buf(sc);
+        float *qf = bf16_as_f32(q, sc), *kf = bf16_as_f32(k, sc),
+              *vf = bf16_as_f32(v, sc);
+        h3_gpu_tensor *tq = h3_gpu_tensor_from_f32(gpu, qf, sc);
+        h3_gpu_tensor *tk = h3_gpu_tensor_from_f32(gpu, kf, sc);
+        h3_gpu_tensor *tv = h3_gpu_tensor_from_f32(gpu, vf, sc);
+        h3_gpu_tensor *to = h3_gpu_tensor_new_f32(gpu, sc);
+        h3_gpu_stats before, after;
+        h3_gpu_get_stats(gpu, &before);
+        CHECK(h3_gpu_begin(gpu), "begin");
+        CHECK(h3_gpu_sdpa_f32(gpu, to, tq, tk, tv, sseq, sh, shd, scale),
+              "sdpa_f32 hd64 call");
+        CHECK(h3_gpu_submit(gpu), "submit");
+        h3_gpu_get_stats(gpu, &after);
+        CHECK(after.mps_sdpa_dispatches == before.mps_sdpa_dispatches + 1,
+              "hd64 f32 sdpa must bump mps_sdpa_dispatches once");
+        float *ref = malloc(sc * 4), *got = malloc(sc * 4);
+        ref_sdpa(qf, kf, vf, ref, 1, sseq, sh, shd, scale, 0, 0);
+        h3_gpu_tensor_read_f32(to, got, sc);
+        check_f32("sdpa_f32_hd64", got, ref, sc,
+                  sdpa_naive_mode ? 1e-5f : 1e-2f);
+        h3_gpu_tensor *all[] = {tq, tk, tv, to};
+        for (int i = 0; i < 4; i++) h3_gpu_tensor_free(all[i]);
+        free(q); free(k); free(v); free(qf); free(kf); free(vf);
+        free(ref); free(got);
+    }
+
     /* ---- 7. h3_gpu_gqa_causal_bf16 ---- */
     {
         const uint32_t gseq = 6, qh = 4, kvh = 2, ghd = 8;

@@ -1418,13 +1418,17 @@ static int h3_attn_has_bf16_mma(struct h3_gpu *gpu) {
 #define H3_FA2_THREADS 256
 #define H3_FA2_QROWS 128
 #define H3_FA2_KVT 64
-#define H3_FA2_HD 128
-#define H3_FA2_LD 136
 #define H3_FA2_STAGES 2
-#define H3_FA2_STAGE_ELEMS (2 * H3_FA2_KVT * H3_FA2_LD)
+/* Row pitch in bf16: head_dim + 8 (16 bytes) of padding keeps the
+ * ldmatrix phases on distinct banks (an odd number of 16-byte units). */
+#define H3_FA2_LD(hd) ((hd) + 8)
+#define H3_FA2_STAGE_ELEMS(hd) (2 * H3_FA2_KVT * H3_FA2_LD(hd))
 
-static size_t h3_fa2_shared(void) {
-    return (size_t)H3_FA2_STAGES * H3_FA2_STAGE_ELEMS * sizeof(uint16_t);
+/* Dynamic shared memory for one launch: HD 128 -> 68 KiB (needs the >48KB
+ * opt-in, one block per SM), HD 64 -> 36 KiB (two blocks per SM). */
+static size_t h3_fa2_shared(uint32_t head_dim) {
+    return (size_t)H3_FA2_STAGES * H3_FA2_STAGE_ELEMS(head_dim) *
+           sizeof(uint16_t);
 }
 
 #if __CUDA_ARCH__ >= 800
@@ -1439,58 +1443,62 @@ __device__ __forceinline__ void h3_cp_async_wait(void) {
 /* Stage K/V tile `tile` into `stage`: 2 x 64 rows x 16 chunks of 16 bytes,
  * eight cp.async per thread; rows past the sequence zero-fill (src-size 0)
  * and read from row 0 so the address stays valid. */
+template <int HD>
 __device__ __forceinline__ void h3_fa2_issue(uint16_t *smem,
                                              const uint16_t *k_src,
                                              const uint16_t *v_src,
                                              size_t row_stride,
                                              uint32_t sequence, uint32_t tile,
                                              uint32_t stage, uint32_t tid) {
-    uint16_t *ks = smem + stage * H3_FA2_STAGE_ELEMS;
-    uint16_t *vs = ks + H3_FA2_KVT * H3_FA2_LD;
+    constexpr int LD = H3_FA2_LD(HD);
+    constexpr int CHUNKS = HD / 8; /* 16-byte chunks per row */
+    uint16_t *ks = smem + stage * H3_FA2_STAGE_ELEMS(HD);
+    uint16_t *vs = ks + H3_FA2_KVT * LD;
     uint32_t kb = tile * H3_FA2_KVT;
 #pragma unroll
-    for (uint32_t i = 0; i < (H3_FA2_KVT * (H3_FA2_HD / 8)) / H3_FA2_THREADS;
-         i++) {
+    for (uint32_t i = 0; i < (H3_FA2_KVT * CHUNKS) / H3_FA2_THREADS; i++) {
         uint32_t c = tid + i * H3_FA2_THREADS;
-        uint32_t j = c >> 4, d = (c & 15) * 8;
+        uint32_t j = c / CHUNKS, d = (c % CHUNKS) * 8;
         uint32_t row = kb + j;
         int live = row < sequence;
         size_t off = (size_t)(live ? row : 0u) * row_stride + d;
-        h3_cp_async_16(ks + j * H3_FA2_LD + d, k_src + off, live ? 16 : 0);
-        h3_cp_async_16(vs + j * H3_FA2_LD + d, v_src + off, live ? 16 : 0);
+        h3_cp_async_16(ks + j * LD + d, k_src + off, live ? 16 : 0);
+        h3_cp_async_16(vs + j * LD + d, v_src + off, live ? 16 : 0);
     }
 }
 #endif
 
-template <int HEAD_MAJOR>
-__global__ void __launch_bounds__(H3_FA2_THREADS, 1)
+template <int HEAD_MAJOR, int HD>
+__global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
     h3k_sdpa_fa2_bf16(const uint16_t *__restrict__ query,
                       const uint16_t *__restrict__ key,
                       const uint16_t *__restrict__ value,
                       uint16_t *__restrict__ output, uint32_t sequence,
                       uint32_t heads, float scale) {
 #if __CUDA_ARCH__ >= 800
+    constexpr int LD = H3_FA2_LD(HD);
+    constexpr int STAGE = H3_FA2_STAGE_ELEMS(HD);
     extern __shared__ __align__(16) uint16_t h3_fa2_smem[];
     const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t head = blockIdx.y;
     const uint32_t q0 = blockIdx.x * H3_FA2_QROWS;
-    const size_t row_stride = (size_t)heads * H3_FA2_HD;
+    const size_t row_stride = (size_t)heads * HD;
     const size_t batch_off = (size_t)blockIdx.z * sequence * row_stride;
-    const size_t head_off = (size_t)head * H3_FA2_HD;
+    const size_t head_off = (size_t)head * HD;
     const uint32_t a_row = lane >> 2, a_col = (lane & 3) * 2;
 
     /* Q A-fragments for this thread's two rows, all eight k-steps, loaded
      * once. Rows past the sequence read zeros. */
     const uint32_t r0 = q0 + warp * 16 + a_row, r1 = r0 + 8;
     const int ok0 = r0 < sequence, ok1 = r1 < sequence;
-    uint32_t qf[H3_FA2_HD / 16][4];
+    uint32_t qf[HD / 16][4];
     {
         const uint16_t *p0 = query + batch_off + head_off +
                              (size_t)(ok0 ? r0 : 0u) * row_stride;
         const uint16_t *p1 = query + batch_off + head_off +
                              (size_t)(ok1 ? r1 : 0u) * row_stride;
 #pragma unroll
-        for (int ks = 0; ks < H3_FA2_HD / 16; ks++) {
+        for (int ks = 0; ks < HD / 16; ks++) {
             uint32_t c = (uint32_t)ks * 16 + a_col;
             qf[ks][0] = ok0 ? *(const uint32_t *)(p0 + c) : 0u;
             qf[ks][1] = ok1 ? *(const uint32_t *)(p1 + c) : 0u;
@@ -1499,9 +1507,9 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
         }
     }
 
-    float o_acc[H3_FA2_HD / 8][4];
+    float o_acc[HD / 8][4];
 #pragma unroll
-    for (int t = 0; t < H3_FA2_HD / 8; t++)
+    for (int t = 0; t < HD / 8; t++)
 #pragma unroll
         for (int k = 0; k < 4; k++) o_acc[t][k] = 0.0f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
@@ -1511,19 +1519,20 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
     const uint16_t *v_src = value + batch_off + head_off;
     const uint32_t tiles = (sequence + H3_FA2_KVT - 1) / H3_FA2_KVT;
 
-    h3_fa2_issue(h3_fa2_smem, k_src, v_src, row_stride, sequence, 0, 0, tid);
+    h3_fa2_issue<HD>(h3_fa2_smem, k_src, v_src, row_stride, sequence, 0, 0,
+                     tid);
     h3_cp_async_commit();
 
     for (uint32_t t = 0; t < tiles; t++) {
         const uint32_t stage = t & 1u;
         if (t + 1 < tiles)
-            h3_fa2_issue(h3_fa2_smem, k_src, v_src, row_stride, sequence,
-                         t + 1, stage ^ 1u, tid);
+            h3_fa2_issue<HD>(h3_fa2_smem, k_src, v_src, row_stride,
+                             sequence, t + 1, stage ^ 1u, tid);
         h3_cp_async_commit(); /* always commit so wait_group<1> is uniform */
         h3_cp_async_wait<1>();
         __syncthreads();
-        const uint16_t *k_tile = h3_fa2_smem + stage * H3_FA2_STAGE_ELEMS;
-        const uint16_t *v_tile = k_tile + H3_FA2_KVT * H3_FA2_LD;
+        const uint16_t *k_tile = h3_fa2_smem + stage * STAGE;
+        const uint16_t *v_tile = k_tile + H3_FA2_KVT * LD;
 
         /* S = Q K^T: eight key n-tiles, eight k-steps over the 128 dims. One
          * ldmatrix.x4 per (n-tile pair, k-step) gives both B fragments. */
@@ -1536,10 +1545,10 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
         for (int p = 0; p < H3_FA2_KVT / 16; p++) {
             const uint16_t *kp = k_tile +
                                  (p * 16 + (lane & 7) + ((lane & 16) ? 8 : 0)) *
-                                     H3_FA2_LD +
+                                     LD +
                                  ((lane & 8) ? 8 : 0);
 #pragma unroll
-            for (int ks = 0; ks < H3_FA2_HD / 16; ks++) {
+            for (int ks = 0; ks < HD / 16; ks++) {
                 uint32_t b[4];
                 h3_ldmatrix_x4(b, kp + ks * 16);
                 h3_mma_bf16_16x8x16(s[2 * p], qf[ks][0], qf[ks][1], qf[ks][2],
@@ -1597,7 +1606,7 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
         m0 = mn0;
         m1 = mn1;
 #pragma unroll
-        for (int d = 0; d < H3_FA2_HD / 8; d++) {
+        for (int d = 0; d < HD / 8; d++) {
             o_acc[d][0] *= c0;
             o_acc[d][1] *= c0;
             o_acc[d][2] *= c1;
@@ -1615,10 +1624,10 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
             uint32_t a3 = h3_pack_bf16(s[2 * ks + 1][2], s[2 * ks + 1][3]);
             const uint16_t *vp = v_tile +
                                  ((lane & 7) + ((lane & 8) ? 8 : 0) + ks * 16) *
-                                     H3_FA2_LD +
+                                     LD +
                                  ((lane & 16) ? 8 : 0);
 #pragma unroll
-            for (int dp = 0; dp < H3_FA2_HD / 16; dp++) {
+            for (int dp = 0; dp < HD / 16; dp++) {
                 uint32_t b[4];
                 h3_ldmatrix_x4_trans(b, vp + dp * 16);
                 h3_mma_bf16_16x8x16(o_acc[2 * dp], a0, a1, a2, a3, b[0], b[1]);
@@ -1633,20 +1642,20 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
     if (ok0) {
         float inv = 1.0f / l0;
         size_t base = HEAD_MAJOR
-                          ? batch_off + ((size_t)head * sequence + r0) * H3_FA2_HD
+                          ? batch_off + ((size_t)head * sequence + r0) * HD
                           : batch_off + (size_t)r0 * row_stride + head_off;
 #pragma unroll
-        for (int d = 0; d < H3_FA2_HD / 8; d++)
+        for (int d = 0; d < HD / 8; d++)
             *(uint32_t *)(output + base + d * 8 + a_col) =
                 h3_pack_bf16(o_acc[d][0] * inv, o_acc[d][1] * inv);
     }
     if (ok1) {
         float inv = 1.0f / l1;
         size_t base = HEAD_MAJOR
-                          ? batch_off + ((size_t)head * sequence + r1) * H3_FA2_HD
+                          ? batch_off + ((size_t)head * sequence + r1) * HD
                           : batch_off + (size_t)r1 * row_stride + head_off;
 #pragma unroll
-        for (int d = 0; d < H3_FA2_HD / 8; d++)
+        for (int d = 0; d < HD / 8; d++)
             *(uint32_t *)(output + base + d * 8 + a_col) =
                 h3_pack_bf16(o_acc[d][2] * inv, o_acc[d][3] * inv);
     }
@@ -1654,13 +1663,14 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, 1)
 }
 
 /* One-time >48KB dynamic shared-memory opt-in per instantiation. */
-template <int HEAD_MAJOR>
+template <int HEAD_MAJOR, int HD>
 static int h3_fa2_attr(void) {
     static int state = 0; /* 0 unknown, 1 ok, -1 failed */
     if (!state)
-        state = cudaFuncSetAttribute((const void *)h3k_sdpa_fa2_bf16<HEAD_MAJOR>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     (int)h3_fa2_shared()) == cudaSuccess
+        state = cudaFuncSetAttribute(
+                    (const void *)h3k_sdpa_fa2_bf16<HEAD_MAJOR, HD>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)h3_fa2_shared(HD)) == cudaSuccess
                     ? 1
                     : -1;
     return state > 0;
@@ -1673,13 +1683,62 @@ static int h3_cuda_sdpa_fa2_enabled(void) {
     return !(value && *value && strcmp(value, "0") == 0);
 }
 
-static int h3_fa2_fits(struct h3_gpu *gpu, int head_major) {
+static int h3_fa2_fits(struct h3_gpu *gpu, int head_major, uint32_t head_dim) {
     int optin = 0;
-    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+    if ((head_dim != 64 && head_dim != 128) ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                gpu->device) != cudaSuccess ||
-        (size_t)optin < h3_fa2_shared())
+        (size_t)optin < h3_fa2_shared(head_dim))
         return 0;
-    return head_major ? h3_fa2_attr<1>() : h3_fa2_attr<0>();
+    if (head_dim == 64)
+        return head_major ? h3_fa2_attr<1, 64>() : h3_fa2_attr<0, 64>();
+    return head_major ? h3_fa2_attr<1, 128>() : h3_fa2_attr<0, 128>();
+}
+
+/* Launch the FA2 kernel for a validated (bf16, non-causal, hd 64/128)
+ * problem. */
+static void h3_fa2_launch(const uint16_t *query, const uint16_t *key,
+                          const uint16_t *value, uint16_t *output,
+                          uint32_t batch, uint32_t sequence, uint32_t heads,
+                          uint32_t head_dim, float scale, int head_major) {
+    dim3 grid((sequence + H3_FA2_QROWS - 1) / H3_FA2_QROWS, heads, batch);
+    size_t shared = h3_fa2_shared(head_dim);
+#define H3_FA2_GO(HM, HD)                                                  \
+    h3k_sdpa_fa2_bf16<HM, HD><<<grid, H3_FA2_THREADS, shared>>>(           \
+        query, key, value, output, sequence, heads, scale)
+    if (head_dim == 64) {
+        if (head_major) H3_FA2_GO(1, 64); else H3_FA2_GO(0, 64);
+    } else {
+        if (head_major) H3_FA2_GO(1, 128); else H3_FA2_GO(0, 128);
+    }
+#undef H3_FA2_GO
+}
+
+/* f32 SDPA through the bf16 FA2 kernel: Q/K/V are rounded to bf16 into the
+ * workspace, the kernel runs, and the bf16 result widens back to f32. This
+ * is the video VAE decoder's attention (hd 64, ~2k rows per tile): the
+ * scalar f32 flash kernel ran it at ~2 TFLOPS. H3_CUDA_SDPA_F32_EXACT=1
+ * keeps the exact f32 kernels. */
+__global__ void h3k_fa2_cast_f32_to_bf16(const float *__restrict__ in,
+                                         uint16_t *__restrict__ out,
+                                         size_t count) {
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += stride)
+        out[i] = h3_f32_to_bf16(in[i]);
+}
+__global__ void h3k_fa2_cast_bf16_to_f32(const uint16_t *__restrict__ in,
+                                         float *__restrict__ out,
+                                         size_t count) {
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += stride)
+        out[i] = h3_bf16_to_f32(in[i]);
+}
+
+static int h3_cuda_sdpa_f32_exact(void) {
+    const char *value = getenv("H3_CUDA_SDPA_F32_EXACT");
+    return value && *value && strcmp(value, "0") != 0;
 }
 
 /* ----------------------------------------------------------- audio kernels */
@@ -2055,21 +2114,40 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
         return h3_cuda_fail(gpu, "SDPA sequence exceeds shared memory");
     /* FA2-class tensor-core path: bf16, head_dim == 128, non-causal,
      * sm_80+, >48KB smem opt-in available. */
-    if (!naive && bf16 && !causal && head_dim == 128 &&
-        h3_attn_has_bf16_mma(gpu) && h3_cuda_sdpa_fa2_enabled() &&
-        h3_fa2_fits(gpu, head_major_output)) {
-        dim3 grid((sequence + H3_FA2_QROWS - 1) / H3_FA2_QROWS, heads, batch);
-        if (head_major_output)
-            h3k_sdpa_fa2_bf16<1><<<grid, H3_FA2_THREADS, h3_fa2_shared()>>>(
-                (const uint16_t *)query->data, (const uint16_t *)key->data,
-                (const uint16_t *)value->data, (uint16_t *)output->data,
-                sequence, heads, scale);
-        else
-            h3k_sdpa_fa2_bf16<0><<<grid, H3_FA2_THREADS, h3_fa2_shared()>>>(
-                (const uint16_t *)query->data, (const uint16_t *)key->data,
-                (const uint16_t *)value->data, (uint16_t *)output->data,
-                sequence, heads, scale);
+    if (!naive && bf16 && !causal && h3_attn_has_bf16_mma(gpu) &&
+        h3_cuda_sdpa_fa2_enabled() &&
+        h3_fa2_fits(gpu, head_major_output, head_dim)) {
+        h3_fa2_launch((const uint16_t *)query->data,
+                      (const uint16_t *)key->data,
+                      (const uint16_t *)value->data, (uint16_t *)output->data,
+                      batch, sequence, heads, head_dim, scale,
+                      head_major_output);
         return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
+    }
+    /* f32 through the bf16 FA2 kernel (see h3k_fa2_cast_*). */
+    if (!naive && !bf16 && !causal && !head_major_output &&
+        h3_attn_has_bf16_mma(gpu) && h3_cuda_sdpa_fa2_enabled() &&
+        !h3_cuda_sdpa_f32_exact() && h3_fa2_fits(gpu, 0, head_dim)) {
+        size_t bytes = count * sizeof(uint16_t);
+        uint16_t *ws = (uint16_t *)h3_cuda_workspace(gpu, 4 * bytes);
+        if (ws) {
+            uint16_t *q16 = ws, *k16 = ws + count, *v16 = ws + 2 * count,
+                     *o16 = ws + 3 * count;
+            unsigned blocks = (unsigned)((count + 255) / 256);
+            if (blocks > 4096u) blocks = 4096u;
+            h3k_fa2_cast_f32_to_bf16<<<blocks, 256>>>(
+                (const float *)query->data, q16, count);
+            h3k_fa2_cast_f32_to_bf16<<<blocks, 256>>>(
+                (const float *)key->data, k16, count);
+            h3k_fa2_cast_f32_to_bf16<<<blocks, 256>>>(
+                (const float *)value->data, v16, count);
+            h3_fa2_launch(q16, k16, v16, o16, batch, sequence, heads, head_dim,
+                          scale, 0);
+            h3k_fa2_cast_bf16_to_f32<<<blocks, 256>>>(
+                o16, (float *)output->data, count);
+            return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
+        }
+        (void)cudaGetLastError(); /* workspace unavailable: exact path */
     }
     /* Tensor-core path: bf16, head_dim == 128, non-causal, sm_80+. */
     if (!naive && bf16 && !causal && head_dim == 128 &&
