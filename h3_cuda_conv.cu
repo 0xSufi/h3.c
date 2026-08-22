@@ -108,6 +108,39 @@ __global__ void h3k_conv_transpose1d_f32(const float *input,
 
 /* NDHWC channels-last activations, OIDHW weights, per-axis strides, no
  * padding and no dilation (matching the MPSGraph descriptor in h3_gpu.m). */
+/* im2col for the GEMM path of Conv3d (valid convolution, no padding): row
+ * (b, ot, oy, ox) holds the receptive field flattened in [ic][kd][kh][kw]
+ * order, matching the weight's [oc][ic][kd][kh][kw] layout read as
+ * [oc][ic*kD*kH*kW]. Input is channel-last [b][d][h][w][ic]. */
+__global__ void h3k_im2col3d_f32(const float *__restrict__ input,
+                                 float *__restrict__ columns, uint32_t batch,
+                                 uint32_t depth, uint32_t height,
+                                 uint32_t width, uint32_t channels,
+                                 uint32_t kd, uint32_t kh, uint32_t kw,
+                                 uint32_t sd, uint32_t sh, uint32_t sw,
+                                 uint32_t out_d, uint32_t out_h,
+                                 uint32_t out_w) {
+    size_t taps = (size_t)channels * kd * kh * kw;
+    size_t rows = (size_t)batch * out_d * out_h * out_w;
+    size_t total = rows * taps;
+    size_t step = (size_t)gridDim.x * blockDim.x;
+    for (size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x; g < total;
+         g += step) {
+        size_t tap = g % taps;
+        size_t row = g / taps;
+        uint32_t ic = (uint32_t)(tap / ((size_t)kd * kh * kw));
+        uint32_t rem = (uint32_t)(tap % ((size_t)kd * kh * kw));
+        uint32_t td = rem / (kh * kw), th = (rem / kw) % kh, tw = rem % kw;
+        uint32_t ox = (uint32_t)(row % out_w);
+        uint32_t oy = (uint32_t)((row / out_w) % out_h);
+        uint32_t ot = (uint32_t)((row / ((size_t)out_w * out_h)) % out_d);
+        uint32_t b = (uint32_t)(row / ((size_t)out_d * out_h * out_w));
+        uint32_t sz = ot * sd + td, sy = oy * sh + th, sx = ox * sw + tw;
+        columns[g] = input[((((size_t)b * depth + sz) * height + sy) * width +
+                            sx) * channels + ic];
+    }
+}
+
 __global__ void h3k_conv3d_f32(const float *input, const float *weight,
                                const float *bias, float *output,
                                uint32_t batch, uint32_t depth, uint32_t height,
@@ -468,6 +501,36 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                   !h3_cuda_require_dtype(gpu, bias, H3_GPU_F32,
                                          "Conv3d bias"))) ||
         !h3_cuda_require_command(gpu)) return 0;
+    /* GEMM path: im2col into the workspace, then the cuBLASLt projection
+     * (F32, TF32 when the reduction is long enough). The video VAE encoder's
+     * conv3d ran ~217 s per conditioning frame on the per-output kernel; the
+     * column matrix is capped at 8 GiB so an extreme shape stays on it. */
+    size_t rows = (size_t)batch * output_depth * output_height * output_width;
+    size_t taps = (size_t)input_channels * kernel_depth * kernel_height *
+                  kernel_width;
+    if (gpu->lt && !gpu->no_cublas && rows && taps &&
+        taps <= UINT32_MAX && rows * taps / taps == rows &&
+        rows * taps <= ((size_t)8 << 30) / sizeof(float)) {
+        float *columns = (float *)h3_cuda_workspace(gpu,
+            rows * taps * sizeof(float));
+        if (columns) {
+            size_t total = rows * taps;
+            unsigned blocks = (unsigned)((total + 255) / 256);
+            if (blocks > 65535u) blocks = 65535u;
+            h3k_im2col3d_f32<<<blocks, 256>>>(
+                (const float *)input->data, columns, batch, depth, height,
+                width, input_channels, kernel_depth, kernel_height,
+                kernel_width, stride_depth, stride_height, stride_width,
+                output_depth, output_height, output_width);
+            if (cudaGetLastError() == cudaSuccess &&
+                h3_cuda_gemm_xwt(gpu, columns, weight->data,
+                                 bias ? bias->data : NULL, output->data,
+                                 CUDA_R_32F, CUDA_R_32F, (uint32_t)rows,
+                                 (uint32_t)taps, output_channels))
+                return h3_cuda_launch_check_kind(gpu, "h3_conv3d_f32", 2);
+            (void)cudaGetLastError();
+        }
+    }
     h3k_conv3d_f32<<<h3_conv_grid_1d(output_count), 256>>>(
         (const float *)input->data, (const float *)weight->data,
         bias ? (const float *)bias->data : NULL, (float *)output->data,
