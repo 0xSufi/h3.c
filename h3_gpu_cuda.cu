@@ -334,6 +334,11 @@ int h3_gpu_is_m5(const h3_gpu *gpu) {
     return 0;
 }
 
+int h3_gpu_prefers_gpu_sampler(const h3_gpu *gpu) {
+    (void)gpu;
+    return 1;
+}
+
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu) {
     (void)gpu;
     return 0;

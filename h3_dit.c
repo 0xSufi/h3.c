@@ -2581,7 +2581,7 @@ static int gpu_sampler_requested(const h3_dit *dit) {
     if (cpu && *cpu && strcmp(cpu, "0")) return 0;
     const char *value = getenv("H3_GPU_SAMPLER");
     if (value) return *value && strcmp(value, "0");
-    return h3_gpu_is_m5(dit->gpu);
+    return h3_gpu_prefers_gpu_sampler(dit->gpu);
 }
 
 static unsigned gpu_sampler_window(void) {

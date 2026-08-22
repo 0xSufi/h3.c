@@ -38,6 +38,9 @@ void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+/* Backend prefers the device-resident Euler sampler by default (avoids the
+ * per-step host latent round-trip). M5 Metal and CUDA return 1. */
+int h3_gpu_prefers_gpu_sampler(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);

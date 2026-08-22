@@ -534,6 +534,10 @@ int h3_gpu_is_m5(const h3_gpu *opaque) {
     return [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
 }
 
+int h3_gpu_prefers_gpu_sampler(const h3_gpu *opaque) {
+    return h3_gpu_is_m5(opaque);
+}
+
 int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
