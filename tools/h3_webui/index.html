@@ -194,7 +194,7 @@ async function refresh() {
     const eta = j.eta ? ` · ~${fmtTime(j.eta)} left` : "";
     const step = j.steps && j.status === "running" ? ` · step ${j.step}/${j.steps}` : "";
     return `<div class="job">
-      <div class="head"><div>${escapeHtml(j.prompt).slice(0, 90)}</div>
+      <div class="head"><div>${escapeHtml(j.prompt)}</div>
         <button class="small" onclick="cancelJob('${j.id}')">cancel</button></div>
       <div class="phase">${j.status === "queued" ? "queued" : j.phase}${step}
         · ${fmtTime(j.elapsed || 0)}${eta}</div>
@@ -207,7 +207,7 @@ async function refresh() {
   if (errors.length && active.length === 0) {
     $("activity").style.display = "";
     $("active").innerHTML = `<div class="job"><div class="head"><div>
-      ${escapeHtml(errors[0].prompt).slice(0, 90)}</div></div>
+      ${escapeHtml(errors[0].prompt)}</div></div>
       <div class="error">${escapeHtml(errors[0].error || "failed")}</div></div>`;
   }
   const signature = done.map(j => j.id).join(",");
