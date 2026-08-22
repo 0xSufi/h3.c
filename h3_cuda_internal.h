@@ -87,6 +87,13 @@ struct h3_gpu {
      * weights, device scales ([H3_CUDA_FP8_WEIGHTS] weight scales followed
      * by the activation scale and its inverse), a grow-only scratch for the
      * quantized activation, and the absmax accumulator. */
+    /* Weight copies are carved from large arena chunks: one cudaMalloc per
+     * few GB instead of one per weight (each cudaMalloc costs up to ~0.2 s
+     * here). Chunks live until the context is freed; forgetting a weight
+     * only invalidates its entry. */
+    void **fp8_arena_chunks;
+    unsigned fp8_arena_count;
+    size_t fp8_arena_used, fp8_arena_capacity; /* current (last) chunk */
     struct h3_cuda_fp8_weight *fp8_weights;
     /* bf16 copies of F32 weights for H3_CUDA_F32_GEMM=bf16 (same entry
      * type; data holds 2 bytes per element). */

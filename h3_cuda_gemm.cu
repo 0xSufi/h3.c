@@ -689,6 +689,38 @@ static int h3_cuda_fp8_quantize(const uint16_t *x, uint8_t *out,
     return cudaGetLastError() == cudaSuccess;
 }
 
+#define H3_CUDA_WEIGHT_ARENA_CHUNK ((size_t)4 << 30)
+
+/* Bump allocation from the weight arena (256-byte aligned). */
+static void *h3_cuda_weight_arena_alloc(struct h3_gpu *gpu, size_t bytes) {
+    bytes = (bytes + 255) & ~(size_t)255;
+    if (!gpu->fp8_arena_count || gpu->fp8_arena_used + bytes >
+                                     gpu->fp8_arena_capacity) {
+        size_t capacity = bytes > H3_CUDA_WEIGHT_ARENA_CHUNK
+                              ? bytes : H3_CUDA_WEIGHT_ARENA_CHUNK;
+        void *chunk = NULL;
+        if (cudaMalloc(&chunk, capacity) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        void **grown = (void **)realloc(
+            gpu->fp8_arena_chunks,
+            (gpu->fp8_arena_count + 1) * sizeof(*grown));
+        if (!grown) {
+            cudaFree(chunk);
+            return NULL;
+        }
+        gpu->fp8_arena_chunks = grown;
+        gpu->fp8_arena_chunks[gpu->fp8_arena_count++] = chunk;
+        gpu->fp8_arena_used = 0;
+        gpu->fp8_arena_capacity = capacity;
+    }
+    void *result = (char *)gpu->fp8_arena_chunks[gpu->fp8_arena_count - 1] +
+                   gpu->fp8_arena_used;
+    gpu->fp8_arena_used += bytes;
+    return result;
+}
+
 static int h3_cuda_fp8_prepare(struct h3_gpu *gpu) {
     if (!gpu->fp8_weights) {
         gpu->fp8_weights = (struct h3_cuda_fp8_weight *)calloc(
@@ -730,25 +762,19 @@ static struct h3_cuda_fp8_weight *h3_cuda_fp8_weight(struct h3_gpu *gpu,
         if (!slot && !entry->valid) { slot = entry; slot_index = i; }
     }
     if (!slot) {
-        /* Cache full: evict round robin. */
+        /* Cache full: evict round robin (arena memory is not reclaimed). */
         static unsigned clock;
         slot_index = (int)(clock++ % H3_CUDA_FP8_WEIGHTS);
         slot = &gpu->fp8_weights[slot_index];
-        if (slot->data) cudaFree(slot->data);
         memset(slot, 0, sizeof(*slot));
     }
-    void *data = NULL;
-    if (cudaMalloc(&data, elements ? elements : 1) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return NULL;
-    }
+    void *data = h3_cuda_weight_arena_alloc(gpu, elements ? elements : 1);
+    if (!data) return NULL;
     float *inverse = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS + 1;
     if (!h3_cuda_fp8_quantize((const uint16_t *)weight, (uint8_t *)data,
                               elements, gpu->fp8_absmax,
-                              gpu->fp8_scales + slot_index, inverse)) {
-        cudaFree(data);
+                              gpu->fp8_scales + slot_index, inverse))
         return NULL;
-    }
     slot->key = weight;
     slot->elements = elements;
     slot->data = data;
@@ -762,17 +788,12 @@ static void h3_cuda_weight_cache_forget(struct h3_cuda_fp8_weight *cache,
     if (!cache) return;
     for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
         struct h3_cuda_fp8_weight *entry = &cache[i];
-        if (entry->valid && entry->key == data) {
-            cudaFree(entry->data);
-            memset(entry, 0, sizeof(*entry));
-        }
+        if (entry->valid && entry->key == data)
+            memset(entry, 0, sizeof(*entry)); /* arena memory stays */
     }
 }
 
 static void h3_cuda_weight_cache_release(struct h3_cuda_fp8_weight **cache) {
-    if (!*cache) return;
-    for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++)
-        if ((*cache)[i].data) cudaFree((*cache)[i].data);
     free(*cache);
     *cache = NULL;
 }
@@ -787,6 +808,12 @@ void h3_cuda_fp8_release(struct h3_gpu *gpu) {
     if (!gpu) return;
     h3_cuda_weight_cache_release(&gpu->fp8_weights);
     h3_cuda_weight_cache_release(&gpu->bf16_weights);
+    for (unsigned i = 0; i < gpu->fp8_arena_count; i++)
+        cudaFree(gpu->fp8_arena_chunks[i]);
+    free(gpu->fp8_arena_chunks);
+    gpu->fp8_arena_chunks = NULL;
+    gpu->fp8_arena_count = 0;
+    gpu->fp8_arena_used = gpu->fp8_arena_capacity = 0;
     if (gpu->fp8_scales) cudaFree(gpu->fp8_scales);
     if (gpu->fp8_scratch) cudaFree(gpu->fp8_scratch);
     if (gpu->fp8_absmax) cudaFree(gpu->fp8_absmax);
@@ -900,23 +927,16 @@ static struct h3_cuda_fp8_weight *h3_cuda_bf16_weight(struct h3_gpu *gpu,
     if (!slot) {
         static unsigned clock;
         slot = &gpu->bf16_weights[clock++ % H3_CUDA_FP8_WEIGHTS];
-        if (slot->data) cudaFree(slot->data);
         memset(slot, 0, sizeof(*slot));
     }
-    void *data = NULL;
-    if (cudaMalloc(&data, elements ? elements * 2 : 2) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return NULL;
-    }
+    void *data = h3_cuda_weight_arena_alloc(gpu, elements ? elements * 2 : 2);
+    if (!data) return NULL;
     unsigned blocks = (unsigned)((elements / 4 + 255) / 256);
     if (!blocks) blocks = 1;
     if (blocks > 4096u) blocks = 4096u;
     h3k_f32_to_bf16_vec<<<blocks, 256>>>((const float *)weight,
                                          (uint16_t *)data, elements);
-    if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(data);
-        return NULL;
-    }
+    if (cudaGetLastError() != cudaSuccess) return NULL;
     slot->key = weight;
     slot->elements = elements;
     slot->data = data;
