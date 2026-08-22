@@ -1,0 +1,67 @@
+{
+ "last_node_id": 1,
+ "last_link_id": 0,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "H3TextToVideo",
+   "pos": [
+    120,
+    120
+   ],
+   "size": [
+    480,
+    420
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "first_frame",
+     "type": "IMAGE",
+     "link": null
+    },
+    {
+     "name": "last_frame",
+     "type": "IMAGE",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "frames",
+     "type": "IMAGE",
+     "links": null
+    },
+    {
+     "name": "video_path",
+     "type": "STRING",
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "H3TextToVideo"
+   },
+   "widgets_values": [
+    "A cat wearing sunglasses rides a skateboard through a neon-lit city at night, cinematic",
+    "fast (fp8 + --layers 45 --reuse 2)",
+    864,
+    480,
+    2,
+    20,
+    42,
+    "randomize",
+    "h3/video",
+    true,
+    "",
+    ""
+   ]
+  }
+ ],
+ "links": [],
+ "groups": [],
+ "config": {},
+ "extra": {},
+ "version": 0.4
+}

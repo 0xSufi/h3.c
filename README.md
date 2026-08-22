@@ -451,6 +451,10 @@ FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate
 uncompressed media file is created.
 
+A ComfyUI custom-node package for the engine lives in `tools/comfyui_h3`
+(prompt and optional first/last-frame conditioning in, MP4 with generated
+audio out, previewed in the graph); see its README for setup.
+
 #### Performance on DGX Spark (GB10)
 
 Measured on a DGX Spark (NVIDIA GB10, sm_121, CUDA 13.0, 128 GB unified
