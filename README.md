@@ -410,6 +410,33 @@ make test
 make parity
 ```
 
+### Linux / CUDA
+
+The engine also builds on Linux with an NVIDIA CUDA backend (nvcc + gcc,
+no Apple frameworks; cuBLASLt for the GEMMs, no cuDNN):
+
+```sh
+make linux      # builds h3 and libh3.a; CUDA_ARCH overrides the sm_XX target
+make test       # host suite + synthetic CUDA op tests + gated suites
+```
+
+The CUDA backend (`h3_gpu_cuda.cu` plus `h3_cuda_core.cu`,
+`h3_cuda_attention.cu`, `h3_cuda_conv.cu`, and `h3_cuda_dit.cu`, with
+`h3_cuda_gemm.cu` wrapping cuBLASLt for the linear layers) implements every
+`h3_gpu.h` entry point with hand-written kernels; the Metal 4 /
+TensorOps int8 and NAX paths are Metal-only and report a clean error on CUDA
+(they are never selected, since the CUDA probe reports no NAX/int8 MLP
+capability). The tokenizer is portable C (`h3_tokenizer.c` with generated
+Unicode tables from `tools/generate_unicode_tables.py`), and frame resizing
+uses a portable bilinear path instead of vImage. All correctness tests run
+without fixtures; the MLX/model-dependent suites skip cleanly when their
+assets are absent, exactly as on macOS.
+
+```sh
+make test
+make parity
+```
+
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
 is installed under `misc/fixtures/`, compiles the Metal source at runtime and
 checks a complete toy H3 block against named MLX outputs. Runtime compilation is
