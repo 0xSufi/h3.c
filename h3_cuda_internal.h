@@ -88,6 +88,9 @@ struct h3_gpu {
      * by the activation scale and its inverse), a grow-only scratch for the
      * quantized activation, and the absmax accumulator. */
     struct h3_cuda_fp8_weight *fp8_weights;
+    /* bf16 copies of F32 weights for H3_CUDA_F32_GEMM=bf16 (same entry
+     * type; data holds 2 bytes per element). */
+    struct h3_cuda_fp8_weight *bf16_weights;
     float *fp8_scales;
     void *fp8_scratch;
     size_t fp8_scratch_bytes;
@@ -199,6 +202,13 @@ int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
 /* Drop the cached FP8 copy of a weight tensor being freed / the whole cache. */
 void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data);
 void h3_cuda_fp8_release(struct h3_gpu *gpu);
+/* F32 projection through a bf16 GEMM (H3_CUDA_F32_GEMM=bf16): x and weight
+ * f32, output f32; the weight's bf16 copy is cached per tensor. Returns 0
+ * when disabled or unservable; callers fall back to the F32/TF32 GEMM. */
+int h3_cuda_gemm_xwt_f32_via_bf16(struct h3_gpu *gpu, const void *x,
+                                  const void *weight, const void *bias,
+                                  void *c, uint32_t rows, uint32_t input_dim,
+                                  uint32_t output_dim);
 
 /* BF16 helpers: raw uint16 storage, exact widening on load and
  * round-to-nearest-even on store, matching h3_shaders.metal. */

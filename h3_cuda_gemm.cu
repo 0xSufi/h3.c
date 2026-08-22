@@ -757,10 +757,11 @@ static struct h3_cuda_fp8_weight *h3_cuda_fp8_weight(struct h3_gpu *gpu,
     return slot;
 }
 
-void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data) {
-    if (!gpu || !gpu->fp8_weights || !data) return;
+static void h3_cuda_weight_cache_forget(struct h3_cuda_fp8_weight *cache,
+                                        const void *data) {
+    if (!cache) return;
     for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
-        struct h3_cuda_fp8_weight *entry = &gpu->fp8_weights[i];
+        struct h3_cuda_fp8_weight *entry = &cache[i];
         if (entry->valid && entry->key == data) {
             cudaFree(entry->data);
             memset(entry, 0, sizeof(*entry));
@@ -768,14 +769,24 @@ void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data) {
     }
 }
 
+static void h3_cuda_weight_cache_release(struct h3_cuda_fp8_weight **cache) {
+    if (!*cache) return;
+    for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++)
+        if ((*cache)[i].data) cudaFree((*cache)[i].data);
+    free(*cache);
+    *cache = NULL;
+}
+
+void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data) {
+    if (!gpu || !data) return;
+    h3_cuda_weight_cache_forget(gpu->fp8_weights, data);
+    h3_cuda_weight_cache_forget(gpu->bf16_weights, data);
+}
+
 void h3_cuda_fp8_release(struct h3_gpu *gpu) {
     if (!gpu) return;
-    if (gpu->fp8_weights) {
-        for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++)
-            if (gpu->fp8_weights[i].data) cudaFree(gpu->fp8_weights[i].data);
-        free(gpu->fp8_weights);
-        gpu->fp8_weights = NULL;
-    }
+    h3_cuda_weight_cache_release(&gpu->fp8_weights);
+    h3_cuda_weight_cache_release(&gpu->bf16_weights);
     if (gpu->fp8_scales) cudaFree(gpu->fp8_scales);
     if (gpu->fp8_scratch) cudaFree(gpu->fp8_scratch);
     if (gpu->fp8_absmax) cudaFree(gpu->fp8_absmax);
@@ -836,4 +847,104 @@ int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
                                              (const uint16_t *)bias, rows,
                                              output_dim);
     return cudaGetLastError() == cudaSuccess;
+}
+
+/* ------------------------------------------ F32 projections through bf16 */
+
+/* H3_CUDA_F32_GEMM=bf16: the video VAE decoder's F32 projections (K and N
+ * >= 1024, rows >= 256) run as bf16 tensor-core GEMMs with F32 output: the
+ * weight's bf16 copy is cached per tensor (dropped when the tensor is
+ * freed), the activation is cast per call into the workspace. bf16 inputs
+ * (8-bit mantissa) are coarser than TF32 (10-bit) but the GEMMs run at the
+ * bf16 rate (~2x TF32 on GB10); validate with tools/vae_ab.c. */
+__device__ __forceinline__ uint32_t h3_pack_bf16_pair(float lo, float hi) {
+    return (uint32_t)h3_f32_to_bf16(lo) | ((uint32_t)h3_f32_to_bf16(hi) << 16);
+}
+
+static int h3_cuda_f32_gemm_bf16_enabled(void) {
+    const char *value = getenv("H3_CUDA_F32_GEMM");
+    return value && strcmp(value, "bf16") == 0;
+}
+
+__global__ void h3k_f32_to_bf16_vec(const float *__restrict__ in,
+                                    uint16_t *__restrict__ out, size_t n) {
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    size_t n4 = n / 4;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += stride) {
+        float4 v = ((const float4 *)in)[i];
+        uint2 o = {h3_pack_bf16_pair(v.x, v.y), h3_pack_bf16_pair(v.z, v.w)};
+        ((uint2 *)out)[i] = o;
+    }
+    for (size_t i = n4 * 4 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += stride)
+        out[i] = h3_f32_to_bf16(in[i]);
+}
+
+static struct h3_cuda_fp8_weight *h3_cuda_bf16_weight(struct h3_gpu *gpu,
+                                                      const void *weight,
+                                                      size_t elements) {
+    if (!gpu->bf16_weights) {
+        gpu->bf16_weights = (struct h3_cuda_fp8_weight *)calloc(
+            H3_CUDA_FP8_WEIGHTS, sizeof(*gpu->bf16_weights));
+        if (!gpu->bf16_weights) return NULL;
+    }
+    struct h3_cuda_fp8_weight *slot = NULL;
+    for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
+        struct h3_cuda_fp8_weight *entry = &gpu->bf16_weights[i];
+        if (entry->valid && entry->key == weight &&
+            entry->elements == elements)
+            return entry;
+        if (!slot && !entry->valid) slot = entry;
+    }
+    if (!slot) {
+        static unsigned clock;
+        slot = &gpu->bf16_weights[clock++ % H3_CUDA_FP8_WEIGHTS];
+        if (slot->data) cudaFree(slot->data);
+        memset(slot, 0, sizeof(*slot));
+    }
+    void *data = NULL;
+    if (cudaMalloc(&data, elements ? elements * 2 : 2) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    unsigned blocks = (unsigned)((elements / 4 + 255) / 256);
+    if (!blocks) blocks = 1;
+    if (blocks > 4096u) blocks = 4096u;
+    h3k_f32_to_bf16_vec<<<blocks, 256>>>((const float *)weight,
+                                         (uint16_t *)data, elements);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(data);
+        return NULL;
+    }
+    slot->key = weight;
+    slot->elements = elements;
+    slot->data = data;
+    slot->valid = 1;
+    return slot;
+}
+
+int h3_cuda_gemm_xwt_f32_via_bf16(struct h3_gpu *gpu, const void *x,
+                                  const void *weight, const void *bias,
+                                  void *c, uint32_t rows, uint32_t input_dim,
+                                  uint32_t output_dim) {
+    if (!gpu || !gpu->lt || gpu->no_cublas ||
+        !h3_cuda_f32_gemm_bf16_enabled() || rows < 256 || input_dim < 1024 ||
+        output_dim < 1024 || input_dim % 8 || ((uintptr_t)x & 15) ||
+        ((uintptr_t)weight & 15))
+        return 0;
+    size_t x_elements = (size_t)rows * input_dim;
+    /* The bf16 activation lives in the workspace; the GEMM output is the
+     * caller's f32 buffer, never the workspace, so no aliasing. */
+    uint16_t *x16 = (uint16_t *)h3_cuda_workspace(gpu, x_elements * 2);
+    if (!x16) return 0;
+    struct h3_cuda_fp8_weight *entry =
+        h3_cuda_bf16_weight(gpu, weight, (size_t)output_dim * input_dim);
+    if (!entry) return 0;
+    unsigned blocks = (unsigned)((x_elements / 4 + 255) / 256);
+    if (blocks > 4096u) blocks = 4096u;
+    h3k_f32_to_bf16_vec<<<blocks, 256>>>((const float *)x, x16, x_elements);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    return h3_cuda_gemm_xwt(gpu, x16, entry->data, bias, c, CUDA_R_16BF,
+                            CUDA_R_32F, rows, input_dim, output_dim);
 }
