@@ -3,6 +3,7 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -1002,6 +1003,134 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     return ok;
 }
 
+/* Opt-in block-sparse attention (H3_SPARSE_ATTN=T:H:W[:G]): a CSR mask
+ * over the FA2 kernels' 128-row query blocks x 64-row K/V tiles, built
+ * once from the fixed token layout. Target-video tiles attend within a 3D
+ * window of the given radii (latent-patch units) plus every G-th video
+ * tile globally (G=0 disables); any tile containing text/audio/condition/
+ * reference rows stays fully global in both directions, so only
+ * video<->video attention is windowed. Unset leaves attention dense; the
+ * reduced token-reduction sequence always stays dense (row-count gate). */
+static int prepare_sparse_attention(h3_dit *dit, char *error,
+                                    size_t error_size) {
+    const char *spec = getenv("H3_SPARSE_ATTN");
+    if (!spec || !*spec) return 1;
+    unsigned radius_t = 0, radius_h = 0, radius_w = 0, global_stride = 0;
+    int fields = sscanf(spec, "%u:%u:%u:%u", &radius_t, &radius_h, &radius_w,
+                        &global_stride);
+    if (fields < 3) {
+        fail(error, error_size, "H3_SPARSE_ATTN must be T:H:W[:G]");
+        return 0;
+    }
+    size_t video_start = 0, video_stop = 0;
+    unsigned video_segments = 0;
+    for (size_t index = 0; index < dit->layout.segment_count; index++) {
+        const h3_segment *segment = &dit->layout.segments[index];
+        if (segment->kind == H3_SEG_VIDEO) {
+            video_start = segment->start;
+            video_stop = segment->stop;
+            video_segments++;
+        }
+    }
+    if (video_segments != 1) {
+        fprintf(stderr, "h3: H3_SPARSE_ATTN ignored (no single target video "
+                "segment)\n");
+        return 1;
+    }
+    enum { QROWS = 128, KVT = 64 };
+    uint32_t qblocks = (dit->sequence + QROWS - 1) / QROWS;
+    uint32_t ktiles = (dit->sequence + KVT - 1) / KVT;
+    typedef struct { int global, min_t, max_t, min_h, max_h, min_w, max_w; }
+        tile_box;
+    tile_box *qbox = calloc(qblocks + ktiles, sizeof(*qbox));
+    uint32_t *ptr = malloc(((size_t)qblocks + 1) * sizeof(*ptr));
+    if (!qbox || !ptr) {
+        free(qbox); free(ptr);
+        fail(error, error_size, "out of memory for the sparse-attention mask");
+        return 0;
+    }
+    tile_box *kbox = qbox + qblocks;
+    for (uint32_t block = 0; block < qblocks + ktiles; block++) {
+        qbox[block].min_t = qbox[block].min_h = qbox[block].min_w = INT_MAX;
+        qbox[block].max_t = qbox[block].max_h = qbox[block].max_w = INT_MIN;
+    }
+    for (uint32_t row = 0; row < dit->sequence; row++) {
+        tile_box *boxes[2] = {&qbox[row / QROWS], &kbox[row / KVT]};
+        for (int side = 0; side < 2; side++) {
+            tile_box *box = boxes[side];
+            if (row < video_start || row >= video_stop) {
+                box->global = 1;
+                continue;
+            }
+            int t = (int)lrint(dit->layout.positions[row].t);
+            int h = (int)lrint(dit->layout.positions[row].h);
+            int w = (int)lrint(dit->layout.positions[row].w);
+            if (t < box->min_t) box->min_t = t;
+            if (t > box->max_t) box->max_t = t;
+            if (h < box->min_h) box->min_h = h;
+            if (h > box->max_h) box->max_h = h;
+            if (w < box->min_w) box->min_w = w;
+            if (w > box->max_w) box->max_w = w;
+        }
+    }
+    /* Two passes: count, then fill. */
+    size_t total = 0;
+    uint32_t *idx = NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        size_t at = 0;
+        for (uint32_t q = 0; q < qblocks; q++) {
+            if (pass) ptr[q] = (uint32_t)at;
+            for (uint32_t k = 0; k < ktiles; k++) {
+                int keep = qbox[q].global || kbox[k].global ||
+                           (global_stride && k % global_stride == 0);
+                if (!keep && qbox[q].min_t <= qbox[q].max_t &&
+                    kbox[k].min_t <= kbox[k].max_t) {
+                    int gap_t = kbox[k].min_t > qbox[q].max_t
+                                    ? kbox[k].min_t - qbox[q].max_t
+                                    : qbox[q].min_t > kbox[k].max_t
+                                          ? qbox[q].min_t - kbox[k].max_t : 0;
+                    int gap_h = kbox[k].min_h > qbox[q].max_h
+                                    ? kbox[k].min_h - qbox[q].max_h
+                                    : qbox[q].min_h > kbox[k].max_h
+                                          ? qbox[q].min_h - kbox[k].max_h : 0;
+                    int gap_w = kbox[k].min_w > qbox[q].max_w
+                                    ? kbox[k].min_w - qbox[q].max_w
+                                    : qbox[q].min_w > kbox[k].max_w
+                                          ? qbox[q].min_w - kbox[k].max_w : 0;
+                    keep = gap_t <= (int)radius_t && gap_h <= (int)radius_h &&
+                           gap_w <= (int)radius_w;
+                }
+                if (keep) {
+                    if (pass) idx[at] = k;
+                    at++;
+                }
+            }
+        }
+        if (!pass) {
+            total = at;
+            idx = malloc((total ? total : 1) * sizeof(*idx));
+            if (!idx) {
+                free(qbox); free(ptr);
+                fail(error, error_size,
+                     "out of memory for the sparse-attention mask");
+                return 0;
+            }
+        } else {
+            ptr[qblocks] = (uint32_t)at;
+        }
+    }
+    int ok = h3_gpu_sdpa_set_sparse(dit->gpu, ptr, (size_t)qblocks + 1, idx,
+                                    total, dit->sequence);
+    if (getenv("H3_PROFILE") || !ok)
+        fprintf(stderr, "h3: sparse attention %s: %.1f%% of %u x %u tiles "
+                "kept (window %u:%u:%u global-stride %u)\n",
+                ok ? "enabled" : "unavailable (staying dense)",
+                100.0 * (double)total / ((double)qblocks * ktiles), qblocks,
+                ktiles, radius_t, radius_h, radius_w, global_stride);
+    free(qbox); free(ptr); free(idx);
+    return 1;
+}
+
 static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
                         char *error, size_t error_size) {
     int steps = h3_dit_schedule_steps(dit->schedule);
@@ -1681,6 +1810,7 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
         !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_sparse_attention(dit, error, error_size) ||
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;

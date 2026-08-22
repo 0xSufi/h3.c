@@ -110,6 +110,12 @@ struct h3_gpu {
      * H3_CUDA_SDPA_FP8_EXACT_SCALE=1 keeps the exact per-call behavior. */
     unsigned *sdpa_fp8_amax;
     int sdpa_fp8_primed;
+    /* Block-sparse SDPA mask (h3_gpu_sdpa_set_sparse): CSR over 64-row K/V
+     * tiles per 128-row query block, applied to FA2/FP8 joint-attention
+     * calls whose row count equals sdpa_sparse_rows. NULL = dense. */
+    unsigned *sdpa_sparse_ptr;
+    unsigned *sdpa_sparse_idx;
+    uint32_t sdpa_sparse_rows;
 };
 
 static inline size_t h3_cuda_item_size(h3_gpu_dtype dtype) {

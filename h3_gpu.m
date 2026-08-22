@@ -538,6 +538,14 @@ int h3_gpu_prefers_gpu_sampler(const h3_gpu *opaque) {
     return h3_gpu_is_m5(opaque);
 }
 
+int h3_gpu_sdpa_set_sparse(h3_gpu *opaque, const uint32_t *ptr,
+                           size_t ptr_count, const uint32_t *idx,
+                           size_t idx_count, uint32_t rows) {
+    (void)opaque; (void)ptr; (void)ptr_count; (void)idx; (void)idx_count;
+    (void)rows;
+    return 0; /* Metal SDPA has no block-sparse path; callers stay dense. */
+}
+
 int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);

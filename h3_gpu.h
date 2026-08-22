@@ -41,6 +41,14 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 /* Backend prefers the device-resident Euler sampler by default (avoids the
  * per-step host latent round-trip). M5 Metal and CUDA return 1. */
 int h3_gpu_prefers_gpu_sampler(const h3_gpu *gpu);
+/* Register a block-sparse SDPA mask: CSR over 64-row K/V tiles per 128-row
+ * query block, applied to non-causal joint-attention calls whose row count
+ * equals rows (other calls stay dense). ptr holds qblocks+1 offsets, idx
+ * the concatenated tile lists. NULL ptr clears. Returns 0 where
+ * unsupported (Metal). */
+int h3_gpu_sdpa_set_sparse(h3_gpu *gpu, const uint32_t *ptr,
+                           size_t ptr_count, const uint32_t *idx,
+                           size_t idx_count, uint32_t rows);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);

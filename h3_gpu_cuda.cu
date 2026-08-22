@@ -158,6 +158,8 @@ void h3_gpu_free(h3_gpu *opaque) {
     h3_cuda_cache_evict_all(gpu);
     if (gpu->load_staging) cudaFreeHost(gpu->load_staging);
     h3_cuda_fp8_release(gpu);
+    if (gpu->sdpa_sparse_ptr) cudaFree(gpu->sdpa_sparse_ptr);
+    if (gpu->sdpa_sparse_idx) cudaFree(gpu->sdpa_sparse_idx);
     for (unsigned i = 0; i < H3_CUDA_H2D_SLOTS; i++) {
         struct h3_cuda_h2d_slot *slot = &gpu->h2d_slots[i];
         if (slot->host) cudaFreeHost(slot->host);

@@ -1604,7 +1604,9 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
                       const uint16_t *__restrict__ key,
                       const uint16_t *__restrict__ value,
                       uint16_t *__restrict__ output, uint32_t sequence,
-                      uint32_t heads, float scale) {
+                      uint32_t heads, float scale,
+                      const uint32_t *__restrict__ sparse_ptr,
+                      const uint32_t *__restrict__ sparse_idx) {
 #if __CUDA_ARCH__ >= 800
     constexpr int LD = H3_FA2_LD(HD);
     constexpr int STAGE = H3_FA2_STAGE_ELEMS(HD);
@@ -1647,17 +1649,30 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
 
     const uint16_t *k_src = key + batch_off + head_off;
     const uint16_t *v_src = value + batch_off + head_off;
-    const uint32_t tiles = (sequence + H3_FA2_KVT - 1) / H3_FA2_KVT;
+    /* Dense: visit every K/V tile in order. Sparse (block-sparse mask):
+     * walk this query block's CSR list of tile indices; the online softmax
+     * is subset- and order-independent. The list length is clamped to the
+     * dense tile count so no host-side mask defect can unbound the loop. */
+    const uint32_t dense_tiles = (sequence + H3_FA2_KVT - 1) / H3_FA2_KVT;
+    const uint32_t list_base = sparse_ptr ? sparse_ptr[blockIdx.x] : 0u;
+    uint32_t tiles = sparse_ptr ? sparse_ptr[blockIdx.x + 1] - list_base
+                                : dense_tiles;
+    if (tiles > dense_tiles) tiles = dense_tiles;
+    uint32_t tile = sparse_idx && tiles ? sparse_idx[list_base] : 0u;
 
-    h3_fa2_issue<HD>(h3_fa2_smem, k_src, v_src, row_stride, sequence, 0, 0,
-                     tid);
+    if (tiles)
+        h3_fa2_issue<HD>(h3_fa2_smem, k_src, v_src, row_stride, sequence,
+                         tile, 0, tid);
     h3_cp_async_commit();
 
     for (uint32_t t = 0; t < tiles; t++) {
         const uint32_t stage = t & 1u;
-        if (t + 1 < tiles)
+        uint32_t next = tile;
+        if (t + 1 < tiles) {
+            next = sparse_idx ? sparse_idx[list_base + t + 1] : t + 1;
             h3_fa2_issue<HD>(h3_fa2_smem, k_src, v_src, row_stride,
-                             sequence, t + 1, stage ^ 1u, tid);
+                             sequence, next, stage ^ 1u, tid);
+        }
         h3_cp_async_commit(); /* always commit so wait_group<1> is uniform */
         h3_cp_async_wait<1>();
         __syncthreads();
@@ -1691,7 +1706,7 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
         /* Online softmax in registers: scale into the exp2 domain, mask the
          * tail tile, row max over this thread's 16 values then across the 4
          * lanes sharing the row, rescale, exponentiate, row sums. */
-        const uint32_t kb = t * H3_FA2_KVT;
+        const uint32_t kb = tile * H3_FA2_KVT;
         float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
         for (int n = 0; n < H3_FA2_KVT / 8; n++) {
@@ -1767,11 +1782,12 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
             }
         }
         __syncthreads(); /* all warps done with this stage before it refills */
+        tile = next;
     }
 
     /* Normalize and store bf16 pairs (4-byte aligned: a_col is even). */
     if (ok0) {
-        float inv = 1.0f / l0;
+        float inv = l0 > 0.0f ? 1.0f / l0 : 0.0f;
         size_t base = HEAD_MAJOR
                           ? batch_off + ((size_t)head * sequence + r0) * HD
                           : batch_off + (size_t)r0 * row_stride + head_off;
@@ -1781,7 +1797,7 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
                 h3_pack_bf16(o_acc[d][0] * inv, o_acc[d][1] * inv);
     }
     if (ok1) {
-        float inv = 1.0f / l1;
+        float inv = l1 > 0.0f ? 1.0f / l1 : 0.0f;
         size_t base = HEAD_MAJOR
                           ? batch_off + ((size_t)head * sequence + r1) * HD
                           : batch_off + (size_t)r1 * row_stride + head_off;
@@ -1791,6 +1807,53 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
                 h3_pack_bf16(o_acc[d][2] * inv, o_acc[d][3] * inv);
     }
 #endif
+}
+
+/* Upload (or clear) the block-sparse SDPA mask; see h3_gpu.h. */
+int h3_gpu_sdpa_set_sparse(h3_gpu *opaque, const uint32_t *ptr,
+                           size_t ptr_count, const uint32_t *idx,
+                           size_t idx_count, uint32_t rows) {
+    struct h3_gpu *gpu = (struct h3_gpu *)opaque;
+    if (!gpu) return 0;
+    if (gpu->sdpa_sparse_ptr) cudaFree(gpu->sdpa_sparse_ptr);
+    if (gpu->sdpa_sparse_idx) cudaFree(gpu->sdpa_sparse_idx);
+    gpu->sdpa_sparse_ptr = NULL;
+    gpu->sdpa_sparse_idx = NULL;
+    gpu->sdpa_sparse_rows = 0;
+    if (!ptr) return 1; /* cleared */
+    if (!idx || !ptr_count || !idx_count || !rows) return 0;
+    /* Validate the CSR before it can reach a kernel: offsets monotone and
+     * ending at idx_count, every tile index within the dense tile count. */
+    {
+        uint32_t ktiles = (rows + H3_FA2_KVT - 1) / H3_FA2_KVT;
+        if (ptr[0] != 0 || ptr[ptr_count - 1] != (uint32_t)idx_count)
+            return 0;
+        for (size_t i = 1; i < ptr_count; i++)
+            if (ptr[i] < ptr[i - 1]) return 0;
+        for (size_t i = 0; i < idx_count; i++)
+            if (idx[i] >= ktiles) return 0;
+    }
+    if (cudaMalloc((void **)&gpu->sdpa_sparse_ptr,
+                   ptr_count * sizeof(uint32_t)) != cudaSuccess)
+        return 0;
+    if (cudaMalloc((void **)&gpu->sdpa_sparse_idx,
+                   idx_count * sizeof(uint32_t)) != cudaSuccess) {
+        cudaFree(gpu->sdpa_sparse_ptr);
+        gpu->sdpa_sparse_ptr = NULL;
+        return 0;
+    }
+    if (cudaMemcpy(gpu->sdpa_sparse_ptr, ptr, ptr_count * sizeof(uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(gpu->sdpa_sparse_idx, idx, idx_count * sizeof(uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(gpu->sdpa_sparse_ptr);
+        cudaFree(gpu->sdpa_sparse_idx);
+        gpu->sdpa_sparse_ptr = NULL;
+        gpu->sdpa_sparse_idx = NULL;
+        return 0;
+    }
+    gpu->sdpa_sparse_rows = rows;
+    return 1;
 }
 
 /* H3_CUDA_SDPA_EXACT_EXP=1 restores the libm exp2f softmax rounding in the
@@ -1848,13 +1911,16 @@ static int h3_fa2_fits(struct h3_gpu *gpu, int head_major, uint32_t head_dim) {
 static void h3_fa2_launch(const uint16_t *query, const uint16_t *key,
                           const uint16_t *value, uint16_t *output,
                           uint32_t batch, uint32_t sequence, uint32_t heads,
-                          uint32_t head_dim, float scale, int head_major) {
+                          uint32_t head_dim, float scale, int head_major,
+                          const uint32_t *sparse_ptr,
+                          const uint32_t *sparse_idx) {
     dim3 grid((sequence + H3_FA2_QROWS - 1) / H3_FA2_QROWS, heads, batch);
     size_t shared = h3_fa2_shared(head_dim);
     const int fexp = h3_cuda_sdpa_fast_exp();
 #define H3_FA2_GO(HM, HD, FE)                                              \
     h3k_sdpa_fa2_bf16<HM, HD, FE><<<grid, H3_FA2_THREADS, shared>>>(       \
-        query, key, value, output, sequence, heads, scale)
+        query, key, value, output, sequence, heads, scale, sparse_ptr,     \
+        sparse_idx)
 #define H3_FA2_GO_EXP(HM, HD)                                              \
     do { if (fexp) H3_FA2_GO(HM, HD, 1); else H3_FA2_GO(HM, HD, 0); } while (0)
     if (head_dim == 64) {
@@ -2168,7 +2234,9 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
                      const uint8_t *__restrict__ vt8,
                      const float *__restrict__ scales,
                      uint16_t *__restrict__ output, uint32_t sequence,
-                     uint32_t seq_pad, uint32_t heads, float scale) {
+                     uint32_t seq_pad, uint32_t heads, float scale,
+                     const uint32_t *__restrict__ sparse_ptr,
+                     const uint32_t *__restrict__ sparse_idx) {
 #if __CUDA_ARCH__ >= 890
     extern __shared__ __align__(16) uint8_t h3_fp8_smem[];
     const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -2203,17 +2271,29 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
 
     const uint8_t *k_src = k8 + head_rows * H3_FP8_HD;
     const uint8_t *vt_src = vt8 + (size_t)head * H3_FP8_HD * seq_pad;
-    const uint32_t tiles = seq_pad / H3_FP8_KVT;
+    /* Dense or CSR block-sparse, as in the bf16 kernel (length clamped to
+     * the dense tile count). */
+    const uint32_t dense_tiles = seq_pad / H3_FP8_KVT;
+    const uint32_t list_base = sparse_ptr ? sparse_ptr[blockIdx.x] : 0u;
+    uint32_t tiles = sparse_ptr ? sparse_ptr[blockIdx.x + 1] - list_base
+                                : dense_tiles;
+    if (tiles > dense_tiles) tiles = dense_tiles;
+    uint32_t tile = sparse_idx && tiles ? sparse_idx[list_base] : 0u;
 
-    h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, 0, 0, tid);
+    if (tiles)
+        h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, tile, 0,
+                     tid);
     h3_cp_async_commit();
     /* C-fragment column (within an 8-key n-tile) this thread holds. */
     const uint32_t c_col = (lane & 3) * 2;
     for (uint32_t t = 0; t < tiles; t++) {
         const uint32_t stage = t & 1u;
-        if (t + 1 < tiles)
-            h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, t + 1,
+        uint32_t next = tile;
+        if (t + 1 < tiles) {
+            next = sparse_idx ? sparse_idx[list_base + t + 1] : t + 1;
+            h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, next,
                          stage ^ 1u, tid);
+        }
         h3_cp_async_commit();
         h3_cp_async_wait<1>();
         __syncthreads();
@@ -2241,7 +2321,7 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
                                     qf[ks][2], qf[ks][3], b[2], b[3]);
             }
         }
-        const uint32_t kb = t * H3_FP8_KVT;
+        const uint32_t kb = tile * H3_FP8_KVT;
         float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
         for (int n = 0; n < H3_FP8_KVT / 8; n++) {
@@ -2326,12 +2406,13 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
             }
         }
         __syncthreads();
+        tile = next;
     }
     const float unscale = s_v / H3_FP8_P_SCALE;
     const size_t row_stride = (size_t)heads * H3_FP8_HD;
     const size_t head_off = (size_t)head * H3_FP8_HD;
     if (ok0) {
-        float inv = unscale / l0;
+        float inv = l0 > 0.0f ? unscale / l0 : 0.0f;
         size_t base = HEAD_MAJOR ? (head_rows + r0) * H3_FP8_HD
                                  : (size_t)r0 * row_stride + head_off;
 #pragma unroll
@@ -2340,7 +2421,7 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
                 h3_pack_bf16(o_acc[d][0] * inv, o_acc[d][1] * inv);
     }
     if (ok1) {
-        float inv = unscale / l1;
+        float inv = l1 > 0.0f ? unscale / l1 : 0.0f;
         size_t base = HEAD_MAJOR ? (head_rows + r1) * H3_FP8_HD
                                  : (size_t)r1 * row_stride + head_off;
 #pragma unroll
@@ -2475,9 +2556,14 @@ static int h3_cuda_sdpa_fp8(struct h3_gpu *gpu, const uint16_t *query,
         fprintf(stderr, "\n  status after pre-pass: %s\n",
                 cudaGetErrorString(cudaGetLastError()));
     }
+    const uint32_t *sparse_ptr =
+        gpu->sdpa_sparse_ptr && gpu->sdpa_sparse_rows == sequence
+            ? gpu->sdpa_sparse_ptr : NULL;
+    const uint32_t *sparse_idx = sparse_ptr ? gpu->sdpa_sparse_idx : NULL;
 #define H3_FP8_GO(HM, FE)                                                  \
     h3k_sdpa_fa2_fp8<HM, FE><<<grid, H3_FP8_THREADS, shared>>>(            \
-        q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale)
+        q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale,      \
+        sparse_ptr, sparse_idx)
     if (h3_cuda_sdpa_fast_exp()) {
         if (head_major) H3_FP8_GO(1, 1); else H3_FP8_GO(0, 1);
     } else {
@@ -2892,7 +2978,13 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                       (const uint16_t *)key->data,
                       (const uint16_t *)value->data, (uint16_t *)output->data,
                       batch, sequence, heads, head_dim, scale,
-                      head_major_output);
+                      head_major_output,
+                      batch == 1 && gpu->sdpa_sparse_ptr &&
+                              gpu->sdpa_sparse_rows == sequence
+                          ? gpu->sdpa_sparse_ptr : NULL,
+                      batch == 1 && gpu->sdpa_sparse_ptr &&
+                              gpu->sdpa_sparse_rows == sequence
+                          ? gpu->sdpa_sparse_idx : NULL);
         return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
     }
     /* f32 through the bf16 FA2 kernel (see h3k_fa2_cast_*). */
@@ -2913,7 +3005,7 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
             h3k_fa2_cast_f32_to_bf16<<<blocks, 256>>>(
                 (const float *)value->data, v16, count);
             h3_fa2_launch(q16, k16, v16, o16, batch, sequence, heads, head_dim,
-                          scale, 0);
+                          scale, 0, NULL, NULL);
             h3k_fa2_cast_bf16_to_f32<<<blocks, 256>>>(
                 o16, (float *)output->data, count);
             return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
