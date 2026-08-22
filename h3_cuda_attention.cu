@@ -1966,6 +1966,37 @@ __global__ void h3k_fp8_attn_scales(const unsigned *__restrict__ absmax,
     scales[3 + i] = 1.0f / s;
 }
 
+/* Delayed scaling: scales for this call come from the running absmax the
+ * pack kernels have accumulated over every previous call, with 6% headroom.
+ * The accumulator is monotone (never reset): e4m3 is a float format, so a
+ * larger-than-necessary scale costs no relative precision, while a monotone
+ * max means only a first sighting of a new global maximum can transiently
+ * saturate (to +-448, as in e4m3 training recipes). */
+__global__ void h3k_fp8_attn_delayed_scales(const unsigned *__restrict__ amax,
+                                            float *__restrict__ scales) {
+    int i = threadIdx.x;
+    if (i >= 3) return;
+    float m = __uint_as_float(amax[i]);
+    float s = m > 0.0f ? m * 1.06f / H3_FP8_P_SCALE : 1.0f;
+    scales[i] = s;
+    scales[3 + i] = 1.0f / s;
+}
+
+/* Block-reduce a thread-local |x| max and fold it into amax[slot]. */
+__device__ __forceinline__ void h3_fp8_amax_fold(unsigned *__restrict__ amax,
+                                                 float m) {
+    __shared__ unsigned partial[256];
+    partial[threadIdx.x] = __float_as_uint(m);
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s; s >>= 1) {
+        if (threadIdx.x < s)
+            partial[threadIdx.x] = max(partial[threadIdx.x],
+                                       partial[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(amax, partial[0]);
+}
+
 __device__ __forceinline__ uint32_t h3_fp8_pack4(float a, float b, float c,
                                                  float d) {
     __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b),
@@ -1977,12 +2008,16 @@ __device__ __forceinline__ uint32_t h3_fp8_pack4(float a, float b, float c,
     return (uint32_t)lo | ((uint32_t)hi << 16);
 }
 
-/* Q or K: [seq][heads][128] bf16 -> [heads][seq][128] e4m3 (8 per thread). */
+/* Q or K: [seq][heads][128] bf16 -> [heads][seq][128] e4m3 (8 per thread).
+ * The raw (pre-scale) absmax folds into amax for the next call's delayed
+ * scale. */
 __global__ void h3k_fp8_attn_pack_qk(const uint16_t *__restrict__ in,
                                      uint8_t *__restrict__ out,
                                      uint32_t sequence, uint32_t heads,
-                                     const float *__restrict__ inverse) {
+                                     const float *__restrict__ inverse,
+                                     unsigned *__restrict__ amax) {
     const float inv = *inverse;
+    float mx = 0.0f;
     size_t chunks = (size_t)sequence * heads * (H3_FP8_HD / 8);
     size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x; c < chunks;
@@ -1995,13 +2030,17 @@ __global__ void h3k_fp8_attn_pack_qk(const uint16_t *__restrict__ in,
         float f[8];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            f[2 * j] = h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu)) * inv;
-            f[2 * j + 1] = h3_bf16_to_f32((uint16_t)(w[j] >> 16)) * inv;
+            float lo = h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu));
+            float hi = h3_bf16_to_f32((uint16_t)(w[j] >> 16));
+            mx = fmaxf(mx, fmaxf(fabsf(lo), fabsf(hi)));
+            f[2 * j] = lo * inv;
+            f[2 * j + 1] = hi * inv;
         }
         uint2 o = {h3_fp8_pack4(f[0], f[1], f[2], f[3]),
                    h3_fp8_pack4(f[4], f[5], f[6], f[7])};
         *(uint2 *)(out + ((size_t)h * sequence + r) * H3_FP8_HD + d) = o;
     }
+    if (amax) h3_fp8_amax_fold(amax, mx);
 }
 
 /* V: [seq][heads][128] bf16 -> [heads][128][seq_pad] e4m3, transposed
@@ -2011,9 +2050,11 @@ __global__ void h3k_fp8_attn_pack_vt(const uint16_t *__restrict__ in,
                                      uint8_t *__restrict__ out,
                                      uint32_t sequence, uint32_t seq_pad,
                                      uint32_t heads,
-                                     const float *__restrict__ inverse) {
+                                     const float *__restrict__ inverse,
+                                     unsigned *__restrict__ amax) {
     __shared__ uint8_t tile[H3_FP8_KVT][H3_FP8_HD + 4];
     const float inv = *inverse;
+    float mx = 0.0f;
     const uint32_t head = blockIdx.y, kb = blockIdx.x * H3_FP8_KVT;
     const uint32_t tid = threadIdx.x;
     /* load 64 keys x 128 dims (8 bf16 per thread per step), quantize */
@@ -2027,10 +2068,12 @@ __global__ void h3k_fp8_attn_pack_vt(const uint16_t *__restrict__ in,
             uint32_t w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
             for (int t = 0; t < 4; t++) {
-                float lo = h3_bf16_to_f32((uint16_t)(w[t] & 0xffffu)) * inv;
-                float hi = h3_bf16_to_f32((uint16_t)(w[t] >> 16)) * inv;
+                float lo = h3_bf16_to_f32((uint16_t)(w[t] & 0xffffu));
+                float hi = h3_bf16_to_f32((uint16_t)(w[t] >> 16));
+                mx = fmaxf(mx, fmaxf(fabsf(lo), fabsf(hi)));
                 __nv_fp8x2_storage_t p = __nv_cvt_float2_to_fp8x2(
-                    make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+                    make_float2(lo * inv, hi * inv), __NV_SATFINITE,
+                    __NV_E4M3);
                 q[2 * t] = (uint8_t)(p & 0xffu);
                 q[2 * t + 1] = (uint8_t)(p >> 8);
             }
@@ -2038,6 +2081,7 @@ __global__ void h3k_fp8_attn_pack_vt(const uint16_t *__restrict__ in,
 #pragma unroll
         for (int t = 0; t < 8; t++) tile[j][d + t] = q[t];
     }
+    if (amax) h3_fp8_amax_fold(amax, mx);
     __syncthreads();
     /* write 128 dim rows x 64 keys (4 permuted keys = 4 bytes per thread) */
     for (uint32_t c = tid; c < H3_FP8_HD * (H3_FP8_KVT / 4); c += blockDim.x) {
@@ -2318,6 +2362,18 @@ static int h3_cuda_sdpa_fp8_enabled(void) {
     return value && *value && strcmp(value, "0") != 0;
 }
 
+/* H3_CUDA_SDPA_FP8_EXACT_SCALE=1 restores the per-call absmax pre-passes;
+ * the default quantizes with the previous call's accumulated absmax
+ * (delayed scaling), removing three full Q/K/V reads per call. */
+static int h3_cuda_sdpa_fp8_exact_scale(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("H3_CUDA_SDPA_FP8_EXACT_SCALE");
+        cached = value && *value && strcmp(value, "0") != 0;
+    }
+    return cached;
+}
+
 static int h3_attn_has_fp8_mma(struct h3_gpu *gpu) {
     static int cached_device = -1;
     static int cached_result = 0;
@@ -2353,23 +2409,46 @@ static int h3_cuda_sdpa_fp8(struct h3_gpu *gpu, const uint16_t *query,
     float *scales = (float *)(ws + s_off);
     unsigned *absmax = (unsigned *)(ws + s_off + 64);
     size_t count = (size_t)sequence * heads * H3_FP8_HD;
-    if (cudaMemsetAsync(absmax, 0, 4 * sizeof(unsigned), 0) != cudaSuccess)
-        return 0;
-    unsigned blocks = (unsigned)((count / 8 + 255) / 256);
-    if (blocks > 2048u) blocks = 2048u;
-    h3k_fp8_attn_absmax<<<blocks, 256>>>(query, count, absmax);
-    h3k_fp8_attn_absmax<<<blocks, 256>>>(key, count, absmax + 1);
-    h3k_fp8_attn_absmax<<<blocks, 256>>>(value, count, absmax + 2);
-    h3k_fp8_attn_scales<<<1, 32>>>(absmax, scales);
+    if (!gpu->sdpa_fp8_amax) {
+        if (cudaMalloc((void **)&gpu->sdpa_fp8_amax,
+                       4 * sizeof(unsigned)) != cudaSuccess)
+            gpu->sdpa_fp8_amax = NULL;
+        else if (cudaMemsetAsync(gpu->sdpa_fp8_amax, 0,
+                                 4 * sizeof(unsigned), 0) != cudaSuccess) {
+            cudaFree(gpu->sdpa_fp8_amax);
+            gpu->sdpa_fp8_amax = NULL;
+        }
+    }
+    int exact = h3_cuda_sdpa_fp8_exact_scale() || !gpu->sdpa_fp8_amax ||
+                !gpu->sdpa_fp8_primed;
+    if (exact) {
+        if (cudaMemsetAsync(absmax, 0, 4 * sizeof(unsigned), 0) !=
+            cudaSuccess)
+            return 0;
+        unsigned blocks = (unsigned)((count / 8 + 255) / 256);
+        if (blocks > 2048u) blocks = 2048u;
+        h3k_fp8_attn_absmax<<<blocks, 256>>>(query, count, absmax);
+        h3k_fp8_attn_absmax<<<blocks, 256>>>(key, count, absmax + 1);
+        h3k_fp8_attn_absmax<<<blocks, 256>>>(value, count, absmax + 2);
+        h3k_fp8_attn_scales<<<1, 32>>>(absmax, scales);
+        /* The packs below fold this call's absmax into the running
+         * accumulator, priming the delayed path. */
+        if (gpu->sdpa_fp8_amax) gpu->sdpa_fp8_primed = 1;
+    } else {
+        h3k_fp8_attn_delayed_scales<<<1, 32>>>(gpu->sdpa_fp8_amax, scales);
+    }
+    unsigned *amax_q = gpu->sdpa_fp8_amax;
+    unsigned *amax_k = amax_q ? amax_q + 1 : NULL;
+    unsigned *amax_v = amax_q ? amax_q + 2 : NULL;
     unsigned pblocks = (unsigned)((count / 8 + 255) / 256);
     if (pblocks > 4096u) pblocks = 4096u;
     h3k_fp8_attn_pack_qk<<<pblocks, 256>>>(query, q8, sequence, heads,
-                                           scales + 3);
+                                           scales + 3, amax_q);
     h3k_fp8_attn_pack_qk<<<pblocks, 256>>>(key, k8, sequence, heads,
-                                           scales + 4);
+                                           scales + 4, amax_k);
     dim3 vgrid(seq_pad / H3_FP8_KVT, heads);
     h3k_fp8_attn_pack_vt<<<vgrid, 256>>>(value, vt8, sequence, seq_pad, heads,
-                                         scales + 5);
+                                         scales + 5, amax_v);
     dim3 grid((sequence + H3_FP8_QROWS - 1) / H3_FP8_QROWS, heads, 1);
     size_t shared = (size_t)2 * H3_FP8_STAGE_BYTES;
     if (getenv("H3_CUDA_SDPA_FP8_DEBUG")) {

@@ -102,6 +102,14 @@ struct h3_gpu {
     void *fp8_scratch;
     size_t fp8_scratch_bytes;
     unsigned *fp8_absmax;
+    /* FP8 SDPA delayed scaling (h3_cuda_attention.cu): a monotone running
+     * Q/K/V absmax accumulated by the pack kernels; each call quantizes
+     * with the running absmax so far (6% headroom, e4m3 saturation), so
+     * the three standalone absmax reads drop out of the steady state. The
+     * first call primes with the exact pre-passes.
+     * H3_CUDA_SDPA_FP8_EXACT_SCALE=1 keeps the exact per-call behavior. */
+    unsigned *sdpa_fp8_amax;
+    int sdpa_fp8_primed;
 };
 
 static inline size_t h3_cuda_item_size(h3_gpu_dtype dtype) {

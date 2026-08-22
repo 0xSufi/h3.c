@@ -821,6 +821,9 @@ void h3_cuda_fp8_release(struct h3_gpu *gpu) {
     gpu->fp8_scratch = NULL;
     gpu->fp8_scratch_bytes = 0;
     gpu->fp8_absmax = NULL;
+    if (gpu->sdpa_fp8_amax) cudaFree(gpu->sdpa_fp8_amax);
+    gpu->sdpa_fp8_amax = NULL;
+    gpu->sdpa_fp8_primed = 0;
 }
 
 int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
