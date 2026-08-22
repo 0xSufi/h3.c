@@ -1389,6 +1389,299 @@ static int h3_attn_has_bf16_mma(struct h3_gpu *gpu) {
     return cached_result;
 }
 
+/* ------------------------------------------- FA2-class tensor-core SDPA */
+
+/* h3k_sdpa_fa2_bf16: FlashAttention-2-style forward for the DiT shape (bf16,
+ * head_dim 128, non-causal, kv_heads == heads) on sm_80+. What differs from
+ * h3k_sdpa_mma_bf16 — and matters at N ~ 38k rows, where that kernel ran at
+ * ~14 TFLOPS on GB10 — is the ratio of mma work to staged bytes and the
+ * number of shared-memory round trips per tile:
+ *   - 128 query rows per block (8 warps x 16 rows), so every staged 64-row
+ *     K/V tile feeds 8x more mma work than the 16-row kernel (per-head K/V
+ *     traffic drops from 2376 to 297 passes at N=38016);
+ *   - K/V double-buffered through cp.async: tile t+1 streams into the other
+ *     stage while tile t computes; one barrier pair per tile;
+ *   - the Q A-fragments are loaded into registers once and reused for every
+ *     tile; the S accumulators, the running max/sum, and the P operand all
+ *     stay in registers: the m16n8 C-fragments of two adjacent key n-tiles
+ *     are exactly the m16n8k16 A-fragment of P for the next mma, so P never
+ *     goes through shared memory (the old kernel published f32 scores to
+ *     smem, ran a warp-per-row softmax, then re-packed from smem).
+ * Softmax is exp2-based with scale*log2(e) folded into the exponent (the
+ * same math on a different rounding path, within the flash tolerance); P is
+ * rounded to bf16 (RNE) before P*V exactly like the existing mma kernel.
+ * Rows past the sequence read zero Q and are never stored; keys past the
+ * sequence are zero-filled by cp.async and masked to -inf. Inputs are
+ * [batch, row, head, dim]; output is the same or [batch, head, row, dim]
+ * when HEAD_MAJOR. Requires the >48KB dynamic shared-memory opt-in (2 stages
+ * x K+V x 64 x 136 bf16 = 68 KiB); the host checks and sets it. */
+#define H3_FA2_THREADS 256
+#define H3_FA2_QROWS 128
+#define H3_FA2_KVT 64
+#define H3_FA2_HD 128
+#define H3_FA2_LD 136
+#define H3_FA2_STAGES 2
+#define H3_FA2_STAGE_ELEMS (2 * H3_FA2_KVT * H3_FA2_LD)
+
+static size_t h3_fa2_shared(void) {
+    return (size_t)H3_FA2_STAGES * H3_FA2_STAGE_ELEMS * sizeof(uint16_t);
+}
+
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void h3_cp_async_commit(void) {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+template <int N>
+__device__ __forceinline__ void h3_cp_async_wait(void) {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+/* Stage K/V tile `tile` into `stage`: 2 x 64 rows x 16 chunks of 16 bytes,
+ * eight cp.async per thread; rows past the sequence zero-fill (src-size 0)
+ * and read from row 0 so the address stays valid. */
+__device__ __forceinline__ void h3_fa2_issue(uint16_t *smem,
+                                             const uint16_t *k_src,
+                                             const uint16_t *v_src,
+                                             size_t row_stride,
+                                             uint32_t sequence, uint32_t tile,
+                                             uint32_t stage, uint32_t tid) {
+    uint16_t *ks = smem + stage * H3_FA2_STAGE_ELEMS;
+    uint16_t *vs = ks + H3_FA2_KVT * H3_FA2_LD;
+    uint32_t kb = tile * H3_FA2_KVT;
+#pragma unroll
+    for (uint32_t i = 0; i < (H3_FA2_KVT * (H3_FA2_HD / 8)) / H3_FA2_THREADS;
+         i++) {
+        uint32_t c = tid + i * H3_FA2_THREADS;
+        uint32_t j = c >> 4, d = (c & 15) * 8;
+        uint32_t row = kb + j;
+        int live = row < sequence;
+        size_t off = (size_t)(live ? row : 0u) * row_stride + d;
+        h3_cp_async_16(ks + j * H3_FA2_LD + d, k_src + off, live ? 16 : 0);
+        h3_cp_async_16(vs + j * H3_FA2_LD + d, v_src + off, live ? 16 : 0);
+    }
+}
+#endif
+
+template <int HEAD_MAJOR>
+__global__ void __launch_bounds__(H3_FA2_THREADS, 1)
+    h3k_sdpa_fa2_bf16(const uint16_t *__restrict__ query,
+                      const uint16_t *__restrict__ key,
+                      const uint16_t *__restrict__ value,
+                      uint16_t *__restrict__ output, uint32_t sequence,
+                      uint32_t heads, float scale) {
+#if __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(16) uint16_t h3_fa2_smem[];
+    const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const uint32_t head = blockIdx.y;
+    const uint32_t q0 = blockIdx.x * H3_FA2_QROWS;
+    const size_t row_stride = (size_t)heads * H3_FA2_HD;
+    const size_t batch_off = (size_t)blockIdx.z * sequence * row_stride;
+    const size_t head_off = (size_t)head * H3_FA2_HD;
+    const uint32_t a_row = lane >> 2, a_col = (lane & 3) * 2;
+
+    /* Q A-fragments for this thread's two rows, all eight k-steps, loaded
+     * once. Rows past the sequence read zeros. */
+    const uint32_t r0 = q0 + warp * 16 + a_row, r1 = r0 + 8;
+    const int ok0 = r0 < sequence, ok1 = r1 < sequence;
+    uint32_t qf[H3_FA2_HD / 16][4];
+    {
+        const uint16_t *p0 = query + batch_off + head_off +
+                             (size_t)(ok0 ? r0 : 0u) * row_stride;
+        const uint16_t *p1 = query + batch_off + head_off +
+                             (size_t)(ok1 ? r1 : 0u) * row_stride;
+#pragma unroll
+        for (int ks = 0; ks < H3_FA2_HD / 16; ks++) {
+            uint32_t c = (uint32_t)ks * 16 + a_col;
+            qf[ks][0] = ok0 ? *(const uint32_t *)(p0 + c) : 0u;
+            qf[ks][1] = ok1 ? *(const uint32_t *)(p1 + c) : 0u;
+            qf[ks][2] = ok0 ? *(const uint32_t *)(p0 + c + 8) : 0u;
+            qf[ks][3] = ok1 ? *(const uint32_t *)(p1 + c + 8) : 0u;
+        }
+    }
+
+    float o_acc[H3_FA2_HD / 8][4];
+#pragma unroll
+    for (int t = 0; t < H3_FA2_HD / 8; t++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) o_acc[t][k] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float scale_log2 = scale * 1.4426950408889634f;
+
+    const uint16_t *k_src = key + batch_off + head_off;
+    const uint16_t *v_src = value + batch_off + head_off;
+    const uint32_t tiles = (sequence + H3_FA2_KVT - 1) / H3_FA2_KVT;
+
+    h3_fa2_issue(h3_fa2_smem, k_src, v_src, row_stride, sequence, 0, 0, tid);
+    h3_cp_async_commit();
+
+    for (uint32_t t = 0; t < tiles; t++) {
+        const uint32_t stage = t & 1u;
+        if (t + 1 < tiles)
+            h3_fa2_issue(h3_fa2_smem, k_src, v_src, row_stride, sequence,
+                         t + 1, stage ^ 1u, tid);
+        h3_cp_async_commit(); /* always commit so wait_group<1> is uniform */
+        h3_cp_async_wait<1>();
+        __syncthreads();
+        const uint16_t *k_tile = h3_fa2_smem + stage * H3_FA2_STAGE_ELEMS;
+        const uint16_t *v_tile = k_tile + H3_FA2_KVT * H3_FA2_LD;
+
+        /* S = Q K^T: eight key n-tiles, eight k-steps over the 128 dims. One
+         * ldmatrix.x4 per (n-tile pair, k-step) gives both B fragments. */
+        float s[H3_FA2_KVT / 8][4];
+#pragma unroll
+        for (int n = 0; n < H3_FA2_KVT / 8; n++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) s[n][k] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < H3_FA2_KVT / 16; p++) {
+            const uint16_t *kp = k_tile +
+                                 (p * 16 + (lane & 7) + ((lane & 16) ? 8 : 0)) *
+                                     H3_FA2_LD +
+                                 ((lane & 8) ? 8 : 0);
+#pragma unroll
+            for (int ks = 0; ks < H3_FA2_HD / 16; ks++) {
+                uint32_t b[4];
+                h3_ldmatrix_x4(b, kp + ks * 16);
+                h3_mma_bf16_16x8x16(s[2 * p], qf[ks][0], qf[ks][1], qf[ks][2],
+                                    qf[ks][3], b[0], b[1]);
+                h3_mma_bf16_16x8x16(s[2 * p + 1], qf[ks][0], qf[ks][1],
+                                    qf[ks][2], qf[ks][3], b[2], b[3]);
+            }
+        }
+
+        /* Online softmax in registers: scale into the exp2 domain, mask the
+         * tail tile, row max over this thread's 16 values then across the 4
+         * lanes sharing the row, rescale, exponentiate, row sums. */
+        const uint32_t kb = t * H3_FA2_KVT;
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < H3_FA2_KVT / 8; n++) {
+            s[n][0] *= scale_log2;
+            s[n][1] *= scale_log2;
+            s[n][2] *= scale_log2;
+            s[n][3] *= scale_log2;
+            if (kb + H3_FA2_KVT > sequence) {
+                uint32_t kc = kb + (uint32_t)n * 8 + a_col;
+                if (kc >= sequence) { s[n][0] = -INFINITY; s[n][2] = -INFINITY; }
+                if (kc + 1 >= sequence) { s[n][1] = -INFINITY; s[n][3] = -INFINITY; }
+            }
+            mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        /* A row with no valid key yet has mn == -inf and zero accumulators;
+         * reference it to 0 so exp2f(-inf - 0) = 0 instead of NaN. */
+        const float ref0 = mn0 == -INFINITY ? 0.0f : mn0;
+        const float ref1 = mn1 == -INFINITY ? 0.0f : mn1;
+        const float c0 = exp2f(m0 - ref0), c1 = exp2f(m1 - ref1);
+        float rs0 = 0.0f, rs1 = 0.0f;
+#pragma unroll
+        for (int n = 0; n < H3_FA2_KVT / 8; n++) {
+            s[n][0] = exp2f(s[n][0] - ref0);
+            s[n][1] = exp2f(s[n][1] - ref0);
+            s[n][2] = exp2f(s[n][2] - ref1);
+            s[n][3] = exp2f(s[n][3] - ref1);
+            rs0 += s[n][0] + s[n][1];
+            rs1 += s[n][2] + s[n][3];
+        }
+        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 1);
+        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 2);
+        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 1);
+        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 2);
+        l0 = l0 * c0 + rs0;
+        l1 = l1 * c1 + rs1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int d = 0; d < H3_FA2_HD / 8; d++) {
+            o_acc[d][0] *= c0;
+            o_acc[d][1] *= c0;
+            o_acc[d][2] *= c1;
+            o_acc[d][3] *= c1;
+        }
+
+        /* O += P V: P A-fragments packed straight from the S C-fragments
+         * (n-tiles 2ks, 2ks+1 form k-step ks), V B-fragments via
+         * ldmatrix.x4.trans over the row-major V tile. */
+#pragma unroll
+        for (int ks = 0; ks < H3_FA2_KVT / 16; ks++) {
+            uint32_t a0 = h3_pack_bf16(s[2 * ks][0], s[2 * ks][1]);
+            uint32_t a1 = h3_pack_bf16(s[2 * ks][2], s[2 * ks][3]);
+            uint32_t a2 = h3_pack_bf16(s[2 * ks + 1][0], s[2 * ks + 1][1]);
+            uint32_t a3 = h3_pack_bf16(s[2 * ks + 1][2], s[2 * ks + 1][3]);
+            const uint16_t *vp = v_tile +
+                                 ((lane & 7) + ((lane & 8) ? 8 : 0) + ks * 16) *
+                                     H3_FA2_LD +
+                                 ((lane & 16) ? 8 : 0);
+#pragma unroll
+            for (int dp = 0; dp < H3_FA2_HD / 16; dp++) {
+                uint32_t b[4];
+                h3_ldmatrix_x4_trans(b, vp + dp * 16);
+                h3_mma_bf16_16x8x16(o_acc[2 * dp], a0, a1, a2, a3, b[0], b[1]);
+                h3_mma_bf16_16x8x16(o_acc[2 * dp + 1], a0, a1, a2, a3, b[2],
+                                    b[3]);
+            }
+        }
+        __syncthreads(); /* all warps done with this stage before it refills */
+    }
+
+    /* Normalize and store bf16 pairs (4-byte aligned: a_col is even). */
+    if (ok0) {
+        float inv = 1.0f / l0;
+        size_t base = HEAD_MAJOR
+                          ? batch_off + ((size_t)head * sequence + r0) * H3_FA2_HD
+                          : batch_off + (size_t)r0 * row_stride + head_off;
+#pragma unroll
+        for (int d = 0; d < H3_FA2_HD / 8; d++)
+            *(uint32_t *)(output + base + d * 8 + a_col) =
+                h3_pack_bf16(o_acc[d][0] * inv, o_acc[d][1] * inv);
+    }
+    if (ok1) {
+        float inv = 1.0f / l1;
+        size_t base = HEAD_MAJOR
+                          ? batch_off + ((size_t)head * sequence + r1) * H3_FA2_HD
+                          : batch_off + (size_t)r1 * row_stride + head_off;
+#pragma unroll
+        for (int d = 0; d < H3_FA2_HD / 8; d++)
+            *(uint32_t *)(output + base + d * 8 + a_col) =
+                h3_pack_bf16(o_acc[d][2] * inv, o_acc[d][3] * inv);
+    }
+#endif
+}
+
+/* One-time >48KB dynamic shared-memory opt-in per instantiation. */
+template <int HEAD_MAJOR>
+static int h3_fa2_attr(void) {
+    static int state = 0; /* 0 unknown, 1 ok, -1 failed */
+    if (!state)
+        state = cudaFuncSetAttribute((const void *)h3k_sdpa_fa2_bf16<HEAD_MAJOR>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)h3_fa2_shared()) == cudaSuccess
+                    ? 1
+                    : -1;
+    return state > 0;
+}
+
+/* H3_CUDA_SDPA_FA2=0 routes bf16/hd128 SDPA back to h3k_sdpa_mma_bf16 for
+ * A/B measurements. */
+static int h3_cuda_sdpa_fa2_enabled(void) {
+    const char *value = getenv("H3_CUDA_SDPA_FA2");
+    return !(value && *value && strcmp(value, "0") == 0);
+}
+
+static int h3_fa2_fits(struct h3_gpu *gpu, int head_major) {
+    int optin = 0;
+    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               gpu->device) != cudaSuccess ||
+        (size_t)optin < h3_fa2_shared())
+        return 0;
+    return head_major ? h3_fa2_attr<1>() : h3_fa2_attr<0>();
+}
+
 /* ----------------------------------------------------------- audio kernels */
 
 __global__ void h3k_audio_qkv_split_f32(const float *qkv, const float *q_bias,
@@ -1760,6 +2053,24 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                     (size_t)h3_attn_max_shared(gpu);
     if (naive && shared + 512 > (size_t)h3_attn_max_shared(gpu))
         return h3_cuda_fail(gpu, "SDPA sequence exceeds shared memory");
+    /* FA2-class tensor-core path: bf16, head_dim == 128, non-causal,
+     * sm_80+, >48KB smem opt-in available. */
+    if (!naive && bf16 && !causal && head_dim == 128 &&
+        h3_attn_has_bf16_mma(gpu) && h3_cuda_sdpa_fa2_enabled() &&
+        h3_fa2_fits(gpu, head_major_output)) {
+        dim3 grid((sequence + H3_FA2_QROWS - 1) / H3_FA2_QROWS, heads, batch);
+        if (head_major_output)
+            h3k_sdpa_fa2_bf16<1><<<grid, H3_FA2_THREADS, h3_fa2_shared()>>>(
+                (const uint16_t *)query->data, (const uint16_t *)key->data,
+                (const uint16_t *)value->data, (uint16_t *)output->data,
+                sequence, heads, scale);
+        else
+            h3k_sdpa_fa2_bf16<0><<<grid, H3_FA2_THREADS, h3_fa2_shared()>>>(
+                (const uint16_t *)query->data, (const uint16_t *)key->data,
+                (const uint16_t *)value->data, (uint16_t *)output->data,
+                sequence, heads, scale);
+        return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
+    }
     /* Tensor-core path: bf16, head_dim == 128, non-causal, sm_80+. */
     if (!naive && bf16 && !causal && head_dim == 128 &&
         h3_attn_has_bf16_mma(gpu) &&
