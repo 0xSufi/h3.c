@@ -1556,6 +1556,20 @@ __device__ __forceinline__ void h3_cp_async_wait(void) {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
+/* Softmax exponent for the FA2/FP8 kernels: FEXP=1 uses ex2.approx.f32
+ * (__exp2f) — a single MUFU op, and ex2(-inf) = +0 exactly like the libm
+ * path needs; FEXP=0 keeps the libm exp2f rounding. Selected once per
+ * process (H3_CUDA_SDPA_EXACT_EXP=1 restores libm). */
+template <int FEXP>
+__device__ __forceinline__ float h3_fa2_exp2(float x) {
+    if (FEXP) {
+        float r;
+        asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+        return r;
+    }
+    return exp2f(x);
+}
+
 /* Stage K/V tile `tile` into `stage`: 2 x 64 rows x 16 chunks of 16 bytes,
  * eight cp.async per thread; rows past the sequence zero-fill (src-size 0)
  * and read from row 0 so the address stays valid. */
@@ -1584,7 +1598,7 @@ __device__ __forceinline__ void h3_fa2_issue(uint16_t *smem,
 }
 #endif
 
-template <int HEAD_MAJOR, int HD>
+template <int HEAD_MAJOR, int HD, int FEXP>
 __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
     h3k_sdpa_fa2_bf16(const uint16_t *__restrict__ query,
                       const uint16_t *__restrict__ key,
@@ -1702,14 +1716,15 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
          * reference it to 0 so exp2f(-inf - 0) = 0 instead of NaN. */
         const float ref0 = mn0 == -INFINITY ? 0.0f : mn0;
         const float ref1 = mn1 == -INFINITY ? 0.0f : mn1;
-        const float c0 = exp2f(m0 - ref0), c1 = exp2f(m1 - ref1);
+        const float c0 = h3_fa2_exp2<FEXP>(m0 - ref0);
+        const float c1 = h3_fa2_exp2<FEXP>(m1 - ref1);
         float rs0 = 0.0f, rs1 = 0.0f;
 #pragma unroll
         for (int n = 0; n < H3_FA2_KVT / 8; n++) {
-            s[n][0] = exp2f(s[n][0] - ref0);
-            s[n][1] = exp2f(s[n][1] - ref0);
-            s[n][2] = exp2f(s[n][2] - ref1);
-            s[n][3] = exp2f(s[n][3] - ref1);
+            s[n][0] = h3_fa2_exp2<FEXP>(s[n][0] - ref0);
+            s[n][1] = h3_fa2_exp2<FEXP>(s[n][1] - ref0);
+            s[n][2] = h3_fa2_exp2<FEXP>(s[n][2] - ref1);
+            s[n][3] = h3_fa2_exp2<FEXP>(s[n][3] - ref1);
             rs0 += s[n][0] + s[n][1];
             rs1 += s[n][2] + s[n][3];
         }
@@ -1778,18 +1793,35 @@ __global__ void __launch_bounds__(H3_FA2_THREADS, HD == 64 ? 2 : 1)
 #endif
 }
 
+/* H3_CUDA_SDPA_EXACT_EXP=1 restores the libm exp2f softmax rounding in the
+ * FA2/FP8 kernels; the default uses ex2.approx.f32 (see h3_fa2_exp2). */
+static int h3_cuda_sdpa_fast_exp(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("H3_CUDA_SDPA_EXACT_EXP");
+        cached = !(value && *value && strcmp(value, "0") != 0);
+    }
+    return cached;
+}
+
 /* One-time >48KB dynamic shared-memory opt-in per instantiation. */
-template <int HEAD_MAJOR, int HD>
+template <int HEAD_MAJOR, int HD, int FEXP>
 static int h3_fa2_attr(void) {
     static int state = 0; /* 0 unknown, 1 ok, -1 failed */
     if (!state)
         state = cudaFuncSetAttribute(
-                    (const void *)h3k_sdpa_fa2_bf16<HEAD_MAJOR, HD>,
+                    (const void *)h3k_sdpa_fa2_bf16<HEAD_MAJOR, HD, FEXP>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     (int)h3_fa2_shared(HD)) == cudaSuccess
                     ? 1
                     : -1;
     return state > 0;
+}
+
+template <int HEAD_MAJOR, int HD>
+static int h3_fa2_attr_exp(void) {
+    return h3_cuda_sdpa_fast_exp() ? h3_fa2_attr<HEAD_MAJOR, HD, 1>()
+                                   : h3_fa2_attr<HEAD_MAJOR, HD, 0>();
 }
 
 /* H3_CUDA_SDPA_FA2=0 routes bf16/hd128 SDPA back to h3k_sdpa_mma_bf16 for
@@ -1807,8 +1839,8 @@ static int h3_fa2_fits(struct h3_gpu *gpu, int head_major, uint32_t head_dim) {
         (size_t)optin < h3_fa2_shared(head_dim))
         return 0;
     if (head_dim == 64)
-        return head_major ? h3_fa2_attr<1, 64>() : h3_fa2_attr<0, 64>();
-    return head_major ? h3_fa2_attr<1, 128>() : h3_fa2_attr<0, 128>();
+        return head_major ? h3_fa2_attr_exp<1, 64>() : h3_fa2_attr_exp<0, 64>();
+    return head_major ? h3_fa2_attr_exp<1, 128>() : h3_fa2_attr_exp<0, 128>();
 }
 
 /* Launch the FA2 kernel for a validated (bf16, non-causal, hd 64/128)
@@ -1819,14 +1851,18 @@ static void h3_fa2_launch(const uint16_t *query, const uint16_t *key,
                           uint32_t head_dim, float scale, int head_major) {
     dim3 grid((sequence + H3_FA2_QROWS - 1) / H3_FA2_QROWS, heads, batch);
     size_t shared = h3_fa2_shared(head_dim);
-#define H3_FA2_GO(HM, HD)                                                  \
-    h3k_sdpa_fa2_bf16<HM, HD><<<grid, H3_FA2_THREADS, shared>>>(           \
+    const int fexp = h3_cuda_sdpa_fast_exp();
+#define H3_FA2_GO(HM, HD, FE)                                              \
+    h3k_sdpa_fa2_bf16<HM, HD, FE><<<grid, H3_FA2_THREADS, shared>>>(       \
         query, key, value, output, sequence, heads, scale)
+#define H3_FA2_GO_EXP(HM, HD)                                              \
+    do { if (fexp) H3_FA2_GO(HM, HD, 1); else H3_FA2_GO(HM, HD, 0); } while (0)
     if (head_dim == 64) {
-        if (head_major) H3_FA2_GO(1, 64); else H3_FA2_GO(0, 64);
+        if (head_major) H3_FA2_GO_EXP(1, 64); else H3_FA2_GO_EXP(0, 64);
     } else {
-        if (head_major) H3_FA2_GO(1, 128); else H3_FA2_GO(0, 128);
+        if (head_major) H3_FA2_GO_EXP(1, 128); else H3_FA2_GO_EXP(0, 128);
     }
+#undef H3_FA2_GO_EXP
 #undef H3_FA2_GO
 }
 
@@ -2081,7 +2117,7 @@ __device__ __forceinline__ void h3_fp8_issue(uint8_t *smem,
 #ifndef H3_FP8_MIN_BLOCKS
 #define H3_FP8_MIN_BLOCKS 2
 #endif
-template <int HEAD_MAJOR>
+template <int HEAD_MAJOR, int FEXP>
 __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
     h3k_sdpa_fa2_fp8(const uint8_t *__restrict__ q8,
                      const uint8_t *__restrict__ k8,
@@ -2184,14 +2220,15 @@ __global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
         const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
         const float ref0 = mn0 == -INFINITY ? 0.0f : mn0;
         const float ref1 = mn1 == -INFINITY ? 0.0f : mn1;
-        const float c0 = exp2f(m0 - ref0), c1 = exp2f(m1 - ref1);
+        const float c0 = h3_fa2_exp2<FEXP>(m0 - ref0);
+        const float c1 = h3_fa2_exp2<FEXP>(m1 - ref1);
         float rs0 = 0.0f, rs1 = 0.0f;
 #pragma unroll
         for (int n = 0; n < H3_FP8_KVT / 8; n++) {
-            s[n][0] = exp2f(s[n][0] - ref0);
-            s[n][1] = exp2f(s[n][1] - ref0);
-            s[n][2] = exp2f(s[n][2] - ref1);
-            s[n][3] = exp2f(s[n][3] - ref1);
+            s[n][0] = h3_fa2_exp2<FEXP>(s[n][0] - ref0);
+            s[n][1] = h3_fa2_exp2<FEXP>(s[n][1] - ref0);
+            s[n][2] = h3_fa2_exp2<FEXP>(s[n][2] - ref1);
+            s[n][3] = h3_fa2_exp2<FEXP>(s[n][3] - ref1);
             rs0 += s[n][0] + s[n][1];
             rs1 += s[n][2] + s[n][3];
         }
@@ -2359,12 +2396,15 @@ static int h3_cuda_sdpa_fp8(struct h3_gpu *gpu, const uint16_t *query,
         fprintf(stderr, "\n  status after pre-pass: %s\n",
                 cudaGetErrorString(cudaGetLastError()));
     }
-    if (head_major)
-        h3k_sdpa_fa2_fp8<1><<<grid, H3_FP8_THREADS, shared>>>(
-            q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale);
-    else
-        h3k_sdpa_fa2_fp8<0><<<grid, H3_FP8_THREADS, shared>>>(
-            q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale);
+#define H3_FP8_GO(HM, FE)                                                  \
+    h3k_sdpa_fa2_fp8<HM, FE><<<grid, H3_FP8_THREADS, shared>>>(            \
+        q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale)
+    if (h3_cuda_sdpa_fast_exp()) {
+        if (head_major) H3_FP8_GO(1, 1); else H3_FP8_GO(0, 1);
+    } else {
+        if (head_major) H3_FP8_GO(1, 0); else H3_FP8_GO(0, 0);
+    }
+#undef H3_FP8_GO
     if (getenv("H3_CUDA_SDPA_FP8_DEBUG")) {
         cudaError_t e = cudaDeviceSynchronize();
         uint16_t ho[8];
