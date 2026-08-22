@@ -156,6 +156,7 @@ void h3_gpu_free(h3_gpu *opaque) {
     if (gpu->lt_workspace) cudaFree(gpu->lt_workspace);
     if (gpu->workspace) cudaFree(gpu->workspace);
     h3_cuda_cache_evict_all(gpu);
+    if (gpu->load_staging) cudaFreeHost(gpu->load_staging);
     for (unsigned i = 0; i < H3_CUDA_H2D_SLOTS; i++) {
         struct h3_cuda_h2d_slot *slot = &gpu->h2d_slots[i];
         if (slot->host) cudaFreeHost(slot->host);
@@ -438,7 +439,7 @@ static int h3_cuda_read_range(int descriptor, unsigned char *staging,
  * chunk of the range into its own slice of the staging buffer. The (much
  * faster) H2D upload stays sequential on the calling thread. */
 #define H3_CUDA_PARALLEL_READ_MIN ((size_t)16 << 20)
-#define H3_CUDA_PARALLEL_READ_THREADS 4
+#define H3_CUDA_PARALLEL_READ_THREADS 8
 
 struct h3_cuda_read_chunk {
     int descriptor;
@@ -494,6 +495,24 @@ static int h3_cuda_read_parallel(int descriptor, unsigned char *staging,
     return tail_status;
 }
 
+/* Pinned, grow-only staging for file loads; NULL when pinned memory is
+ * unavailable (callers fall back to a pageable buffer). */
+static unsigned char *h3_cuda_load_staging(struct h3_gpu *gpu, size_t bytes) {
+    if (gpu->load_staging_bytes >= bytes && gpu->load_staging)
+        return (unsigned char *)gpu->load_staging;
+    if (gpu->load_staging) cudaFreeHost(gpu->load_staging);
+    gpu->load_staging = NULL;
+    gpu->load_staging_bytes = 0;
+    void *fresh = NULL;
+    if (cudaMallocHost(&fresh, bytes ? bytes : 1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    gpu->load_staging = fresh;
+    gpu->load_staging_bytes = bytes;
+    return (unsigned char *)fresh;
+}
+
 static h3_gpu_tensor *h3_cuda_tensor_load_file(
         struct h3_gpu *gpu, const char *path, uint64_t file_offset,
         size_t elements, size_t item_size, h3_gpu_dtype dtype,
@@ -512,7 +531,9 @@ static h3_gpu_tensor *h3_cuda_tensor_load_file(
         h3_gpu_tensor_free(result);
         return NULL;
     }
-    unsigned char *staging = (unsigned char *)malloc(bytes ? bytes : 1);
+    unsigned char *staging = h3_cuda_load_staging(gpu, bytes);
+    int pinned = staging != NULL;
+    if (!staging) staging = (unsigned char *)malloc(bytes ? bytes : 1);
     if (!staging) {
         h3_cuda_fail(gpu, "out of memory staging %s payload", label);
         close(descriptor);
@@ -527,19 +548,26 @@ static h3_gpu_tensor *h3_cuda_tensor_load_file(
         h3_cuda_fail(gpu, "cannot read %s payload from %s: %s", label, path,
                      read_status > 0 ? strerror(read_status)
                                      : "unexpected end of file");
-        free(staging);
+        if (!pinned) free(staging);
         h3_gpu_tensor_free(result);
         return NULL;
     }
     if (bytes) {
-        int uploaded = h3_cuda_h2d(gpu, tensor->data, staging, bytes);
-        free(staging);
+        /* Pinned staging uploads with one synchronous DMA (the buffer is
+         * reused by the next load); the pageable fallback goes through the
+         * H2D ring. */
+        int uploaded = pinned
+            ? cudaMemcpy(tensor->data, staging, bytes,
+                         cudaMemcpyHostToDevice) == cudaSuccess
+            : h3_cuda_h2d(gpu, tensor->data, staging, bytes);
+        if (!pinned) free(staging);
         if (!uploaded) {
+            (void)cudaGetLastError();
             h3_cuda_fail(gpu, "tensor upload failed");
             h3_gpu_tensor_free(result);
             return NULL;
         }
-    } else {
+    } else if (!pinned) {
         free(staging);
     }
     return result;

@@ -66,6 +66,13 @@ struct h3_gpu {
      * guards reuse so a new write cannot clobber a copy still in flight. */
     struct h3_cuda_h2d_slot h2d_slots[H3_CUDA_H2D_SLOTS];
     unsigned h2d_next;          /* round-robin slot cursor */
+    /* Grow-only pinned staging for whole-tensor file loads
+     * (h3_cuda_tensor_load_file): preads land in it directly and upload
+     * with one DMA, instead of a fresh pageable malloc per tensor whose
+     * page faults plus the extra copy into the H2D ring capped the DiT
+     * load at ~0.6 GB/s on a 10 GB/s NVMe. */
+    void *load_staging;
+    size_t load_staging_bytes;
 };
 
 static inline size_t h3_cuda_item_size(h3_gpu_dtype dtype) {
