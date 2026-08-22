@@ -195,6 +195,11 @@ static uint32_t h3_cuda_gemm_alignment(const void *pointer) {
 /* Element size of a cublasLt matrix type used here. */
 /* Re-read per call (cheap) so a process can toggle it, e.g. the tests pin
  * exact F32 and then exercise the TF32 path explicitly. */
+static int h3_cuda_gemm_tune_enabled(void) {
+    const char *value = getenv("H3_CUDA_GEMM_TUNE");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
 static int h3_cuda_tf32_enabled(void) {
     const char *value = getenv("H3_CUDA_TF32");
     return !(value && *value && strcmp(value, "0") == 0);
@@ -235,7 +240,12 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
      * products see 10-bit mantissas, accumulation stays F32. The VAE
      * decoder's F32 projections are the main user; the SIMT F32 path is
      * 3-4x slower on GB10. */
-    int tf32 = ab_type == CUDA_R_32F && h3_cuda_tf32_enabled();
+    /* Only worth it — and only applied — for reductions of at least 1024
+     * elements: the DiT's F32 patch projections (K = 32 / 96) are
+     * bandwidth-bound and stay exact, so TF32 cannot perturb the sampler;
+     * the VAE decoder's projections (K = 2048 / 8192) are the target. */
+    int tf32 = ab_type == CUDA_R_32F && input_dim >= 1024 &&
+               h3_cuda_tf32_enabled();
     if (cublasLtMatmulDescCreate(&desc, tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32
                                              : CUBLAS_COMPUTE_32F,
                                  CUDA_R_32F) != CUBLAS_STATUS_SUCCESS)
@@ -327,7 +337,14 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
                 CUBLAS_STATUS_SUCCESS ||
             results < 1)
             goto done;
-        if (cudaEventCreate(&start) == cudaSuccess &&
+        /* Empirical probing is opt-in (H3_CUDA_GEMM_TUNE=1): with the
+         * reduction mask in place the heuristic's first result won or tied
+         * (within 4%) on every DiT and VAE shape in the tune log, the probes
+         * cost a one-time 20-65 s per run at 15 s video shapes, and a
+         * single-run timing pick is noisy enough to make GEMM algorithm
+         * choice — and so bitwise output — vary between runs. */
+        if (h3_cuda_gemm_tune_enabled() &&
+            cudaEventCreate(&start) == cudaSuccess &&
             cudaEventCreate(&stop) == cudaSuccess) {
             for (int i = 0; i < results; i++) {
                 float ms = h3_cuda_gemm_time_algo(
@@ -361,7 +378,20 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
             tuned_algo = candidates[best].algo;
             algo = &tuned_algo;
         } else {
+            /* Heuristic #0, cached like a tuned winner so the per-call
+             * heuristic query is paid once per shape. */
             algo = &candidates[0].algo;
+            if (candidates[0].state == CUBLAS_STATUS_SUCCESS &&
+                candidates[0].workspaceSize <= gpu->lt_workspace_bytes) {
+                entry = h3_cuda_gemm_algo_slot();
+                *entry = (h3_cuda_gemm_algo_entry){
+                    rows, input_dim, output_dim, ld_x, ld_w, ld_c,
+                    align_a, align_b, align_c,
+                    (int)ab_type, (int)cd_type, bias_epilogue, tf32,
+                    candidates[0].workspaceSize, candidates[0].algo, 1};
+                tuned_algo = candidates[0].algo;
+                algo = &tuned_algo;
+            }
         }
     }
     if (cublasLtMatmul(gpu->lt, desc, &alpha, weight, a_desc, x, b_desc,

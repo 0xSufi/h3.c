@@ -643,11 +643,12 @@ static void test_linear_f32_big(void) {
     free(in); free(w); free(b); free(ref); free(got);
 }
 
-/* Same 64x512x512 projection with TF32 enabled: products see 10-bit
- * mantissas, so the answer is only required to land within 1e-2 relative
- * (+1e-3 absolute) of the F32 reference, versus 1e-3 for exact F32. */
+/* A 64x2048x256 projection with TF32 enabled (TF32 only applies to
+ * reductions of at least 1024 elements): products see 10-bit mantissas, so
+ * the answer is only required to land within 1e-2 relative (+1e-3
+ * absolute) of the F32 reference, versus 1e-3 for exact F32. */
 static void test_linear_f32_tf32(void) {
-    const uint32_t rows = 64, in_dim = 512, out_dim = 512;
+    const uint32_t rows = 64, in_dim = 2048, out_dim = 256;
     float *in = malloc(rows * in_dim * 4), *w = malloc(out_dim * in_dim * 4),
           *b = malloc(out_dim * 4), *ref = malloc(rows * out_dim * 4),
           *got = malloc(rows * out_dim * 4);
@@ -670,7 +671,7 @@ static void test_linear_f32_tf32(void) {
         if (err > max_err) max_err = err;
         if (!(err <= 1e-3 + 1e-2 * fabs((double)ref[i]))) bad++;
     }
-    report("linear_f32 64x512x512 tf32", max_err, bad);
+    report("linear_f32 64x2048x256 tf32", max_err, bad);
     h3_gpu_tensor_free(ti); h3_gpu_tensor_free(tw); h3_gpu_tensor_free(tb);
     h3_gpu_tensor_free(to);
     free(in); free(w); free(b); free(ref); free(got);
