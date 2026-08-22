@@ -953,6 +953,121 @@ static void test_patch_linear_bf16_map(void) {
     free(sentinel);
 }
 
+/* FP8 projection path (H3_CUDA_FP8=1): weights and activations quantized to
+ * e4m3 with per-tensor scales, cublasLt FP8 GEMM, bf16 output. e4m3 keeps 3
+ * mantissa bits, so against the f32 reference the result carries a few
+ * percent of relative error (measured ~5% rel-L2 at these shapes) — the
+ * checks bound rel-L2 and the worst element relative to the output range.
+ * A rel-L2 under 5e-3 means the bf16 path ran instead (the device or
+ * library cannot serve FP8); that is reported, not failed. */
+static void report_fp8(const char *name, const uint16_t *got,
+                       const uint16_t *ref, size_t n, double max_rel_l2) {
+    double num = 0, den = 0, max_err = 0, max_ref = 0;
+    for (size_t i = 0; i < n; i++) {
+        double g = host_bf16_to_f32(got[i]), r = host_bf16_to_f32(ref[i]);
+        num += (g - r) * (g - r);
+        den += r * r;
+        if (fabs(g - r) > max_err) max_err = fabs(g - r);
+        if (fabs(r) > max_ref) max_ref = fabs(r);
+    }
+    double rel_l2 = den > 0 ? sqrt(num / den) : 0.0;
+    int bad = rel_l2 > max_rel_l2 || max_err > 0.2 * max_ref;
+    printf("%s %s rel-L2=%.3g max_err=%.3g (max|ref| %.3g)%s\n",
+           bad ? "FAIL" : "ok  ", name, rel_l2, max_err, max_ref,
+           rel_l2 < 5e-3 ? " [bf16 path: FP8 not served]" : "");
+    if (bad) failures++;
+}
+
+static void test_linear_bf16_fp8(void) {
+    const uint32_t rows = 1024, in_dim = 512, out_dim = 256;
+    uint16_t *in = malloc(rows * in_dim * 2), *w = malloc(out_dim * in_dim * 2),
+             *b = malloc(out_dim * 2),
+             *ref = malloc(rows * out_dim * 2), *got = malloc(rows * out_dim * 2);
+    float *fin = malloc(rows * in_dim * 4), *fw = malloc(out_dim * in_dim * 4),
+          *fb = malloc(out_dim * 4), *fref = malloc(rows * out_dim * 4);
+    for (uint32_t i = 0; i < rows * in_dim; i++) { in[i] = host_f32_to_bf16(frand(0.2f)); fin[i] = host_bf16_to_f32(in[i]); }
+    for (uint32_t i = 0; i < out_dim * in_dim; i++) { w[i] = host_f32_to_bf16(frand(0.2f)); fw[i] = host_bf16_to_f32(w[i]); }
+    for (uint32_t i = 0; i < out_dim; i++) { b[i] = host_f32_to_bf16(frand(0.2f)); fb[i] = host_bf16_to_f32(b[i]); }
+    ref_linear_f32(fin, fw, fb, fref, rows, in_dim, out_dim);
+    for (uint32_t i = 0; i < rows * out_dim; i++) ref[i] = host_f32_to_bf16(fref[i]);
+    h3_gpu_tensor *ti = mk_bf16(in, rows * in_dim),
+                  *tw = mk_bf16(w, out_dim * in_dim),
+                  *tb = mk_bf16(b, out_dim), *to = new_bf16(rows * out_dim);
+    h3_gpu_stats before, after;
+    OP(h3_gpu_get_stats(gpu, &before));
+    setenv("H3_CUDA_FP8", "1", 1);
+    OP(h3_gpu_linear_bf16(gpu, to, ti, tw, tb, rows, in_dim, out_dim));
+    run();
+    /* second call: the cached FP8 weight must give the same answer */
+    h3_gpu_tensor *to2 = new_bf16(rows * out_dim);
+    OP(h3_gpu_linear_bf16(gpu, to2, ti, tw, tb, rows, in_dim, out_dim));
+    run();
+    setenv("H3_CUDA_FP8", "0", 1);
+    OP(h3_gpu_get_stats(gpu, &after));
+    OP(h3_gpu_tensor_read_bf16(to, got, rows * out_dim));
+    report_fp8("linear_bf16 fp8 1024x512x256+bias", got, ref, rows * out_dim, 0.08);
+    uint16_t *got2 = malloc(rows * out_dim * 2);
+    OP(h3_gpu_tensor_read_bf16(to2, got2, rows * out_dim));
+    if (memcmp(got, got2, rows * out_dim * 2) != 0) {
+        printf("FAIL linear_bf16 fp8 cached-weight call differs\n");
+        failures++;
+    } else {
+        printf("ok   linear_bf16 fp8 cached-weight call matches\n");
+    }
+    if (after.mps_linear_dispatches != before.mps_linear_dispatches + 2) {
+        printf("FAIL linear_bf16 fp8 did not bump mps_linear_dispatches by 2\n");
+        failures++;
+    }
+    h3_gpu_tensor_free(ti); h3_gpu_tensor_free(tw); h3_gpu_tensor_free(tb);
+    h3_gpu_tensor_free(to); h3_gpu_tensor_free(to2);
+    free(in); free(w); free(b); free(ref); free(got); free(got2);
+    free(fin); free(fw); free(fb); free(fref);
+}
+
+static void test_mlp_bf16_fp8(void) {
+    const uint32_t rows = 1024, in_dim = 256, hidden = 256, out_dim = 256;
+    uint16_t *in = malloc(rows * in_dim * 2),
+             *fc1 = malloc(2 * hidden * in_dim * 2),
+             *fc2 = malloc(out_dim * hidden * 2),
+             *ref = malloc(rows * out_dim * 2), *got = malloc(rows * out_dim * 2);
+    float *fin = malloc(rows * in_dim * 4), *ffc1 = malloc(2 * hidden * in_dim * 4),
+          *ffc2 = malloc(out_dim * hidden * 4);
+    for (uint32_t i = 0; i < rows * in_dim; i++) { in[i] = host_f32_to_bf16(frand(1.0f)); fin[i] = host_bf16_to_f32(in[i]); }
+    for (uint32_t i = 0; i < 2 * hidden * in_dim; i++) { fc1[i] = host_f32_to_bf16(frand(0.1f)); ffc1[i] = host_bf16_to_f32(fc1[i]); }
+    for (uint32_t i = 0; i < out_dim * hidden; i++) { fc2[i] = host_f32_to_bf16(frand(0.1f)); ffc2[i] = host_bf16_to_f32(fc2[i]); }
+    float *act = malloc(rows * hidden * 4);
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t hh = 0; hh < hidden; hh++) {
+            float gate = 0.0f, up = 0.0f;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                gate += fin[r * in_dim + k] * ffc1[hh * in_dim + k];
+                up += fin[r * in_dim + k] * ffc1[(hidden + hh) * in_dim + k];
+            }
+            act[r * hidden + hh] = ref_silu(gate) * up;
+        }
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t o = 0; o < out_dim; o++) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < hidden; k++)
+                sum += act[r * hidden + k] * ffc2[o * hidden + k];
+            ref[r * out_dim + o] = host_f32_to_bf16(sum);
+        }
+    h3_gpu_tensor *ti = mk_bf16(in, rows * in_dim),
+                  *t1 = mk_bf16(fc1, 2 * hidden * in_dim),
+                  *t2 = mk_bf16(fc2, out_dim * hidden),
+                  *to = new_bf16(rows * out_dim);
+    setenv("H3_CUDA_FP8", "1", 1);
+    OP(h3_gpu_mlp_bf16(gpu, to, ti, t1, t2, rows, in_dim, hidden, out_dim));
+    run();
+    setenv("H3_CUDA_FP8", "0", 1);
+    OP(h3_gpu_tensor_read_bf16(to, got, rows * out_dim));
+    report_fp8("mlp_bf16 fp8 1024x256x256x256", got, ref, rows * out_dim, 0.12);
+    h3_gpu_tensor_free(ti); h3_gpu_tensor_free(t1); h3_gpu_tensor_free(t2);
+    h3_gpu_tensor_free(to);
+    free(in); free(fc1); free(fc2); free(ref); free(got); free(fin); free(ffc1);
+    free(ffc2); free(act);
+}
+
 static void test_mlp_bf16(void) {
     const uint32_t rows = 4, in_dim = 8, hidden = 6, out_dim = 5;
     uint16_t *in = malloc(rows * in_dim * 2),
@@ -1258,6 +1373,7 @@ int main(void) {
      * exact-F32 checks below pin it off, and test_linear_f32_tf32 covers the
      * TF32 path with its own tolerance. */
     setenv("H3_CUDA_TF32", "0", 1);
+    setenv("H3_CUDA_FP8", "0", 1);
     gpu = h3_gpu_create(NULL, error, sizeof(error));
     if (!gpu) { fprintf(stderr, "h3_gpu_create failed: %s\n", error); return 2; }
     OP(h3_gpu_begin(gpu));
@@ -1291,6 +1407,8 @@ int main(void) {
     test_patch_linear_bf16();
     test_patch_linear_bf16_map();
     test_mlp_bf16();
+    test_linear_bf16_fp8();
+    test_mlp_bf16_fp8();
     test_h2d_ring_stress();
     test_alloc_churn();
     test_file_load_bf16();

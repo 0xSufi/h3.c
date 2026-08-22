@@ -157,6 +157,7 @@ void h3_gpu_free(h3_gpu *opaque) {
     if (gpu->workspace) cudaFree(gpu->workspace);
     h3_cuda_cache_evict_all(gpu);
     if (gpu->load_staging) cudaFreeHost(gpu->load_staging);
+    h3_cuda_fp8_release(gpu);
     for (unsigned i = 0; i < H3_CUDA_H2D_SLOTS; i++) {
         struct h3_cuda_h2d_slot *slot = &gpu->h2d_slots[i];
         if (slot->host) cudaFreeHost(slot->host);
@@ -669,6 +670,7 @@ void h3_gpu_tensor_free(h3_gpu_tensor *opaque) {
             owner->stats.live_bytes - tensor->bytes : 0;
     }
     if (tensor->data) {
+        if (owner) h3_cuda_fp8_forget(owner, tensor->data);
         /* Return the block to the context cache instead of cudaFree (which
          * device-synchronizes). Reuse is stream-ordered on the default
          * stream; the cache is evicted at allocation boundaries. */

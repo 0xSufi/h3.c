@@ -891,10 +891,13 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         !h3_cuda_require_command(gpu)) return 0;
     int kind = h3_cuda_linear_kind(rows, input_dim, output_dim);
     if (rows && output_dim &&
-        h3_cuda_gemm_xwt(gpu, input->data, weight->data,
-                         bias ? bias->data : NULL, output->data,
-                         CUDA_R_16BF, CUDA_R_16BF, rows, input_dim,
-                         output_dim))
+        (h3_cuda_gemm_xwt_fp8(gpu, input->data, weight->data,
+                              bias ? bias->data : NULL, output->data, rows,
+                              input_dim, output_dim) ||
+         h3_cuda_gemm_xwt(gpu, input->data, weight->data,
+                          bias ? bias->data : NULL, output->data,
+                          CUDA_R_16BF, CUDA_R_16BF, rows, input_dim,
+                          output_dim)))
         return h3_cuda_launch_check_kind(gpu, "h3_linear_bf16", kind);
     if (rows && output_dim)
         h3k_linear_bf16<<<h3_cuda_grid_2d(output_dim, rows), dim3(16, 16)>>>(
@@ -1074,7 +1077,10 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
             uint16_t *fused = workspace;
             uint16_t *activated_bf16 =
                 (uint16_t *)((char *)workspace + activated_off);
-            served = h3_cuda_gemm_xwt(gpu, input->data, fc1_weight->data,
+            served = h3_cuda_gemm_xwt_fp8(gpu, input->data, fc1_weight->data,
+                                          NULL, fused, rows, input_dim,
+                                          2 * hidden_dim) ||
+                     h3_cuda_gemm_xwt(gpu, input->data, fc1_weight->data,
                                       NULL, fused, CUDA_R_16BF, CUDA_R_16BF,
                                       rows, input_dim, 2 * hidden_dim);
             if (served) {
@@ -1084,7 +1090,11 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                 served = cudaGetLastError() == cudaSuccess;
             }
             if (served)
-                served = h3_cuda_gemm_xwt(gpu, activated_bf16,
+                served = h3_cuda_gemm_xwt_fp8(gpu, activated_bf16,
+                                              fc2_weight->data, NULL,
+                                              output->data, rows, hidden_dim,
+                                              output_dim) ||
+                         h3_cuda_gemm_xwt(gpu, activated_bf16,
                                           fc2_weight->data, NULL,
                                           output->data, CUDA_R_16BF,
                                           CUDA_R_16BF, rows, hidden_dim,

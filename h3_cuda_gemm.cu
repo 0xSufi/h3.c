@@ -37,6 +37,8 @@ extern "C" {
 }
 #include "h3_cuda_internal.h"
 
+#include <cuda_fp8.h>
+
 /* Bias add for when cublasLt serves the GEMM but not the bias epilogue: the
  * GEMM runs with beta=0 and the bias is added in F32, rounding to BF16 once
  * at the end (the hand kernels seed the accumulator with the bias instead;
@@ -222,7 +224,8 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
                             cudaDataType ab_type, cudaDataType cd_type,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim, uint32_t ld_x, uint32_t ld_w,
-                            uint32_t ld_c, int bias_epilogue) {
+                            uint32_t ld_c, int bias_epilogue,
+                            const float *a_scale, const float *b_scale) {
     cublasLtMatmulDesc_t desc = NULL;
     cublasLtMatrixLayout_t a_desc = NULL, b_desc = NULL, c_desc = NULL;
     cublasLtMatmulPreference_t preference = NULL;
@@ -255,6 +258,15 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
             CUBLAS_STATUS_SUCCESS ||
         cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
                                        &identity, sizeof(identity)) !=
+            CUBLAS_STATUS_SUCCESS) goto done;
+    /* FP8: per-tensor device scales for A (weight) and B (activation). */
+    if (a_scale &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                       &a_scale, sizeof(a_scale)) !=
+            CUBLAS_STATUS_SUCCESS) goto done;
+    if (b_scale &&
+        cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                       &b_scale, sizeof(b_scale)) !=
             CUBLAS_STATUS_SUCCESS) goto done;
     if (bias_epilogue) {
         cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
@@ -528,11 +540,12 @@ int h3_cuda_gemm_xwt(struct h3_gpu *gpu, const void *x, const void *weight,
         int served = bias && ((uintptr_t)bias & 15) == 0 &&
                      h3_cuda_gemm_run(gpu, gemm_x, gemm_w, bias, gemm_c,
                                       ab_type, cd_type, rows, input_dim,
-                                      output_dim, ld_x, ld_w, ld_c, 1);
+                                      output_dim, ld_x, ld_w, ld_c, 1, NULL,
+                                      NULL);
         if (!served &&
             !h3_cuda_gemm_run(gpu, gemm_x, gemm_w, NULL, gemm_c, ab_type,
                               cd_type, rows, input_dim, output_dim, ld_x,
-                              ld_w, ld_c, 0))
+                              ld_w, ld_c, 0, NULL, NULL))
             return 0;
         if (stage_c &&
             cudaMemcpy2DAsync(c, (size_t)output_dim * cd_elem, gemm_c,
@@ -559,4 +572,268 @@ copy_failed:
      * into a clean error state. */
     (void)cudaGetLastError();
     return 0;
+}
+
+/* ------------------------------------------------------------------- FP8 */
+
+/* Per-tensor e4m3 path for the bf16 projections, opt-in with H3_CUDA_FP8=1.
+ * Weights are quantized once per tensor (scale = absmax / 448) into a
+ * context-owned cache, the activation per call into fp8_scratch, and
+ * cublasLt runs the TN FP8 GEMM with both scales applied — F32 accumulate,
+ * bf16 output. GB10 cublasLt: 215 TFLOPS at the DiT QKV shape against 105
+ * for bf16. Per-row / per-channel scaling (OUTER_VEC) is NOT_SUPPORTED for
+ * FP8 by this cublasLt on sm_121, so scaling is per tensor; e4m3 keeps 3
+ * mantissa bits, so outputs carry a few percent of relative error against
+ * the bf16 path (see test_cuda_core's fp8 checks). */
+static int h3_cuda_fp8_enabled(void) {
+    const char *value = getenv("H3_CUDA_FP8");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+__global__ void h3k_fp8_absmax_bf16(const uint16_t *__restrict__ x, size_t n,
+                                    unsigned *__restrict__ result) {
+    __shared__ unsigned partial[256];
+    float m = 0.0f;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    size_t n8 = n / 8;
+    if ((((uintptr_t)x) & 15) == 0) {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8;
+             i += stride) {
+            uint4 v = ((const uint4 *)x)[i];
+            uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                m = fmaxf(m, fabsf(h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu))));
+                m = fmaxf(m, fabsf(h3_bf16_to_f32((uint16_t)(w[j] >> 16))));
+            }
+        }
+        for (size_t i = n8 * 8 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += stride)
+            m = fmaxf(m, fabsf(h3_bf16_to_f32(x[i])));
+    } else {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+             i += stride)
+            m = fmaxf(m, fabsf(h3_bf16_to_f32(x[i])));
+    }
+    partial[threadIdx.x] = __float_as_uint(m);
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s; s >>= 1) {
+        if (threadIdx.x < s)
+            partial[threadIdx.x] = max(partial[threadIdx.x],
+                                       partial[threadIdx.x + s]);
+        __syncthreads();
+    }
+    /* Non-negative floats order like their bit patterns. */
+    if (threadIdx.x == 0) atomicMax(result, partial[0]);
+}
+
+__global__ void h3k_fp8_scale(const unsigned *__restrict__ absmax_bits,
+                              float *__restrict__ scale,
+                              float *__restrict__ inverse) {
+    float m = __uint_as_float(*absmax_bits);
+    float s = m > 0.0f ? m / 448.0f : 1.0f;
+    *scale = s;
+    *inverse = 1.0f / s;
+}
+
+template <int VEC>
+__global__ void h3k_fp8_quantize_bf16(const uint16_t *__restrict__ x,
+                                      uint8_t *__restrict__ out, size_t n,
+                                      const float *__restrict__ inverse) {
+    const float inv = *inverse;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    if (VEC) {
+        size_t n8 = n / 8;
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8;
+             i += stride) {
+            uint4 v = ((const uint4 *)x)[i];
+            uint32_t w[4] = {v.x, v.y, v.z, v.w};
+            uint32_t packed[2] = {0u, 0u};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float lo = h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu)) * inv;
+                float hi = h3_bf16_to_f32((uint16_t)(w[j] >> 16)) * inv;
+                __nv_fp8x2_storage_t p = __nv_cvt_float2_to_fp8x2(
+                    make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+                packed[j >> 1] |= (uint32_t)p << ((j & 1) * 16);
+            }
+            ((uint2 *)out)[i] = make_uint2(packed[0], packed[1]);
+        }
+        for (size_t i = n8 * 8 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += stride)
+            out[i] = (uint8_t)__nv_cvt_float_to_fp8(h3_bf16_to_f32(x[i]) * inv,
+                                                    __NV_SATFINITE, __NV_E4M3);
+    } else {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+             i += stride)
+            out[i] = (uint8_t)__nv_cvt_float_to_fp8(h3_bf16_to_f32(x[i]) * inv,
+                                                    __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+/* Launch absmax -> scale -> quantize for `elements` bf16 values; no sync. */
+static int h3_cuda_fp8_quantize(const uint16_t *x, uint8_t *out,
+                                size_t elements, unsigned *absmax,
+                                float *scale, float *inverse) {
+    if (cudaMemsetAsync(absmax, 0, sizeof(unsigned), 0) != cudaSuccess)
+        return 0;
+    unsigned blocks = (unsigned)((elements / 8 + 255) / 256);
+    if (!blocks) blocks = 1;
+    if (blocks > 2048u) blocks = 2048u;
+    h3k_fp8_absmax_bf16<<<blocks, 256>>>(x, elements, absmax);
+    h3k_fp8_scale<<<1, 1>>>(absmax, scale, inverse);
+    if (((uintptr_t)x & 15) == 0 && ((uintptr_t)out & 7) == 0)
+        h3k_fp8_quantize_bf16<1><<<blocks, 256>>>(x, out, elements, inverse);
+    else
+        h3k_fp8_quantize_bf16<0><<<blocks, 256>>>(x, out, elements, inverse);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+static int h3_cuda_fp8_prepare(struct h3_gpu *gpu) {
+    if (!gpu->fp8_weights) {
+        gpu->fp8_weights = (struct h3_cuda_fp8_weight *)calloc(
+            H3_CUDA_FP8_WEIGHTS, sizeof(*gpu->fp8_weights));
+        if (!gpu->fp8_weights) return 0;
+    }
+    if (!gpu->fp8_scales &&
+        cudaMalloc((void **)&gpu->fp8_scales,
+                   (H3_CUDA_FP8_WEIGHTS + 2) * sizeof(float)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        gpu->fp8_scales = NULL;
+        return 0;
+    }
+    if (!gpu->fp8_absmax &&
+        cudaMalloc((void **)&gpu->fp8_absmax, sizeof(unsigned)) !=
+            cudaSuccess) {
+        (void)cudaGetLastError();
+        gpu->fp8_absmax = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* Cached e4m3 copy of a bf16 weight (output_dim x input_dim); quantized on
+ * first use, scale at fp8_scales[*index]. */
+static struct h3_cuda_fp8_weight *h3_cuda_fp8_weight(struct h3_gpu *gpu,
+                                                     const void *weight,
+                                                     size_t elements,
+                                                     int *index) {
+    struct h3_cuda_fp8_weight *slot = NULL;
+    int slot_index = -1;
+    for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
+        struct h3_cuda_fp8_weight *entry = &gpu->fp8_weights[i];
+        if (entry->valid && entry->key == weight &&
+            entry->elements == elements) {
+            *index = i;
+            return entry;
+        }
+        if (!slot && !entry->valid) { slot = entry; slot_index = i; }
+    }
+    if (!slot) {
+        /* Cache full: evict round robin. */
+        static unsigned clock;
+        slot_index = (int)(clock++ % H3_CUDA_FP8_WEIGHTS);
+        slot = &gpu->fp8_weights[slot_index];
+        if (slot->data) cudaFree(slot->data);
+        memset(slot, 0, sizeof(*slot));
+    }
+    void *data = NULL;
+    if (cudaMalloc(&data, elements ? elements : 1) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    float *inverse = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS + 1;
+    if (!h3_cuda_fp8_quantize((const uint16_t *)weight, (uint8_t *)data,
+                              elements, gpu->fp8_absmax,
+                              gpu->fp8_scales + slot_index, inverse)) {
+        cudaFree(data);
+        return NULL;
+    }
+    slot->key = weight;
+    slot->elements = elements;
+    slot->data = data;
+    slot->valid = 1;
+    *index = slot_index;
+    return slot;
+}
+
+void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data) {
+    if (!gpu || !gpu->fp8_weights || !data) return;
+    for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
+        struct h3_cuda_fp8_weight *entry = &gpu->fp8_weights[i];
+        if (entry->valid && entry->key == data) {
+            cudaFree(entry->data);
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+}
+
+void h3_cuda_fp8_release(struct h3_gpu *gpu) {
+    if (!gpu) return;
+    if (gpu->fp8_weights) {
+        for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++)
+            if (gpu->fp8_weights[i].data) cudaFree(gpu->fp8_weights[i].data);
+        free(gpu->fp8_weights);
+        gpu->fp8_weights = NULL;
+    }
+    if (gpu->fp8_scales) cudaFree(gpu->fp8_scales);
+    if (gpu->fp8_scratch) cudaFree(gpu->fp8_scratch);
+    if (gpu->fp8_absmax) cudaFree(gpu->fp8_absmax);
+    gpu->fp8_scales = NULL;
+    gpu->fp8_scratch = NULL;
+    gpu->fp8_scratch_bytes = 0;
+    gpu->fp8_absmax = NULL;
+}
+
+int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
+                         const void *weight, const void *bias, void *c,
+                         uint32_t rows, uint32_t input_dim,
+                         uint32_t output_dim) {
+    if (!gpu || !gpu->lt || gpu->no_cublas || !h3_cuda_fp8_enabled() ||
+        rows < 512 || !input_dim || !output_dim || input_dim % 16 ||
+        output_dim % 16 || ((uintptr_t)c & 15) ||
+        (bias && ((uintptr_t)bias & 15)))
+        return 0;
+    if (!h3_cuda_fp8_prepare(gpu)) return 0;
+    size_t x_elements = (size_t)rows * input_dim;
+    if (gpu->fp8_scratch_bytes < x_elements) {
+        /* cudaFree device-synchronizes, so in-flight users of the old
+         * scratch are done before it goes. */
+        if (gpu->fp8_scratch) cudaFree(gpu->fp8_scratch);
+        gpu->fp8_scratch = NULL;
+        gpu->fp8_scratch_bytes = 0;
+        if (cudaMalloc(&gpu->fp8_scratch, x_elements) != cudaSuccess) {
+            (void)cudaGetLastError();
+            gpu->fp8_scratch = NULL;
+            return 0;
+        }
+        gpu->fp8_scratch_bytes = x_elements;
+    }
+    int index = -1;
+    struct h3_cuda_fp8_weight *entry = h3_cuda_fp8_weight(
+        gpu, weight, (size_t)output_dim * input_dim, &index);
+    if (!entry) return 0;
+    float *a_scale = gpu->fp8_scales + index;
+    float *b_scale = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS;
+    if (!h3_cuda_fp8_quantize((const uint16_t *)x,
+                              (uint8_t *)gpu->fp8_scratch, x_elements,
+                              gpu->fp8_absmax, b_scale, b_scale + 1))
+        return 0;
+    int served = bias &&
+                 h3_cuda_gemm_run(gpu, gpu->fp8_scratch, entry->data, bias, c,
+                                  CUDA_R_8F_E4M3, CUDA_R_16BF, rows,
+                                  input_dim, output_dim, input_dim,
+                                  input_dim, output_dim, 1, a_scale, b_scale);
+    if (!served &&
+        !h3_cuda_gemm_run(gpu, gpu->fp8_scratch, entry->data, NULL, c,
+                          CUDA_R_8F_E4M3, CUDA_R_16BF, rows, input_dim,
+                          output_dim, input_dim, input_dim, output_dim, 0,
+                          a_scale, b_scale))
+        return 0;
+    if (!served && bias)
+        h3k_gemm_bias_bf16<<<h3_cuda_gemm_grid_2d(output_dim, rows),
+                             dim3(16, 16)>>>((uint16_t *)c,
+                                             (const uint16_t *)bias, rows,
+                                             output_dim);
+    return cudaGetLastError() == cudaSuccess;
 }

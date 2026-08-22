@@ -36,6 +36,16 @@ struct h3_cuda_h2d_slot {
     int event_valid;
 };
 
+/* FP8 weight cache entry (h3_cuda_gemm.cu): e4m3 copy of a bf16 projection
+ * weight with its per-tensor scale kept at fp8_scales[index]. */
+#define H3_CUDA_FP8_WEIGHTS 320
+struct h3_cuda_fp8_weight {
+    const void *key;    /* bf16 weight tensor data pointer */
+    size_t elements;
+    void *data;         /* device e4m3, elements bytes */
+    int valid;
+};
+
 struct h3_gpu {
     int device;
     int active;                 /* inside h3_gpu_begin..h3_gpu_submit */
@@ -73,6 +83,15 @@ struct h3_gpu {
      * load at ~0.6 GB/s on a 10 GB/s NVMe. */
     void *load_staging;
     size_t load_staging_bytes;
+    /* FP8 projection path (H3_CUDA_FP8=1, h3_cuda_gemm.cu): cached e4m3
+     * weights, device scales ([H3_CUDA_FP8_WEIGHTS] weight scales followed
+     * by the activation scale and its inverse), a grow-only scratch for the
+     * quantized activation, and the absmax accumulator. */
+    struct h3_cuda_fp8_weight *fp8_weights;
+    float *fp8_scales;
+    void *fp8_scratch;
+    size_t fp8_scratch_bytes;
+    unsigned *fp8_absmax;
 };
 
 static inline size_t h3_cuda_item_size(h3_gpu_dtype dtype) {
@@ -169,6 +188,17 @@ int h3_cuda_gemm_xwt(struct h3_gpu *gpu, const void *x, const void *weight,
                      const void *bias, void *c, cudaDataType ab_type,
                      cudaDataType cd_type, uint32_t rows, uint32_t input_dim,
                      uint32_t output_dim);
+/* FP8 variant of the bf16 projection: x and weight are bf16, output bf16.
+ * Returns 0 (having launched nothing that matters) when the path is
+ * disabled (H3_CUDA_FP8 unset), the shape is unsuitable, or cublasLt cannot
+ * serve it; callers then take their bf16 path. */
+int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
+                         const void *weight, const void *bias, void *c,
+                         uint32_t rows, uint32_t input_dim,
+                         uint32_t output_dim);
+/* Drop the cached FP8 copy of a weight tensor being freed / the whole cache. */
+void h3_cuda_fp8_forget(struct h3_gpu *gpu, const void *data);
+void h3_cuda_fp8_release(struct h3_gpu *gpu);
 
 /* BF16 helpers: raw uint16 storage, exact widening on load and
  * round-to-nearest-even on store, matching h3_shaders.metal. */
