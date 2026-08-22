@@ -744,12 +744,18 @@ static int h3_cuda_fp8_prepare(struct h3_gpu *gpu) {
     return 1;
 }
 
-/* Cached e4m3 copy of a bf16 weight (output_dim x input_dim); quantized on
- * first use, scale at fp8_scales[*index]. */
+static int h3_cuda_fp8_quantize_f32v(const float *x, uint8_t *out,
+                                     size_t elements, unsigned *absmax,
+                                     float *scale, float *inverse);
+
+/* Cached e4m3 copy of a bf16 (or, with f32_source, F32) weight
+ * (output_dim x input_dim); quantized on first use, scale at
+ * fp8_scales[*index]. */
 static struct h3_cuda_fp8_weight *h3_cuda_fp8_weight(struct h3_gpu *gpu,
                                                      const void *weight,
                                                      size_t elements,
-                                                     int *index) {
+                                                     int *index,
+                                                     int f32_source) {
     struct h3_cuda_fp8_weight *slot = NULL;
     int slot_index = -1;
     for (int i = 0; i < H3_CUDA_FP8_WEIGHTS; i++) {
@@ -771,10 +777,14 @@ static struct h3_cuda_fp8_weight *h3_cuda_fp8_weight(struct h3_gpu *gpu,
     void *data = h3_cuda_weight_arena_alloc(gpu, elements ? elements : 1);
     if (!data) return NULL;
     float *inverse = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS + 1;
-    if (!h3_cuda_fp8_quantize((const uint16_t *)weight, (uint8_t *)data,
-                              elements, gpu->fp8_absmax,
-                              gpu->fp8_scales + slot_index, inverse))
-        return NULL;
+    int quantized = f32_source
+        ? h3_cuda_fp8_quantize_f32v((const float *)weight, (uint8_t *)data,
+                                    elements, gpu->fp8_absmax,
+                                    gpu->fp8_scales + slot_index, inverse)
+        : h3_cuda_fp8_quantize((const uint16_t *)weight, (uint8_t *)data,
+                               elements, gpu->fp8_absmax,
+                               gpu->fp8_scales + slot_index, inverse);
+    if (!quantized) return NULL;
     slot->key = weight;
     slot->elements = elements;
     slot->data = data;
@@ -852,7 +862,7 @@ int h3_cuda_gemm_xwt_fp8(struct h3_gpu *gpu, const void *x,
     }
     int index = -1;
     struct h3_cuda_fp8_weight *entry = h3_cuda_fp8_weight(
-        gpu, weight, (size_t)output_dim * input_dim, &index);
+        gpu, weight, (size_t)output_dim * input_dim, &index, 0);
     if (!entry) return 0;
     float *a_scale = gpu->fp8_scales + index;
     float *b_scale = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS;
@@ -970,4 +980,149 @@ int h3_cuda_gemm_xwt_f32_via_bf16(struct h3_gpu *gpu, const void *x,
     if (cudaGetLastError() != cudaSuccess) return 0;
     return h3_cuda_gemm_xwt(gpu, x16, entry->data, bias, c, CUDA_R_16BF,
                             CUDA_R_32F, rows, input_dim, output_dim);
+}
+
+/* -------------------------------------------- F32 projections through FP8 */
+
+/* H3_CUDA_F32_GEMM=fp8: the qualifying F32 projections run as per-tensor
+ * e4m3 GEMMs with F32 accumulation and F32 output at the FP8 tensor-core
+ * rate (215 vs 100-107 TFLOPS bf16 on GB10). Weights quantize once into
+ * the shared FP8 cache, the activation per call into fp8_scratch. The
+ * video VAE decoder's 36x4 GEMMs are the target; validate with
+ * tools/vae_ab.c. */
+static int h3_cuda_f32_gemm_fp8_enabled(void) {
+    const char *value = getenv("H3_CUDA_F32_GEMM");
+    return value && strcmp(value, "fp8") == 0;
+}
+
+__global__ void h3k_fp8_absmax_f32(const float *__restrict__ x, size_t n,
+                                   unsigned *__restrict__ result) {
+    __shared__ unsigned partial[256];
+    float m = 0.0f;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    size_t n4 = n / 4;
+    if ((((uintptr_t)x) & 15) == 0) {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+             i += stride) {
+            float4 v = ((const float4 *)x)[i];
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                               fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+        for (size_t i = n4 * 4 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += stride)
+            m = fmaxf(m, fabsf(x[i]));
+    } else {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+             i += stride)
+            m = fmaxf(m, fabsf(x[i]));
+    }
+    partial[threadIdx.x] = __float_as_uint(m);
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s; s >>= 1) {
+        if (threadIdx.x < s)
+            partial[threadIdx.x] = max(partial[threadIdx.x],
+                                       partial[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(result, partial[0]);
+}
+
+template <int VEC>
+__global__ void h3k_fp8_quantize_f32(const float *__restrict__ x,
+                                     uint8_t *__restrict__ out, size_t n,
+                                     const float *__restrict__ inverse) {
+    const float inv = *inverse;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    if (VEC) {
+        size_t n4 = n / 4;
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+             i += stride) {
+            float4 v = ((const float4 *)x)[i];
+            __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(
+                make_float2(v.x * inv, v.y * inv), __NV_SATFINITE, __NV_E4M3);
+            __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(
+                make_float2(v.z * inv, v.w * inv), __NV_SATFINITE, __NV_E4M3);
+            ((uint32_t *)out)[i] = (uint32_t)lo | ((uint32_t)hi << 16);
+        }
+        for (size_t i = n4 * 4 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += stride)
+            out[i] = (uint8_t)__nv_cvt_float_to_fp8(x[i] * inv, __NV_SATFINITE,
+                                                    __NV_E4M3);
+    } else {
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+             i += stride)
+            out[i] = (uint8_t)__nv_cvt_float_to_fp8(x[i] * inv, __NV_SATFINITE,
+                                                    __NV_E4M3);
+    }
+}
+
+/* Launch absmax -> scale -> quantize for `elements` F32 values; no sync. */
+static int h3_cuda_fp8_quantize_f32v(const float *x, uint8_t *out,
+                                     size_t elements, unsigned *absmax,
+                                     float *scale, float *inverse) {
+    if (cudaMemsetAsync(absmax, 0, sizeof(unsigned), 0) != cudaSuccess)
+        return 0;
+    unsigned blocks = (unsigned)((elements / 4 + 255) / 256);
+    if (!blocks) blocks = 1;
+    if (blocks > 2048u) blocks = 2048u;
+    h3k_fp8_absmax_f32<<<blocks, 256>>>(x, elements, absmax);
+    h3k_fp8_scale<<<1, 1>>>(absmax, scale, inverse);
+    if (((uintptr_t)x & 15) == 0 && ((uintptr_t)out & 3) == 0)
+        h3k_fp8_quantize_f32<1><<<blocks, 256>>>(x, out, elements, inverse);
+    else
+        h3k_fp8_quantize_f32<0><<<blocks, 256>>>(x, out, elements, inverse);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+int h3_cuda_gemm_xwt_f32_via_fp8(struct h3_gpu *gpu, const void *x,
+                                 const void *weight, const void *bias,
+                                 void *c, uint32_t rows, uint32_t input_dim,
+                                 uint32_t output_dim) {
+    /* Only the widest projections (the VAE decoder's MLP w1/w2, 75% of its
+     * GEMM FLOPs) — per-tensor e4m3 on the narrower attention-path GEMMs
+     * pushed the whole-decode PSNR to ~50 dB, below the accepted 70 dB
+     * bar, for little extra speed. */
+    if (!gpu || !gpu->lt || gpu->no_cublas ||
+        !h3_cuda_f32_gemm_fp8_enabled() || rows < 256 || input_dim < 1024 ||
+        output_dim < 1024 || (input_dim < 4096 && output_dim < 8192) ||
+        input_dim % 16 || output_dim % 16 ||
+        ((uintptr_t)x & 15) || ((uintptr_t)weight & 15) ||
+        ((uintptr_t)c & 15) || (bias && ((uintptr_t)bias & 15)))
+        return 0;
+    if (!h3_cuda_fp8_prepare(gpu)) return 0;
+    size_t x_elements = (size_t)rows * input_dim;
+    if (gpu->fp8_scratch_bytes < x_elements) {
+        if (gpu->fp8_scratch) cudaFree(gpu->fp8_scratch);
+        gpu->fp8_scratch = NULL;
+        gpu->fp8_scratch_bytes = 0;
+        if (cudaMalloc(&gpu->fp8_scratch, x_elements) != cudaSuccess) {
+            (void)cudaGetLastError();
+            gpu->fp8_scratch = NULL;
+            return 0;
+        }
+        gpu->fp8_scratch_bytes = x_elements;
+    }
+    int index = -1;
+    struct h3_cuda_fp8_weight *entry = h3_cuda_fp8_weight(
+        gpu, weight, (size_t)output_dim * input_dim, &index, 1);
+    if (!entry) return 0;
+    float *a_scale = gpu->fp8_scales + index;
+    float *b_scale = gpu->fp8_scales + H3_CUDA_FP8_WEIGHTS;
+    if (!h3_cuda_fp8_quantize_f32v((const float *)x,
+                                   (uint8_t *)gpu->fp8_scratch, x_elements,
+                                   gpu->fp8_absmax, b_scale, b_scale + 1))
+        return 0;
+    /* No bias epilogue here: for FP8 matmuls cublasLt defaults the bias
+     * vector type to BF16, which would misread the F32 bias; the explicit
+     * F32 bias kernel is one cheap elementwise pass. */
+    if (!h3_cuda_gemm_run(gpu, gpu->fp8_scratch, entry->data, NULL, c,
+                          CUDA_R_8F_E4M3, CUDA_R_32F, rows, input_dim,
+                          output_dim, input_dim, input_dim, output_dim, 0,
+                          a_scale, b_scale))
+        return 0;
+    if (bias)
+        h3k_gemm_bias_f32<<<h3_cuda_gemm_grid_2d(output_dim, rows),
+                            dim3(16, 16)>>>((float *)c, (const float *)bias,
+                                            rows, output_dim);
+    return cudaGetLastError() == cudaSuccess;
 }

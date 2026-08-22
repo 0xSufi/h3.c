@@ -9,8 +9,9 @@
  *
  * Variants: exact (H3_CUDA_TF32=0, H3_CUDA_SDPA_F32_EXACT=1), tf32 (TF32
  * GEMMs, exact attention), attn (bf16 FA2 attention, exact GEMMs), fast
- * (both), bf16gemm (H3_CUDA_F32_GEMM=bf16 + bf16 attention). Reports rel-L2,
- * max abs error, and PSNR over RGB in [0,1]. */
+ * (both), bf16gemm (H3_CUDA_F32_GEMM=bf16 + bf16 attention), fp8gemm
+ * (H3_CUDA_F32_GEMM=fp8 + bf16 attention). Reports rel-L2, max abs error,
+ * and PSNR over RGB in [0,1]. */
 #include "h3_video_vae.h"
 
 #include <math.h>
@@ -93,11 +94,12 @@ int main(int argc, char **argv) {
         return 1;
     printf("%-6s %7.2f s  (reference: F32 GEMMs, f32 attention)\n", "exact",
            s_exact);
-    const char *names[] = {"tf32", "attn", "fast", "bf16gemm", "exact2"};
-    const char *tf32s[] = {"1", "0", "1", "1", "0"};
-    const char *exacts[] = {"1", "0", "0", "0", "1"};
-    const char *gemms[] = {"", "", "", "bf16", ""};
-    for (int i = 0; i < 5; i++) {
+    const char *names[] = {"tf32", "attn", "fast", "bf16gemm", "fp8gemm",
+                           "exact2"};
+    const char *tf32s[] = {"1", "0", "1", "1", "1", "0"};
+    const char *exacts[] = {"1", "0", "0", "0", "0", "1"};
+    const char *gemms[] = {"", "", "", "bf16", "fp8", ""};
+    for (int i = 0; i < 6; i++) {
         if (!decode(argv[1], latent, t, h, w, tf32s[i], exacts[i], gemms[i],
                     &variant, &s_var))
             return 1;

@@ -863,7 +863,11 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
      * h3_cuda_gemm_xwt returns 0 when cuBLASLt is disabled or cannot serve
      * the shape, and the naive kernel below then rewrites the output. */
     if (rows && output_dim &&
-        (h3_cuda_gemm_xwt_f32_via_bf16(gpu, input->data, weight->data,
+        (h3_cuda_gemm_xwt_f32_via_fp8(gpu, input->data, weight->data,
+                                      bias ? bias->data : NULL,
+                                      output->data, rows, input_dim,
+                                      output_dim) ||
+         h3_cuda_gemm_xwt_f32_via_bf16(gpu, input->data, weight->data,
                                        bias ? bias->data : NULL,
                                        output->data, rows, input_dim,
                                        output_dim) ||

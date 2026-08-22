@@ -225,6 +225,14 @@ int h3_cuda_gemm_xwt_f32_via_bf16(struct h3_gpu *gpu, const void *x,
                                   void *c, uint32_t rows, uint32_t input_dim,
                                   uint32_t output_dim);
 
+/* F32 projection through a per-tensor e4m3 GEMM (H3_CUDA_F32_GEMM=fp8):
+ * F32 accumulation and output at the FP8 tensor-core rate. Returns 0 when
+ * disabled or unservable; callers fall back to bf16/TF32. */
+int h3_cuda_gemm_xwt_f32_via_fp8(struct h3_gpu *gpu, const void *x,
+                                 const void *weight, const void *bias,
+                                 void *c, uint32_t rows, uint32_t input_dim,
+                                 uint32_t output_dim);
+
 /* BF16 helpers: raw uint16 storage, exact widening on load and
  * round-to-nearest-even on store, matching h3_shaders.metal. */
 __device__ __forceinline__ float h3_bf16_to_f32(uint16_t value) {
