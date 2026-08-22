@@ -84,7 +84,7 @@ typedef struct {
     uint32_t rows, input_dim, output_dim;
     uint32_t ld_x, ld_w, ld_c;
     uint32_t align_a, align_b, align_c;
-    int ab_type, cd_type, bias_epilogue;
+    int ab_type, cd_type, bias_epilogue, tf32;
     size_t workspace_bytes;     /* heuristic's required workspace */
     cublasLtMatmulAlgo_t algo;
     int valid;
@@ -98,7 +98,7 @@ static h3_cuda_gemm_algo_entry *h3_cuda_gemm_algo_find(
     uint32_t rows, uint32_t input_dim, uint32_t output_dim, uint32_t ld_x,
     uint32_t ld_w, uint32_t ld_c, uint32_t align_a, uint32_t align_b,
     uint32_t align_c, cudaDataType ab_type, cudaDataType cd_type,
-    int bias_epilogue) {
+    int bias_epilogue, int tf32) {
     for (int i = 0; i < H3_CUDA_GEMM_ALGO_CACHE_MAX; i++) {
         h3_cuda_gemm_algo_entry *entry = &h3_cuda_gemm_algo_cache[i];
         if (entry->valid && entry->rows == rows &&
@@ -107,7 +107,7 @@ static h3_cuda_gemm_algo_entry *h3_cuda_gemm_algo_find(
             entry->ld_c == ld_c && entry->align_a == align_a &&
             entry->align_b == align_b && entry->align_c == align_c &&
             entry->ab_type == (int)ab_type && entry->cd_type == (int)cd_type &&
-            entry->bias_epilogue == bias_epilogue)
+            entry->bias_epilogue == bias_epilogue && entry->tf32 == tf32)
             return entry;
     }
     return NULL;
@@ -193,6 +193,13 @@ static uint32_t h3_cuda_gemm_alignment(const void *pointer) {
 }
 
 /* Element size of a cublasLt matrix type used here. */
+/* Re-read per call (cheap) so a process can toggle it, e.g. the tests pin
+ * exact F32 and then exercise the TF32 path explicitly. */
+static int h3_cuda_tf32_enabled(void) {
+    const char *value = getenv("H3_CUDA_TF32");
+    return !(value && *value && strcmp(value, "0") == 0);
+}
+
 static size_t h3_cuda_gemm_elem_size(cudaDataType type) {
     return type == CUDA_R_16BF || type == CUDA_R_16F ? sizeof(uint16_t) :
            type == CUDA_R_8I ? sizeof(int8_t) : sizeof(float);
@@ -224,8 +231,15 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
     memset(&tuned_algo, 0, sizeof(tuned_algo));
     cublasOperation_t transpose = CUBLAS_OP_T;
     cublasOperation_t identity = CUBLAS_OP_N;
-    if (cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
-        CUBLAS_STATUS_SUCCESS) return 0;
+    /* F32 operands run on the TF32 tensor cores unless H3_CUDA_TF32=0:
+     * products see 10-bit mantissas, accumulation stays F32. The VAE
+     * decoder's F32 projections are the main user; the SIMT F32 path is
+     * 3-4x slower on GB10. */
+    int tf32 = ab_type == CUDA_R_32F && h3_cuda_tf32_enabled();
+    if (cublasLtMatmulDescCreate(&desc, tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32
+                                             : CUBLAS_COMPUTE_32F,
+                                 CUDA_R_32F) != CUBLAS_STATUS_SUCCESS)
+        return 0;
     if (cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                        &transpose, sizeof(transpose)) !=
             CUBLAS_STATUS_SUCCESS ||
@@ -298,7 +312,7 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
      * with the winning algorithm leaves the definitive result. */
     entry = h3_cuda_gemm_algo_find(
         rows, input_dim, output_dim, ld_x, ld_w, ld_c, align_a, align_b,
-        align_c, ab_type, cd_type, bias_epilogue);
+        align_c, ab_type, cd_type, bias_epilogue, tf32);
     if (entry && entry->workspace_bytes <= gpu->lt_workspace_bytes) {
         algo = &entry->algo;
     } else {
@@ -342,7 +356,7 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
             *entry = (h3_cuda_gemm_algo_entry){
                 rows, input_dim, output_dim, ld_x, ld_w, ld_c,
                 align_a, align_b, align_c,
-                (int)ab_type, (int)cd_type, bias_epilogue,
+                (int)ab_type, (int)cd_type, bias_epilogue, tf32,
                 candidates[best].workspaceSize, candidates[best].algo, 1};
             tuned_algo = candidates[best].algo;
             algo = &tuned_algo;

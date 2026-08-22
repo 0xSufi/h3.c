@@ -643,6 +643,39 @@ static void test_linear_f32_big(void) {
     free(in); free(w); free(b); free(ref); free(got);
 }
 
+/* Same 64x512x512 projection with TF32 enabled: products see 10-bit
+ * mantissas, so the answer is only required to land within 1e-2 relative
+ * (+1e-3 absolute) of the F32 reference, versus 1e-3 for exact F32. */
+static void test_linear_f32_tf32(void) {
+    const uint32_t rows = 64, in_dim = 512, out_dim = 512;
+    float *in = malloc(rows * in_dim * 4), *w = malloc(out_dim * in_dim * 4),
+          *b = malloc(out_dim * 4), *ref = malloc(rows * out_dim * 4),
+          *got = malloc(rows * out_dim * 4);
+    for (uint32_t i = 0; i < rows * in_dim; i++) in[i] = frand(0.2f);
+    for (uint32_t i = 0; i < out_dim * in_dim; i++) w[i] = frand(0.2f);
+    for (uint32_t i = 0; i < out_dim; i++) b[i] = frand(0.2f);
+    ref_linear_f32(in, w, b, ref, rows, in_dim, out_dim);
+    h3_gpu_tensor *ti = mk_f32(in, rows * in_dim),
+                  *tw = mk_f32(w, out_dim * in_dim),
+                  *tb = mk_f32(b, out_dim), *to = new_f32(rows * out_dim);
+    setenv("H3_CUDA_TF32", "1", 1);
+    OP(h3_gpu_linear_f32(gpu, to, ti, tw, tb, rows, in_dim, out_dim));
+    run();
+    setenv("H3_CUDA_TF32", "0", 1);
+    OP(h3_gpu_tensor_read_f32(to, got, rows * out_dim));
+    double max_err = 0.0;
+    int bad = 0;
+    for (size_t i = 0; i < (size_t)rows * out_dim; i++) {
+        double err = fabs((double)got[i] - (double)ref[i]);
+        if (err > max_err) max_err = err;
+        if (!(err <= 1e-3 + 1e-2 * fabs((double)ref[i]))) bad++;
+    }
+    report("linear_f32 64x512x512 tf32", max_err, bad);
+    h3_gpu_tensor_free(ti); h3_gpu_tensor_free(tw); h3_gpu_tensor_free(tb);
+    h3_gpu_tensor_free(to);
+    free(in); free(w); free(b); free(ref); free(got);
+}
+
 static void test_linear_bf16_small(void) {
     const uint32_t rows = 5, in_dim = 7, out_dim = 9;
     uint16_t *in = malloc(rows * in_dim * 2), *w = malloc(out_dim * in_dim * 2),
@@ -1220,6 +1253,10 @@ static void test_validation(void) {
 
 int main(void) {
     char error[512];
+    /* F32 GEMMs default to TF32 tensor cores on CUDA (H3_CUDA_TF32); the
+     * exact-F32 checks below pin it off, and test_linear_f32_tf32 covers the
+     * TF32 path with its own tolerance. */
+    setenv("H3_CUDA_TF32", "0", 1);
     gpu = h3_gpu_create(NULL, error, sizeof(error));
     if (!gpu) { fprintf(stderr, "h3_gpu_create failed: %s\n", error); return 2; }
     OP(h3_gpu_begin(gpu));
@@ -1245,6 +1282,7 @@ int main(void) {
     test_head_rms_norm_bf16();
     test_linear_f32_small();
     test_linear_f32_big();
+    test_linear_f32_tf32();
     test_linear_bf16_small();
     test_linear_bf16_big();
     test_linear_f32_misaligned();

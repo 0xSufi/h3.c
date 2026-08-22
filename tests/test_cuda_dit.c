@@ -817,6 +817,8 @@ static void test_stubs(void) {
 }
 
 int main(void) {
+    /* Exact F32 for the patch-projection GEMM checks (see test_cuda_core.c). */
+    setenv("H3_CUDA_TF32", "0", 1);
     char error[512];
     gpu = h3_gpu_create(NULL, error, sizeof(error));
     if (!gpu) { fprintf(stderr, "h3_gpu_create failed: %s\n", error); return 2; }
