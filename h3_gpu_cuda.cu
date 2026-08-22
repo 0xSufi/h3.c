@@ -496,6 +496,30 @@ static int h3_cuda_read_parallel(int descriptor, unsigned char *staging,
     return tail_status;
 }
 
+/* H3_PROFILE=1 load accounting: where whole-tensor file loads spend their
+ * time (printed by h3_gpu_profile_mark / at context free). */
+static double h3_cuda_load_read_seconds, h3_cuda_load_upload_seconds,
+    h3_cuda_load_alloc_seconds;
+static size_t h3_cuda_load_bytes;
+static unsigned h3_cuda_load_calls;
+
+static void h3_cuda_load_report(void) {
+    if (!h3_cuda_load_calls || !h3_cuda_profile_enabled()) return;
+    fprintf(stderr,
+            "h3 profile file loads: %u tensors, %.2f GiB, read %.2fs (%.1f "
+            "GB/s), upload %.2fs, alloc %.2fs\n",
+            h3_cuda_load_calls, (double)h3_cuda_load_bytes / 1073741824.0,
+            h3_cuda_load_read_seconds,
+            h3_cuda_load_read_seconds > 0
+                ? (double)h3_cuda_load_bytes / h3_cuda_load_read_seconds / 1e9
+                : 0.0,
+            h3_cuda_load_upload_seconds, h3_cuda_load_alloc_seconds);
+    h3_cuda_load_calls = 0;
+    h3_cuda_load_bytes = 0;
+    h3_cuda_load_read_seconds = h3_cuda_load_upload_seconds =
+        h3_cuda_load_alloc_seconds = 0.0;
+}
+
 /* Pinned, grow-only staging for file loads; NULL when pinned memory is
  * unavailable (callers fall back to a pageable buffer). */
 static unsigned char *h3_cuda_load_staging(struct h3_gpu *gpu, size_t bytes) {
@@ -522,9 +546,11 @@ static h3_gpu_tensor *h3_cuda_tensor_load_file(
         elements > SIZE_MAX / item_size) return NULL;
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
+    double t_alloc = h3_cuda_now();
     h3_gpu_tensor *result =
         h3_cuda_tensor_new(gpu, NULL, elements, item_size, dtype);
     if (!result) return NULL;
+    h3_cuda_load_alloc_seconds += h3_cuda_now() - t_alloc;
     struct h3_gpu_tensor *tensor = (struct h3_gpu_tensor *)result;
     int descriptor = open(path, O_RDONLY | O_CLOEXEC);
     if (descriptor < 0) {
@@ -541,10 +567,14 @@ static h3_gpu_tensor *h3_cuda_tensor_load_file(
         h3_gpu_tensor_free(result);
         return NULL;
     }
+    double t_read = h3_cuda_now();
     int read_status = bytes >= H3_CUDA_PARALLEL_READ_MIN
         ? h3_cuda_read_parallel(descriptor, staging, file_offset, bytes)
         : h3_cuda_read_range(descriptor, staging, file_offset, bytes);
     close(descriptor);
+    h3_cuda_load_read_seconds += h3_cuda_now() - t_read;
+    h3_cuda_load_bytes += bytes;
+    h3_cuda_load_calls++;
     if (read_status) {
         h3_cuda_fail(gpu, "cannot read %s payload from %s: %s", label, path,
                      read_status > 0 ? strerror(read_status)
@@ -557,10 +587,12 @@ static h3_gpu_tensor *h3_cuda_tensor_load_file(
         /* Pinned staging uploads with one synchronous DMA (the buffer is
          * reused by the next load); the pageable fallback goes through the
          * H2D ring. */
+        double t_upload = h3_cuda_now();
         int uploaded = pinned
             ? cudaMemcpy(tensor->data, staging, bytes,
                          cudaMemcpyHostToDevice) == cudaSuccess
             : h3_cuda_h2d(gpu, tensor->data, staging, bytes);
+        h3_cuda_load_upload_seconds += h3_cuda_now() - t_upload;
         if (!pinned) free(staging);
         if (!uploaded) {
             (void)cudaGetLastError();
@@ -811,6 +843,7 @@ void h3_gpu_profile_set_label(h3_gpu *opaque, const char *label) {
 void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
     struct h3_gpu *gpu = (struct h3_gpu *)opaque;
     if (!gpu || !phase || !*phase || !h3_cuda_profile_enabled()) return;
+    h3_cuda_load_report();
     h3_cuda_profile_emit(gpu, phase, &gpu->profile_mark_stats,
                          gpu->profile_mark_wall);
     gpu->profile_mark_stats = gpu->stats;
