@@ -290,6 +290,9 @@ static void test_group_norm_silu(void) {
 }
 
 int main(void) {
+    /* Conv1d's GEMM path goes through the F32 projection helper; keep it
+     * exact F32 (no TF32) for the 1e-5 brute-force comparisons. */
+    setenv("H3_CUDA_TF32", "0", 1);
     char error[512];
     gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!gpu) die(error);

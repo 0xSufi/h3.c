@@ -46,6 +46,34 @@ __global__ void h3k_conv1d_f32(const float *input, const float *weight,
     output[((size_t)b * output_length + time) * output_channels + oc] = sum;
 }
 
+/* im2col for the GEMM path of Conv1d: row (b, t) holds, for every input
+ * channel, the kernel taps in [ic][k] order (the Conv1d weight's [oc][ic][k]
+ * layout read as [oc][ic*K + k]); taps outside the padded input are zero. */
+__global__ void h3k_im2col1d_f32(const float *__restrict__ input,
+                                 float *__restrict__ columns, uint32_t batch,
+                                 uint32_t length, uint32_t channels,
+                                 uint32_t kernel, uint32_t stride,
+                                 uint32_t padding, uint32_t dilation,
+                                 uint32_t output_length) {
+    size_t width = (size_t)channels * kernel;
+    size_t total = (size_t)batch * output_length * width;
+    size_t step = (size_t)gridDim.x * blockDim.x;
+    for (size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x; g < total;
+         g += step) {
+        uint32_t kk = (uint32_t)(g % width);
+        size_t bt = g / width;
+        uint32_t t = (uint32_t)(bt % output_length);
+        uint32_t b = (uint32_t)(bt / output_length);
+        uint32_t ic = kk / kernel, k = kk % kernel;
+        int64_t source = (int64_t)t * stride + (int64_t)k * dilation -
+                         (int64_t)padding;
+        columns[g] = source >= 0 && source < (int64_t)length
+                         ? input[((size_t)b * length + (size_t)source) *
+                                     channels + ic]
+                         : 0.0f;
+    }
+}
+
 /* ConvTranspose1d weights are IOK order [in, out, kernel]. */
 __global__ void h3k_conv_transpose1d_f32(const float *input,
                                          const float *weight,
@@ -316,6 +344,33 @@ int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                   !h3_cuda_require_dtype(gpu, bias, H3_GPU_F32,
                                          "Conv1d bias"))) ||
         !h3_cuda_require_command(gpu)) return 0;
+    /* GEMM path: im2col into the workspace, then the cuBLASLt projection
+     * (F32, TF32 when the reduction is long enough). The audio VAE decoder's
+     * 129 Conv1d calls took 16.5 s on the per-output-element kernel; the
+     * column matrix is capped at 8 GiB so an extreme shape still runs. */
+    size_t rows = (size_t)batch * output_length;
+    size_t width = (size_t)input_channels * kernel;
+    size_t column_bytes = rows * width * sizeof(float);
+    if (gpu->lt && !gpu->no_cublas && column_bytes <= ((size_t)8 << 30) &&
+        rows * width / width == rows) {
+        float *columns = (float *)h3_cuda_workspace(gpu, column_bytes);
+        if (columns) {
+            size_t total = rows * width;
+            unsigned blocks = (unsigned)((total + 255) / 256);
+            if (blocks > 65535u) blocks = 65535u;
+            h3k_im2col1d_f32<<<blocks, 256>>>(
+                (const float *)input->data, columns, batch, length,
+                input_channels, kernel, stride, padding, dilation,
+                output_length);
+            if (cudaGetLastError() == cudaSuccess &&
+                h3_cuda_gemm_xwt(gpu, columns, weight->data,
+                                 bias ? bias->data : NULL, output->data,
+                                 CUDA_R_32F, CUDA_R_32F, (uint32_t)rows,
+                                 (uint32_t)width, output_channels))
+                return h3_cuda_launch_check_kind(gpu, "h3_conv1d_f32", 2);
+            (void)cudaGetLastError();
+        }
+    }
     h3k_conv1d_f32<<<h3_conv_grid_1d(output_count), 256>>>(
         (const float *)input->data, (const float *)weight->data,
         bias ? (const float *)bias->data : NULL, (float *)output->data,
