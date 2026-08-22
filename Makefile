@@ -29,7 +29,9 @@ CUDA_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
 CUDA_ARCH := $(if $(CUDA_ARCH),$(CUDA_ARCH),61)
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DEFAULT_SOURCE -DH3_BACKEND_CUDA
-CUDAFLAGS := -O3 -std=c++14 -arch=sm_$(CUDA_ARCH) -DH3_BACKEND_CUDA
+# -MMD: .cu objects depend on the headers they include (h3_cuda_internal.h
+# defines struct h3_gpu; every CUDA unit must rebuild when it changes).
+CUDAFLAGS := -O3 -std=c++14 -arch=sm_$(CUDA_ARCH) -DH3_BACKEND_CUDA -MMD
 ifneq ($(CUDA_HOME),)
 CUDAFLAGS += -I$(CUDA_HOME)/include
 CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
