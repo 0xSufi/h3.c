@@ -62,6 +62,11 @@ __device__ __forceinline__ void h3_attn_store(uint16_t *p, float v) {
     *p = h3_f32_to_bf16(v);
 }
 
+/* Pack two f32 values as an RNE bf16 pair (lo in the low half). */
+__device__ __forceinline__ uint32_t h3_pack_bf16(float lo, float hi) {
+    return (uint32_t)h3_f32_to_bf16(lo) | ((uint32_t)h3_f32_to_bf16(hi) << 16);
+}
+
 /* ------------------------------------------------------- QKV/RoPE kernels */
 
 /* h3_qkv_rope_f32: fused QKV rows are [q|k|v] x [head, dim]; Q/K get a
@@ -227,6 +232,120 @@ __global__ void h3k_qkv_rope_bf16(const uint16_t *qkv,
     query[output_index] = h3_f32_to_bf16(q0);
     key[output_index] = h3_f32_to_bf16(k0);
     value[output_index] = qkv[v_base + dimension];
+}
+
+/* One warp per (row, head) for the DiT shape (head_dim 128, rope_half a
+ * multiple of 4): lane l owns dims 4l..4l+3 of q, k and v, so each head's
+ * sums of squares are one 8-byte load per lane plus a warp reduction (the
+ * per-element kernel above recomputed them in all 128 threads of a head),
+ * RoPE pairs (d, d +/- rope_half) move between lanes l and l +/- rope_half/4
+ * with shuffles, and the stores are 8-byte groups. At 44.5k rows x 56 heads
+ * this turns a 48 ms launch into a bandwidth-bound ~13 ms one. Sums reduce
+ * in tree order (within the 1-ulp bf16 contract of the tests). */
+__global__ void h3k_qkv_rope_bf16_warp(const uint16_t *__restrict__ qkv,
+                                       const uint16_t *__restrict__ q_weight,
+                                       const uint16_t *__restrict__ k_weight,
+                                       const uint16_t *__restrict__ rope_cos,
+                                       const uint16_t *__restrict__ rope_sin,
+                                       uint16_t *__restrict__ query,
+                                       uint16_t *__restrict__ key,
+                                       uint16_t *__restrict__ value,
+                                       uint32_t sequence, uint32_t heads,
+                                       uint32_t rope_half, uint32_t grouped,
+                                       float epsilon) {
+    const uint32_t HD = 128;
+    const uint32_t gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const uint32_t lane = threadIdx.x & 31;
+    if (gw >= sequence * heads) return;
+    const uint32_t row = gw / heads, head = gw % heads;
+    const size_t inner = (size_t)heads * HD;
+    const size_t row_base = (size_t)row * inner * 3;
+    size_t q_base, k_base, v_base;
+    if (grouped) {
+        q_base = row_base + (size_t)head * HD * 3;
+        k_base = q_base + HD;
+        v_base = k_base + HD;
+    } else {
+        q_base = row_base + (size_t)head * HD;
+        k_base = q_base + inner;
+        v_base = q_base + inner * 2;
+    }
+    const uint32_t d0 = lane * 4;
+    uint2 qr = *(const uint2 *)(qkv + q_base + d0);
+    uint2 kr = *(const uint2 *)(qkv + k_base + d0);
+    uint2 vr = *(const uint2 *)(qkv + v_base + d0);
+    uint2 qw = *(const uint2 *)(q_weight + d0);
+    uint2 kw = *(const uint2 *)(k_weight + d0);
+    float q[4] = {h3_bf16_to_f32((uint16_t)(qr.x & 0xffffu)),
+                  h3_bf16_to_f32((uint16_t)(qr.x >> 16)),
+                  h3_bf16_to_f32((uint16_t)(qr.y & 0xffffu)),
+                  h3_bf16_to_f32((uint16_t)(qr.y >> 16))};
+    float k[4] = {h3_bf16_to_f32((uint16_t)(kr.x & 0xffffu)),
+                  h3_bf16_to_f32((uint16_t)(kr.x >> 16)),
+                  h3_bf16_to_f32((uint16_t)(kr.y & 0xffffu)),
+                  h3_bf16_to_f32((uint16_t)(kr.y >> 16))};
+    float wq[4] = {h3_bf16_to_f32((uint16_t)(qw.x & 0xffffu)),
+                   h3_bf16_to_f32((uint16_t)(qw.x >> 16)),
+                   h3_bf16_to_f32((uint16_t)(qw.y & 0xffffu)),
+                   h3_bf16_to_f32((uint16_t)(qw.y >> 16))};
+    float wk[4] = {h3_bf16_to_f32((uint16_t)(kw.x & 0xffffu)),
+                   h3_bf16_to_f32((uint16_t)(kw.x >> 16)),
+                   h3_bf16_to_f32((uint16_t)(kw.y & 0xffffu)),
+                   h3_bf16_to_f32((uint16_t)(kw.y >> 16))};
+    float q_sum = fmaf(q[0], q[0], fmaf(q[1], q[1], fmaf(q[2], q[2], q[3] * q[3])));
+    float k_sum = fmaf(k[0], k[0], fmaf(k[1], k[1], fmaf(k[2], k[2], k[3] * k[3])));
+#pragma unroll
+    for (int off = 16; off; off >>= 1) {
+        q_sum += __shfl_xor_sync(0xffffffffu, q_sum, off);
+        k_sum += __shfl_xor_sync(0xffffffffu, k_sum, off);
+    }
+    const float q_inv = 1.0f / sqrtf(q_sum / (float)HD + epsilon);
+    const float k_inv = 1.0f / sqrtf(k_sum / (float)HD + epsilon);
+    float qn[4], kn[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        qn[i] = q[i] * q_inv * wq[i];
+        kn[i] = k[i] * k_inv * wk[i];
+    }
+    /* Partner values for the RoPE pairs: dims below rope_half pair with
+     * +rope_half, the next rope_half dims with -rope_half, the rest have no
+     * partner (source = self, unused). */
+    const uint32_t shift = rope_half / 4;
+    int src = (int)lane;
+    if (d0 < rope_half) src = (int)(lane + shift);
+    else if (d0 < rope_half * 2) src = (int)(lane - shift);
+    float qp[4], kp[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        qp[i] = __shfl_sync(0xffffffffu, qn[i], src);
+        kp[i] = __shfl_sync(0xffffffffu, kn[i], src);
+    }
+    float qo[4], ko[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t d = d0 + (uint32_t)i;
+        if (d < rope_half) {
+            float c = h3_bf16_to_f32(rope_cos[row * rope_half + d]);
+            float sn = h3_bf16_to_f32(rope_sin[row * rope_half + d]);
+            qo[i] = qn[i] * c - qp[i] * sn;
+            ko[i] = kn[i] * c - kp[i] * sn;
+        } else if (d < rope_half * 2) {
+            uint32_t pair = d - rope_half;
+            float c = h3_bf16_to_f32(rope_cos[row * rope_half + pair]);
+            float sn = h3_bf16_to_f32(rope_sin[row * rope_half + pair]);
+            qo[i] = qn[i] * c + qp[i] * sn;
+            ko[i] = kn[i] * c + kp[i] * sn;
+        } else {
+            qo[i] = qn[i];
+            ko[i] = kn[i];
+        }
+    }
+    const size_t out = ((size_t)row * heads + head) * HD + d0;
+    uint2 qs = {h3_pack_bf16(qo[0], qo[1]), h3_pack_bf16(qo[2], qo[3])};
+    uint2 kss = {h3_pack_bf16(ko[0], ko[1]), h3_pack_bf16(ko[2], ko[3])};
+    *(uint2 *)(query + out) = qs;
+    *(uint2 *)(key + out) = kss;
+    *(uint2 *)(value + out) = vr;
 }
 
 /* h3_vision_qkv_rope_bf16: no norms; RoPE pairs wrap across the whole head
@@ -1085,11 +1204,6 @@ static int h3_f32_flash_fits(h3_gpu *gpu, uint32_t head_dim, int kvt,
  * conflicts in the fragment-pattern accesses (see above). */
 #define H3_MMA_SLD 65
 
-/* Pack two f32 values as an RNE bf16 pair (lo in the low half). */
-__device__ __forceinline__ uint32_t h3_pack_bf16(float lo, float hi) {
-    return (uint32_t)h3_f32_to_bf16(lo) | ((uint32_t)h3_f32_to_bf16(hi) << 16);
-}
-
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void h3_mma_bf16_16x8x16(float *c, uint32_t a0,
                                                     uint32_t a1, uint32_t a2,
@@ -1865,7 +1979,15 @@ static int h3_cuda_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
         !h3_attn_require_bf16(gpu, value, count, "value") ||
         rope_half * 2 > head_dim ||
         !h3_cuda_require_command(gpu)) return 0;
-    if (count)
+    if (count && head_dim == 128 && rope_half % 4 == 0) {
+        size_t warps = (size_t)sequence * heads;
+        h3k_qkv_rope_bf16_warp<<<h3_attn_grid_1d(warps * 32), 256>>>(
+            (const uint16_t *)qkv->data, (const uint16_t *)q_norm->data,
+            (const uint16_t *)k_norm->data, (const uint16_t *)rope_cos->data,
+            (const uint16_t *)rope_sin->data, (uint16_t *)query->data,
+            (uint16_t *)key->data, (uint16_t *)value->data, sequence, heads,
+            rope_half, grouped, epsilon);
+    } else if (count)
         h3k_qkv_rope_bf16<<<h3_attn_grid_1d(count), 256>>>(
             (const uint16_t *)qkv->data, (const uint16_t *)q_norm->data,
             (const uint16_t *)k_norm->data, (const uint16_t *)rope_cos->data,
