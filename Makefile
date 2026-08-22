@@ -39,6 +39,9 @@ LIB_M :=
 LIB_C += h3_tokenizer.c h3_unicode_tables.c
 LIB_CU := h3_gpu_cuda.cu h3_cuda_core.cu h3_cuda_conv.cu h3_cuda_dit.cu \
 	h3_cuda_attention.cu h3_cuda_gemm.cu
+# Synthetic CUDA backend tests (no fixtures needed); Linux-only.
+CUDA_TESTS := h3_cuda_core_tests h3_cuda_conv_tests h3_cuda_attention_tests \
+	h3_cuda_dit_tests
 endif
 
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(LIB_CU:.cu=.o)
@@ -72,6 +75,18 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_cuda_core_tests: tests/test_cuda_core.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_cuda_conv_tests: tests/test_cuda_conv.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_cuda_attention_tests: tests/test_cuda_attention.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_cuda_dit_tests: tests/test_cuda_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -130,9 +145,11 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test h3_real_ref_video_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test \
+	$(CUDA_TESTS)
 
 	./h3_tests
+	@for cuda_test in $(CUDA_TESTS); do ./$$cuda_test || exit 1; done
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
@@ -243,7 +260,8 @@ clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
-		h3_av_mux_test \
+		h3_av_mux_test h3_cuda_core_tests h3_cuda_conv_tests \
+		h3_cuda_attention_tests h3_cuda_dit_tests \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
