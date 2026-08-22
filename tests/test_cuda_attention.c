@@ -681,6 +681,69 @@ static void run_suite(h3_gpu *gpu) {
         free(ref); free(got);
     }
 
+    /* ---- 6d. SDPA bf16 hd128 on the FP8 (e4m3) flash kernel ----
+     * H3_CUDA_SDPA_FP8=1 routes bf16/hd128 non-causal SDPA through
+     * h3k_sdpa_fa2_fp8 on sm_89+: Q/K/V quantized to e4m3 with per-tensor
+     * scales, P scaled by 448 and quantized, F32 accumulation. e4m3 keeps 3
+     * mantissa bits, so the check bounds rel-L2 (<= 6%) and the worst
+     * element (<= 10% of max|ref|) against the f32 reference; a rel-L2
+     * below 5e-3 means the bf16 kernel ran instead (reported). seq 130
+     * crosses the 128-row Q tile and the 64-key tile; both output layouts
+     * are checked. In the naive pass the exact kernel runs. */
+    {
+        const uint32_t sseq = 130, sh = 3, shd = 128;
+        const size_t sc = (size_t)sseq * sh * shd;
+        float scale = 0.088f;
+        uint16_t *q = bf16_buf(sc), *k = bf16_buf(sc), *v = bf16_buf(sc);
+        float *qf = bf16_as_f32(q, sc), *kf = bf16_as_f32(k, sc),
+              *vf = bf16_as_f32(v, sc);
+        h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, q, sc);
+        h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, k, sc);
+        h3_gpu_tensor *tv = h3_gpu_tensor_from_bf16(gpu, v, sc);
+        h3_gpu_tensor *to = h3_gpu_tensor_new_bf16(gpu, sc);
+        h3_gpu_tensor *toh = h3_gpu_tensor_new_bf16(gpu, sc);
+        setenv("H3_CUDA_SDPA_FP8", "1", 1);
+        CHECK(h3_gpu_begin(gpu), "begin");
+        CHECK(h3_gpu_sdpa_bf16(gpu, to, tq, tk, tv, sseq, sh, shd, scale),
+              "sdpa_bf16 fp8 call");
+        CHECK(h3_gpu_sdpa_bf16_head_major_output(gpu, toh, tq, tk, tv, sseq,
+                                                 sh, shd, scale),
+              "sdpa_bf16 fp8 head_major call");
+        CHECK(h3_gpu_submit(gpu), "submit");
+        setenv("H3_CUDA_SDPA_FP8", "0", 1);
+        float *ref = malloc(sc * 4), *refh = malloc(sc * 4);
+        ref_sdpa(qf, kf, vf, ref, 1, sseq, sh, shd, scale, 0, 0);
+        ref_sdpa(qf, kf, vf, refh, 1, sseq, sh, shd, scale, 0, 1);
+        uint16_t *got = malloc(sc * 2), *goth = malloc(sc * 2);
+        h3_gpu_tensor_read_bf16(to, got, sc);
+        h3_gpu_tensor_read_bf16(toh, goth, sc);
+        const uint16_t *gs[2] = {got, goth};
+        const float *rs[2] = {ref, refh};
+        const char *names[2] = {"sdpa_bf16_hd128_fp8", "sdpa_bf16_hd128_fp8_head_major"};
+        for (int m = 0; m < 2; m++) {
+            double num = 0, den = 0, max_err = 0, max_ref = 0;
+            for (size_t i = 0; i < sc; i++) {
+                double g = c_bf16_to_f32(gs[m][i]), r = rs[m][i];
+                num += (g - r) * (g - r);
+                den += r * r;
+                if (fabs(g - r) > max_err) max_err = fabs(g - r);
+                if (fabs(r) > max_ref) max_ref = fabs(r);
+            }
+            double rel_l2 = den > 0 ? sqrt(num / den) : 0.0;
+            int bad = sdpa_naive_mode ? (rel_l2 > 2e-3) :
+                      (rel_l2 > 0.06 || max_err > 0.1 * max_ref);
+            printf("%s %-36s rel-L2=%.3g max|d|=%.3g%s\n",
+                   bad ? "FAIL:" : "ok:", names[m], rel_l2, max_err,
+                   (!sdpa_naive_mode && rel_l2 < 5e-3)
+                       ? " [bf16 kernel ran: FP8 not served]" : "");
+            if (bad) failures++;
+        }
+        h3_gpu_tensor *all[] = {tq, tk, tv, to, toh};
+        for (int i = 0; i < 5; i++) h3_gpu_tensor_free(all[i]);
+        free(q); free(k); free(v); free(qf); free(kf); free(vf);
+        free(ref); free(refh); free(got); free(goth);
+    }
+
     /* ---- 7. h3_gpu_gqa_causal_bf16 ---- */
     {
         const uint32_t gseq = 6, qh = 4, kvh = 2, ghd = 8;

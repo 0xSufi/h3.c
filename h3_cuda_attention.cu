@@ -23,6 +23,8 @@ extern "C" {
 }
 #include "h3_cuda_internal.h"
 
+#include <cuda_fp8.h>
+
 #include <stdlib.h>
 
 /* ---------------------------------------------------------------- helpers */
@@ -1855,6 +1857,525 @@ static int h3_cuda_sdpa_f32_exact(void) {
     return value && *value && strcmp(value, "0") != 0;
 }
 
+/* ------------------------------------------------- FP8 (e4m3) flash SDPA */
+
+/* h3k_sdpa_fa2_fp8: the FA2 kernel above on the e4m3 tensor cores
+ * (mma.m16n8k32, sm_89+; 2x the bf16 rate), opt-in with H3_CUDA_SDPA_FP8=1.
+ * A pre-pass (h3_cuda_sdpa_fp8_pack) measures per-tensor absmax for Q, K
+ * and V, quantizes Q and K to e4m3 in head-major layout, and writes V
+ * transposed ([head][dim][key], keys zero-padded to the 64-key tile) with
+ * the keys of every 32-block permuted so that the softmax C-fragments of
+ * four adjacent 8-key n-tiles are exactly the 32-key A-fragment of P*V
+ * (FA3's trick; P is scaled by 448 before e4m3). Scores carry s_q*s_k, the
+ * output s_v/448, all folded into the existing scale / normalization.
+ * Numerics: e4m3 keeps 3 mantissa bits, so expect a few percent of
+ * relative error against the bf16 kernel (see the attention test). */
+#define H3_FP8_THREADS 256
+#define H3_FP8_QROWS 128
+#define H3_FP8_KVT 64
+#define H3_FP8_HD 128
+#define H3_FP8_LDK (H3_FP8_HD + 16)   /* bytes per K row: 9 x 16 B (odd) */
+#define H3_FP8_LDV (H3_FP8_KVT + 16)  /* bytes per V^T row: 5 x 16 B (odd) */
+#define H3_FP8_STAGE_BYTES (H3_FP8_KVT * H3_FP8_LDK + H3_FP8_HD * H3_FP8_LDV)
+#define H3_FP8_P_SCALE 448.0f
+
+/* Key held at position p of a 32-key block in the permuted V^T layout:
+ * the m16n8k32 A-fragment byte (4q + j) / (16 + 4q + j) of lane group q
+ * must carry the probability the C-fragments hold there — keys 2q, 2q+1 of
+ * n-tile 0 and 8+2q, 9+2q of n-tile 1 (same for the upper 16). */
+__host__ __device__ __forceinline__ uint32_t h3_fp8_perm_key(uint32_t p) {
+    uint32_t base = p & ~31u, r = p & 31u;
+    uint32_t hi = r & 16u, q = (r & 15u) >> 2, j = r & 3u;
+    return base + hi + (j < 2u ? 2u * q + j : 8u + 2u * q + (j - 2u));
+}
+
+__global__ void h3k_fp8_attn_absmax(const uint16_t *__restrict__ x, size_t n,
+                                    unsigned *__restrict__ result) {
+    __shared__ unsigned partial[256];
+    float m = 0.0f;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    size_t n8 = n / 8;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8;
+         i += stride) {
+        uint4 v = ((const uint4 *)x)[i];
+        uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            m = fmaxf(m, fabsf(h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu))));
+            m = fmaxf(m, fabsf(h3_bf16_to_f32((uint16_t)(w[j] >> 16))));
+        }
+    }
+    for (size_t i = n8 * 8 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += stride)
+        m = fmaxf(m, fabsf(h3_bf16_to_f32(x[i])));
+    partial[threadIdx.x] = __float_as_uint(m);
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s; s >>= 1) {
+        if (threadIdx.x < s)
+            partial[threadIdx.x] = max(partial[threadIdx.x],
+                                       partial[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(result, partial[0]);
+}
+
+/* scales[0..2] = s_q, s_k, s_v; [3..5] = their inverses. */
+__global__ void h3k_fp8_attn_scales(const unsigned *__restrict__ absmax,
+                                    float *__restrict__ scales) {
+    int i = threadIdx.x;
+    if (i >= 3) return;
+    float m = __uint_as_float(absmax[i]);
+    float s = m > 0.0f ? m / H3_FP8_P_SCALE : 1.0f;
+    scales[i] = s;
+    scales[3 + i] = 1.0f / s;
+}
+
+__device__ __forceinline__ uint32_t h3_fp8_pack4(float a, float b, float c,
+                                                 float d) {
+    __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b),
+                                                       __NV_SATFINITE,
+                                                       __NV_E4M3);
+    __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d),
+                                                       __NV_SATFINITE,
+                                                       __NV_E4M3);
+    return (uint32_t)lo | ((uint32_t)hi << 16);
+}
+
+/* Q or K: [seq][heads][128] bf16 -> [heads][seq][128] e4m3 (8 per thread). */
+__global__ void h3k_fp8_attn_pack_qk(const uint16_t *__restrict__ in,
+                                     uint8_t *__restrict__ out,
+                                     uint32_t sequence, uint32_t heads,
+                                     const float *__restrict__ inverse) {
+    const float inv = *inverse;
+    size_t chunks = (size_t)sequence * heads * (H3_FP8_HD / 8);
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x; c < chunks;
+         c += stride) {
+        uint32_t d = (uint32_t)(c % (H3_FP8_HD / 8)) * 8;
+        size_t rh = c / (H3_FP8_HD / 8);
+        uint32_t h = (uint32_t)(rh % heads), r = (uint32_t)(rh / heads);
+        uint4 v = *(const uint4 *)(in + rh * H3_FP8_HD + d);
+        uint32_t w[4] = {v.x, v.y, v.z, v.w};
+        float f[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            f[2 * j] = h3_bf16_to_f32((uint16_t)(w[j] & 0xffffu)) * inv;
+            f[2 * j + 1] = h3_bf16_to_f32((uint16_t)(w[j] >> 16)) * inv;
+        }
+        uint2 o = {h3_fp8_pack4(f[0], f[1], f[2], f[3]),
+                   h3_fp8_pack4(f[4], f[5], f[6], f[7])};
+        *(uint2 *)(out + ((size_t)h * sequence + r) * H3_FP8_HD + d) = o;
+    }
+}
+
+/* V: [seq][heads][128] bf16 -> [heads][128][seq_pad] e4m3, transposed
+ * through shared memory one (head, 64-key tile) per block, keys permuted
+ * inside each 32-block (h3_fp8_perm_key) and zero past the sequence. */
+__global__ void h3k_fp8_attn_pack_vt(const uint16_t *__restrict__ in,
+                                     uint8_t *__restrict__ out,
+                                     uint32_t sequence, uint32_t seq_pad,
+                                     uint32_t heads,
+                                     const float *__restrict__ inverse) {
+    __shared__ uint8_t tile[H3_FP8_KVT][H3_FP8_HD + 4];
+    const float inv = *inverse;
+    const uint32_t head = blockIdx.y, kb = blockIdx.x * H3_FP8_KVT;
+    const uint32_t tid = threadIdx.x;
+    /* load 64 keys x 128 dims (8 bf16 per thread per step), quantize */
+    for (uint32_t c = tid; c < H3_FP8_KVT * (H3_FP8_HD / 8); c += blockDim.x) {
+        uint32_t j = c >> 4, d = (c & 15) * 8;
+        uint32_t key = kb + j;
+        uint8_t q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (key < sequence) {
+            uint4 v = *(const uint4 *)(in + ((size_t)key * heads + head) *
+                                                H3_FP8_HD + d);
+            uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int t = 0; t < 4; t++) {
+                float lo = h3_bf16_to_f32((uint16_t)(w[t] & 0xffffu)) * inv;
+                float hi = h3_bf16_to_f32((uint16_t)(w[t] >> 16)) * inv;
+                __nv_fp8x2_storage_t p = __nv_cvt_float2_to_fp8x2(
+                    make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+                q[2 * t] = (uint8_t)(p & 0xffu);
+                q[2 * t + 1] = (uint8_t)(p >> 8);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 8; t++) tile[j][d + t] = q[t];
+    }
+    __syncthreads();
+    /* write 128 dim rows x 64 keys (4 permuted keys = 4 bytes per thread) */
+    for (uint32_t c = tid; c < H3_FP8_HD * (H3_FP8_KVT / 4); c += blockDim.x) {
+        uint32_t d = c >> 4, p0 = (c & 15) * 4;
+        uint32_t b0 = tile[h3_fp8_perm_key(p0)][d];
+        uint32_t b1 = tile[h3_fp8_perm_key(p0 + 1)][d];
+        uint32_t b2 = tile[h3_fp8_perm_key(p0 + 2)][d];
+        uint32_t b3 = tile[h3_fp8_perm_key(p0 + 3)][d];
+        *(uint32_t *)(out + ((size_t)head * H3_FP8_HD + d) * seq_pad + kb +
+                      p0) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+}
+
+#if __CUDA_ARCH__ >= 890
+__device__ __forceinline__ void h3_mma_e4m3_16x8x32(float *c, uint32_t a0,
+                                                    uint32_t a1, uint32_t a2,
+                                                    uint32_t a3, uint32_t b0,
+                                                    uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void h3_ldmatrix_x4_b(uint32_t r[4],
+                                                 const uint8_t *addr) {
+    uint32_t s = (uint32_t)__cvta_generic_to_shared(addr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+        : "r"(s));
+}
+
+__device__ __forceinline__ void h3_cp_async_16_b(uint8_t *smem,
+                                                 const uint8_t *gmem,
+                                                 int src_size) {
+    uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s),
+                 "l"(gmem), "r"(src_size));
+}
+
+/* Stage K tile (64 x 128 B) and V^T tile (128 x 64 B) of key block `tile`. */
+__device__ __forceinline__ void h3_fp8_issue(uint8_t *smem,
+                                             const uint8_t *k_src,
+                                             const uint8_t *vt_src,
+                                             uint32_t sequence,
+                                             uint32_t seq_pad, uint32_t tile,
+                                             uint32_t stage, uint32_t tid) {
+    uint8_t *ks = smem + stage * H3_FP8_STAGE_BYTES;
+    uint8_t *vs = ks + H3_FP8_KVT * H3_FP8_LDK;
+    uint32_t kb = tile * H3_FP8_KVT;
+    /* K: 64 rows x 8 chunks = 512; V^T: 128 rows x 4 chunks = 512 */
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++) {
+        uint32_t c = tid + i * H3_FP8_THREADS;
+        uint32_t j = c >> 3, d = (c & 7) * 16;
+        uint32_t row = kb + j;
+        int live = row < sequence;
+        h3_cp_async_16_b(ks + j * H3_FP8_LDK + d,
+                         k_src + (size_t)(live ? row : 0u) * H3_FP8_HD + d,
+                         live ? 16 : 0);
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++) {
+        uint32_t c = tid + i * H3_FP8_THREADS;
+        uint32_t d = c >> 2, kc = (c & 3) * 16;
+        h3_cp_async_16_b(vs + d * H3_FP8_LDV + kc,
+                         vt_src + (size_t)d * seq_pad + kb + kc, 16);
+    }
+}
+#endif
+
+/* Blocks per SM the register allocation targets: 2 caps the kernel at 128
+ * registers (a little spilling), 1 lets it breathe; -DH3_FP8_MIN_BLOCKS=1
+ * builds the other variant for A/B timing. */
+#ifndef H3_FP8_MIN_BLOCKS
+#define H3_FP8_MIN_BLOCKS 2
+#endif
+template <int HEAD_MAJOR>
+__global__ void __launch_bounds__(H3_FP8_THREADS, H3_FP8_MIN_BLOCKS)
+    h3k_sdpa_fa2_fp8(const uint8_t *__restrict__ q8,
+                     const uint8_t *__restrict__ k8,
+                     const uint8_t *__restrict__ vt8,
+                     const float *__restrict__ scales,
+                     uint16_t *__restrict__ output, uint32_t sequence,
+                     uint32_t seq_pad, uint32_t heads, float scale) {
+#if __CUDA_ARCH__ >= 890
+    extern __shared__ __align__(16) uint8_t h3_fp8_smem[];
+    const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const uint32_t head = blockIdx.y;
+    const uint32_t q0 = blockIdx.x * H3_FP8_QROWS;
+    const size_t head_rows = (size_t)head * sequence;
+    const uint32_t a_row = lane >> 2, a_col = (lane & 3) * 4;
+    const float s_q = scales[0], s_k = scales[1], s_v = scales[2];
+
+    const uint32_t r0 = q0 + warp * 16 + a_row, r1 = r0 + 8;
+    const int ok0 = r0 < sequence, ok1 = r1 < sequence;
+    uint32_t qf[H3_FP8_HD / 32][4];
+    {
+        const uint8_t *p0 = q8 + (head_rows + (ok0 ? r0 : 0u)) * H3_FP8_HD;
+        const uint8_t *p1 = q8 + (head_rows + (ok1 ? r1 : 0u)) * H3_FP8_HD;
+#pragma unroll
+        for (int ks = 0; ks < H3_FP8_HD / 32; ks++) {
+            uint32_t c = (uint32_t)ks * 32 + a_col;
+            qf[ks][0] = ok0 ? *(const uint32_t *)(p0 + c) : 0u;
+            qf[ks][1] = ok1 ? *(const uint32_t *)(p1 + c) : 0u;
+            qf[ks][2] = ok0 ? *(const uint32_t *)(p0 + c + 16) : 0u;
+            qf[ks][3] = ok1 ? *(const uint32_t *)(p1 + c + 16) : 0u;
+        }
+    }
+    float o_acc[H3_FP8_HD / 8][4];
+#pragma unroll
+    for (int t = 0; t < H3_FP8_HD / 8; t++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) o_acc[t][k] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float scale_log2 = scale * s_q * s_k * 1.4426950408889634f;
+
+    const uint8_t *k_src = k8 + head_rows * H3_FP8_HD;
+    const uint8_t *vt_src = vt8 + (size_t)head * H3_FP8_HD * seq_pad;
+    const uint32_t tiles = seq_pad / H3_FP8_KVT;
+
+    h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, 0, 0, tid);
+    h3_cp_async_commit();
+    /* C-fragment column (within an 8-key n-tile) this thread holds. */
+    const uint32_t c_col = (lane & 3) * 2;
+    for (uint32_t t = 0; t < tiles; t++) {
+        const uint32_t stage = t & 1u;
+        if (t + 1 < tiles)
+            h3_fp8_issue(h3_fp8_smem, k_src, vt_src, sequence, seq_pad, t + 1,
+                         stage ^ 1u, tid);
+        h3_cp_async_commit();
+        h3_cp_async_wait<1>();
+        __syncthreads();
+        const uint8_t *k_tile = h3_fp8_smem + stage * H3_FP8_STAGE_BYTES;
+        const uint8_t *v_tile = k_tile + H3_FP8_KVT * H3_FP8_LDK;
+
+        float s[H3_FP8_KVT / 8][4];
+#pragma unroll
+        for (int n = 0; n < H3_FP8_KVT / 8; n++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) s[n][k] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < H3_FP8_KVT / 16; p++) {
+            const uint8_t *kp = k_tile +
+                                (p * 16 + (lane & 7) + ((lane & 16) ? 8 : 0)) *
+                                    H3_FP8_LDK +
+                                ((lane & 8) ? 16 : 0);
+#pragma unroll
+            for (int ks = 0; ks < H3_FP8_HD / 32; ks++) {
+                uint32_t b[4];
+                h3_ldmatrix_x4_b(b, kp + ks * 32);
+                h3_mma_e4m3_16x8x32(s[2 * p], qf[ks][0], qf[ks][1], qf[ks][2],
+                                    qf[ks][3], b[0], b[1]);
+                h3_mma_e4m3_16x8x32(s[2 * p + 1], qf[ks][0], qf[ks][1],
+                                    qf[ks][2], qf[ks][3], b[2], b[3]);
+            }
+        }
+        const uint32_t kb = t * H3_FP8_KVT;
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < H3_FP8_KVT / 8; n++) {
+            s[n][0] *= scale_log2;
+            s[n][1] *= scale_log2;
+            s[n][2] *= scale_log2;
+            s[n][3] *= scale_log2;
+            if (kb + H3_FP8_KVT > sequence) {
+                uint32_t kc = kb + (uint32_t)n * 8 + c_col;
+                if (kc >= sequence) { s[n][0] = -INFINITY; s[n][2] = -INFINITY; }
+                if (kc + 1 >= sequence) { s[n][1] = -INFINITY; s[n][3] = -INFINITY; }
+            }
+            mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float ref0 = mn0 == -INFINITY ? 0.0f : mn0;
+        const float ref1 = mn1 == -INFINITY ? 0.0f : mn1;
+        const float c0 = exp2f(m0 - ref0), c1 = exp2f(m1 - ref1);
+        float rs0 = 0.0f, rs1 = 0.0f;
+#pragma unroll
+        for (int n = 0; n < H3_FP8_KVT / 8; n++) {
+            s[n][0] = exp2f(s[n][0] - ref0);
+            s[n][1] = exp2f(s[n][1] - ref0);
+            s[n][2] = exp2f(s[n][2] - ref1);
+            s[n][3] = exp2f(s[n][3] - ref1);
+            rs0 += s[n][0] + s[n][1];
+            rs1 += s[n][2] + s[n][3];
+        }
+        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 1);
+        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 2);
+        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 1);
+        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 2);
+        l0 = l0 * c0 + rs0;
+        l1 = l1 * c1 + rs1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int d = 0; d < H3_FP8_HD / 8; d++) {
+            o_acc[d][0] *= c0;
+            o_acc[d][1] *= c0;
+            o_acc[d][2] *= c1;
+            o_acc[d][3] *= c1;
+        }
+        /* O += P V: 32-key A-fragments from four n-tiles (scaled by 448),
+         * V^T B-fragments via ldmatrix over the permuted key-major rows. */
+#pragma unroll
+        for (int ks = 0; ks < H3_FP8_KVT / 32; ks++) {
+            const int n0 = ks * 4;
+            uint32_t a0 = h3_fp8_pack4(s[n0][0] * H3_FP8_P_SCALE,
+                                       s[n0][1] * H3_FP8_P_SCALE,
+                                       s[n0 + 1][0] * H3_FP8_P_SCALE,
+                                       s[n0 + 1][1] * H3_FP8_P_SCALE);
+            uint32_t a1 = h3_fp8_pack4(s[n0][2] * H3_FP8_P_SCALE,
+                                       s[n0][3] * H3_FP8_P_SCALE,
+                                       s[n0 + 1][2] * H3_FP8_P_SCALE,
+                                       s[n0 + 1][3] * H3_FP8_P_SCALE);
+            uint32_t a2 = h3_fp8_pack4(s[n0 + 2][0] * H3_FP8_P_SCALE,
+                                       s[n0 + 2][1] * H3_FP8_P_SCALE,
+                                       s[n0 + 3][0] * H3_FP8_P_SCALE,
+                                       s[n0 + 3][1] * H3_FP8_P_SCALE);
+            uint32_t a3 = h3_fp8_pack4(s[n0 + 2][2] * H3_FP8_P_SCALE,
+                                       s[n0 + 2][3] * H3_FP8_P_SCALE,
+                                       s[n0 + 3][2] * H3_FP8_P_SCALE,
+                                       s[n0 + 3][3] * H3_FP8_P_SCALE);
+#pragma unroll
+            for (int dp = 0; dp < H3_FP8_HD / 16; dp++) {
+                const uint8_t *vp = v_tile +
+                                    (dp * 16 + (lane & 7) + ((lane & 16) ? 8 : 0)) *
+                                        H3_FP8_LDV +
+                                    ((lane & 8) ? 16 : 0) + ks * 32;
+                uint32_t b[4];
+                h3_ldmatrix_x4_b(b, vp);
+                h3_mma_e4m3_16x8x32(o_acc[2 * dp], a0, a1, a2, a3, b[0], b[1]);
+                h3_mma_e4m3_16x8x32(o_acc[2 * dp + 1], a0, a1, a2, a3, b[2],
+                                    b[3]);
+            }
+        }
+        __syncthreads();
+    }
+    const float unscale = s_v / H3_FP8_P_SCALE;
+    const size_t row_stride = (size_t)heads * H3_FP8_HD;
+    const size_t head_off = (size_t)head * H3_FP8_HD;
+    if (ok0) {
+        float inv = unscale / l0;
+        size_t base = HEAD_MAJOR ? (head_rows + r0) * H3_FP8_HD
+                                 : (size_t)r0 * row_stride + head_off;
+#pragma unroll
+        for (int d = 0; d < H3_FP8_HD / 8; d++)
+            *(uint32_t *)(output + base + d * 8 + c_col) =
+                h3_pack_bf16(o_acc[d][0] * inv, o_acc[d][1] * inv);
+    }
+    if (ok1) {
+        float inv = unscale / l1;
+        size_t base = HEAD_MAJOR ? (head_rows + r1) * H3_FP8_HD
+                                 : (size_t)r1 * row_stride + head_off;
+#pragma unroll
+        for (int d = 0; d < H3_FP8_HD / 8; d++)
+            *(uint32_t *)(output + base + d * 8 + c_col) =
+                h3_pack_bf16(o_acc[d][2] * inv, o_acc[d][3] * inv);
+    }
+#endif
+}
+
+static float __uint_as_float_host(unsigned u) {
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static int h3_cuda_sdpa_fp8_enabled(void) {
+    const char *value = getenv("H3_CUDA_SDPA_FP8");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static int h3_attn_has_fp8_mma(struct h3_gpu *gpu) {
+    static int cached_device = -1;
+    static int cached_result = 0;
+    if (cached_device != gpu->device) {
+        int major = 0, minor = 0;
+        cached_result =
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                   gpu->device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                                   gpu->device) == cudaSuccess &&
+            (major > 8 || (major == 8 && minor >= 9));
+        cached_device = gpu->device;
+    }
+    return cached_result;
+}
+
+/* Whole FP8 SDPA: pre-pass into the workspace, then the kernel. Returns 0
+ * (nothing consequential launched) when the workspace is unavailable. */
+static int h3_cuda_sdpa_fp8(struct h3_gpu *gpu, const uint16_t *query,
+                            const uint16_t *key, const uint16_t *value,
+                            uint16_t *output, uint32_t sequence,
+                            uint32_t heads, float scale, int head_major) {
+    uint32_t seq_pad = (sequence + H3_FP8_KVT - 1) / H3_FP8_KVT * H3_FP8_KVT;
+    size_t qk_bytes = (size_t)sequence * heads * H3_FP8_HD;
+    size_t vt_bytes = (size_t)seq_pad * heads * H3_FP8_HD;
+    size_t q_off = 0, k_off = (qk_bytes + 255) & ~(size_t)255;
+    size_t v_off = k_off + ((qk_bytes + 255) & ~(size_t)255);
+    size_t s_off = v_off + ((vt_bytes + 255) & ~(size_t)255);
+    size_t total = s_off + 256;
+    uint8_t *ws = (uint8_t *)h3_cuda_workspace(gpu, total);
+    if (!ws) return 0;
+    uint8_t *q8 = ws + q_off, *k8 = ws + k_off, *vt8 = ws + v_off;
+    float *scales = (float *)(ws + s_off);
+    unsigned *absmax = (unsigned *)(ws + s_off + 64);
+    size_t count = (size_t)sequence * heads * H3_FP8_HD;
+    if (cudaMemsetAsync(absmax, 0, 4 * sizeof(unsigned), 0) != cudaSuccess)
+        return 0;
+    unsigned blocks = (unsigned)((count / 8 + 255) / 256);
+    if (blocks > 2048u) blocks = 2048u;
+    h3k_fp8_attn_absmax<<<blocks, 256>>>(query, count, absmax);
+    h3k_fp8_attn_absmax<<<blocks, 256>>>(key, count, absmax + 1);
+    h3k_fp8_attn_absmax<<<blocks, 256>>>(value, count, absmax + 2);
+    h3k_fp8_attn_scales<<<1, 32>>>(absmax, scales);
+    unsigned pblocks = (unsigned)((count / 8 + 255) / 256);
+    if (pblocks > 4096u) pblocks = 4096u;
+    h3k_fp8_attn_pack_qk<<<pblocks, 256>>>(query, q8, sequence, heads,
+                                           scales + 3);
+    h3k_fp8_attn_pack_qk<<<pblocks, 256>>>(key, k8, sequence, heads,
+                                           scales + 4);
+    dim3 vgrid(seq_pad / H3_FP8_KVT, heads);
+    h3k_fp8_attn_pack_vt<<<vgrid, 256>>>(value, vt8, sequence, seq_pad, heads,
+                                         scales + 5);
+    dim3 grid((sequence + H3_FP8_QROWS - 1) / H3_FP8_QROWS, heads, 1);
+    size_t shared = (size_t)2 * H3_FP8_STAGE_BYTES;
+    if (getenv("H3_CUDA_SDPA_FP8_DEBUG")) {
+        /* Debug: dump the pre-pass products (synchronous). */
+        float hs[6];
+        unsigned hm[4];
+        uint8_t hq[16], hk[16], hv[16];
+        cudaDeviceSynchronize();
+        cudaMemcpy(hs, scales, sizeof(hs), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hm, absmax, sizeof(hm), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hq, q8, 16, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hk, k8, 16, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hv, vt8, 16, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "fp8 sdpa debug: absmax %g %g %g scales %g %g %g inv %g %g %g\n",
+                __uint_as_float_host(hm[0]), __uint_as_float_host(hm[1]),
+                __uint_as_float_host(hm[2]), hs[0], hs[1], hs[2], hs[3], hs[4],
+                hs[5]);
+        fprintf(stderr, "  q8[0..15]:");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", hq[i]);
+        fprintf(stderr, "\n  k8[0..15]:");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", hk[i]);
+        fprintf(stderr, "\n  vt8[0..15]:");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", hv[i]);
+        fprintf(stderr, "\n  status after pre-pass: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+    }
+    if (head_major)
+        h3k_sdpa_fa2_fp8<1><<<grid, H3_FP8_THREADS, shared>>>(
+            q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale);
+    else
+        h3k_sdpa_fa2_fp8<0><<<grid, H3_FP8_THREADS, shared>>>(
+            q8, k8, vt8, scales, output, sequence, seq_pad, heads, scale);
+    if (getenv("H3_CUDA_SDPA_FP8_DEBUG")) {
+        cudaError_t e = cudaDeviceSynchronize();
+        uint16_t ho[8];
+        cudaMemcpy(ho, output, 16, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "  kernel status: %s; out[0..7]:", cudaGetErrorString(e));
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %04x", ho[i]);
+        fprintf(stderr, "\n");
+    }
+    return 1;
+}
+
 /* ----------------------------------------------------------- audio kernels */
 
 __global__ void h3k_audio_qkv_split_f32(const float *qkv, const float *q_bias,
@@ -2236,6 +2757,15 @@ static int h3_cuda_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
         return h3_cuda_fail(gpu, "SDPA sequence exceeds shared memory");
     /* FA2-class tensor-core path: bf16, head_dim == 128, non-causal,
      * sm_80+, >48KB smem opt-in available. */
+    /* FP8 (e4m3) flash path: bf16 hd128 non-causal, batch 1, opt-in. */
+    if (!naive && bf16 && !causal && head_dim == 128 && batch == 1 &&
+        h3_cuda_sdpa_fp8_enabled() && h3_attn_has_fp8_mma(gpu) &&
+        h3_cuda_sdpa_fp8(gpu, (const uint16_t *)query->data,
+                         (const uint16_t *)key->data,
+                         (const uint16_t *)value->data,
+                         (uint16_t *)output->data, sequence, heads, scale,
+                         head_major_output))
+        return h3_cuda_launch_check_kind(gpu, "h3_sdpa", 3);
     if (!naive && bf16 && !causal && h3_attn_has_bf16_mma(gpu) &&
         h3_cuda_sdpa_fa2_enabled() &&
         h3_fa2_fits(gpu, head_major_output, head_dim)) {
