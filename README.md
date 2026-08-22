@@ -530,6 +530,84 @@ the measured GEMM peak), so an exact step cannot go much below ~55 s; the
 remaining factor of two on GB10 is FP8, and beyond that only fewer steps,
 fewer active blocks, or token reduction — the README presets above.
 
+#### Second round: sampler, VAE, and block-sparse attention
+
+Measured on the same benchmark (15 s, 864x480, 20 steps, FP8 config), all
+three columns in one boot cycle so cuBLASLt algorithm selection is held
+fixed:
+
+| stage (15 s clip) | FP8 before | new defaults | + `H3_SPARSE_ATTN=16:8:14:8` |
+|---|---|---|---|
+| DiT denoise, per step | 36.7 s | 34.6 s | 18.4 s |
+| video VAE decode | 78.4 s | 77 s | 76.9 s |
+| end to end | 13 m 58 s | ~13 m 14 s | 7 m 51 s |
+
+The sparse column is 1.75x the documented 823 s FP8 baseline (1.78x the
+same-window measurement).
+
+What changed:
+
+- **GPU-resident Euler sampler by default on CUDA** (was Metal-M5-only;
+  `H3_CPU_SAMPLER=1` restores): removes the per-step host round-trip
+  (mallocs, CPU patchify, D2H readback, scalar casts, CPU extrapolation).
+- **FP8 SDPA delayed scaling** (`H3_CUDA_SDPA_FP8_EXACT_SCALE=1` restores):
+  the pack kernels fold a monotone running Q/K/V absmax while quantizing,
+  so the three standalone absmax reads (~1.9 GB per call) drop out of the
+  steady state; the first call still primes with exact pre-passes. e4m3 is
+  a float format, so the slightly larger running scale costs no relative
+  precision.
+- **Video VAE decode**: the frame scatter/stitch loops are threaded
+  (`H3_VAE_CPU_THREADS=1` restores single-thread; per-frame math is
+  unchanged, so outputs are byte-identical). `H3_VAE_TILE_PIXELS=512`
+  (2 tiles instead of 8, ~11% less redundant coverage, 64.0 s decode) was
+  **rejected**: it introduces a uniform 16-px token-grid artifact across
+  every frame. Note the trap that hid it: vae_ab's PSNR compares against
+  an exact decode *under the same tiling*, so a tiling-induced artifact
+  cancels out (it measured 81.1 dB while visibly gridded). The stock
+  256-320 px auto-tiler stays; tile-size changes need frame inspection,
+  not just vae_ab.
+- **Block-sparse attention** (`H3_SPARSE_ATTN=T:H:W[:G]`, opt-in): both
+  FA2 kernels walk a per-query-block CSR list of 64-row K/V tiles built
+  once at DiT init. Only target-video <-> target-video attention is
+  windowed (3D radii in latent-patch units plus every G-th video tile
+  globally); text, audio, condition, and reference rows stay fully global
+  in both directions, so Ref2VA/FL2VA conditioning is exempt by
+  construction. The validated `16:8:14:8` mask keeps 22.4% of tiles and
+  cuts the FP8 step 36.7 -> S20DENOISE s. The CSR is validated host-side
+  and clamped in-kernel; the reduced token-reduction sequence stays dense.
+- `--layers 45/40` now keep the same 60%-depth command split as 50 blocks
+  on CUDA (previously they silently disabled the encode/execute overlap).
+- The full-clip f32 -> u8 conversion before FFmpeg is threaded
+  (byte-identical).
+
+Measured dead ends, kept for the record: device `exp2f` already compiles
+to `ex2.approx.f32` on CUDA 13 (`H3_CUDA_SDPA_EXACT_EXP=1` selects the
+libm-named path; both produce identical SASS, so the FA2 softmax was never
+exponent-bound). `H3_CUDA_F32_GEMM=fp8` runs the VAE decoder's widest
+projections as per-tensor e4m3 with F32 accumulation — 44.6 s vs 76.7 s
+for the full decode — but measures 59.5 dB PSNR even restricted to the
+MLP GEMMs, below the accepted 70 dB bar, so it stays opt-in and off by
+default. `H3_CUDA_F32_GEMM=bf16` measures slower than TF32 at these
+shapes (80.6 vs 76.7 s): GB10's TF32 and bf16 tensor rates are close, so
+the extra activation casts dominate.
+
+Validation: with every switch restored (`H3_CPU_SAMPLER=1
+H3_CUDA_SDPA_EXACT_EXP=1 H3_CUDA_SDPA_FP8_EXACT_SCALE=1`, sparse unset)
+the new binary reproduces the previous binary's same-seed latent
+bit-for-bit. Same-seed bit-identity holds within a boot/memory state;
+across process contexts cuBLASLt's algorithm choice can shift, which
+changes the rounding path (measured ~15% latent rel-L2 at 2 steps between
+contexts for the *unmodified* baseline), so exact A/Bs must run
+back-to-back — and the same chaos dominates 20-step video PSNR between
+any two numerically-different configs (dense-vs-sparse measures 17.6 dB,
+but so does baseline-vs-new-defaults at 19.4 dB: both are
+different-but-equivalent samples, not degradation). Sparse-attention
+quality was therefore judged visually: the 20-step benchmark latents
+decoded under identical stock VAE settings render clean, coherent,
+detail-rich frames for baseline, new-defaults, and sparse configs alike
+(composition drifts, as with token reduction). Latent dumps for every
+config are kept under `H3_DUMP_LATENT` for re-inspection.
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the
