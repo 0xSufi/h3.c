@@ -3,7 +3,13 @@
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
+#ifdef H3_BACKEND_CUDA
+#include "h3_cuda.h"
+#define h3_device_probe h3_cuda_probe
+#else
 #include "h3_metal.h"
+#define h3_device_probe h3_metal_probe
+#endif
 #include "h3_multimodal.h"
 #include "h3_safetensors.h"
 #include "h3_text_encoder.h"
@@ -455,7 +461,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         return NULL;
     }
     char metal_error[256];
-    if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
+    if (!h3_device_probe(&ctx->device, metal_error, sizeof(metal_error))) {
         h3_set_error(ctx, "%s", metal_error);
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);

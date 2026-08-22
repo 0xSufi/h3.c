@@ -1,3 +1,5 @@
+UNAME_S := $(shell uname -s)
+
 CC := clang
 AR := ar
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
@@ -14,12 +16,39 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
-LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
+LIB_CU :=
+
+# Linux build: CUDA backend replaces the Metal/ObjC sources, and the portable
+# C tokenizer replaces h3_tokenizer.m. `make linux` and `make test` both work.
+ifeq ($(UNAME_S),Linux)
+CC := gcc
+NVCC ?= nvcc
+CUDA_HOME ?= $(patsubst %/bin/nvcc,%,$(shell command -v $(NVCC) 2>/dev/null))
+CUDA_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
+	2>/dev/null | head -n1 | tr -d '.')
+CUDA_ARCH := $(if $(CUDA_ARCH),$(CUDA_ARCH),61)
+CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
+	-Wconversion -Wno-sign-conversion -D_DEFAULT_SOURCE -DH3_BACKEND_CUDA
+CUDAFLAGS := -O3 -std=c++14 -arch=sm_$(CUDA_ARCH) -DH3_BACKEND_CUDA
+ifneq ($(CUDA_HOME),)
+CUDAFLAGS += -I$(CUDA_HOME)/include
+CUDA_LDLIBS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
+endif
+LDLIBS := $(CUDA_LDLIBS) -lcudart -lcublasLt -lcublas -lstdc++ -lm
+LIB_M :=
+LIB_C += h3_tokenizer.c h3_unicode_tables.c
+LIB_CU := h3_gpu_cuda.cu h3_cuda_core.cu h3_cuda_conv.cu h3_cuda_dit.cu \
+	h3_cuda_attention.cu h3_cuda_gemm.cu
+endif
+
+LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(LIB_CU:.cu=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all linux test parity real-parity clean
 
 all: h3 libh3.a
+
+linux: all
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -193,12 +222,20 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 %.o: %.m
 	$(CC) $(OBJCFLAGS) -I. -c $< -o $@
 
+%.o: %.cu
+	$(NVCC) $(CUDAFLAGS) -I. -c $< -o $@
+
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
 # Vendored from Iris. Keep the main project strict without rewriting this small
 # terminal editor for conversion diagnostics unrelated to H3.
-linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
+linenoise.o: CFLAGS += -Wno-conversion
+ifeq ($(UNAME_S),Linux)
+linenoise.o: CFLAGS += -Wno-variadic-macros -Wno-pedantic
+else
+linenoise.o: CFLAGS += -Wno-variadic-macro-arguments-omitted
+endif
 
 -include $(wildcard *.d tests/*.d)
 

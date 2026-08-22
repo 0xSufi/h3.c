@@ -1,6 +1,12 @@
 #include "h3_host.h"
 #include "h3_dit.h"
+#ifdef H3_BACKEND_CUDA
+#include "h3_cuda.h"
+#define h3_device_probe h3_cuda_probe
+#else
 #include "h3_metal.h"
+#define h3_device_probe h3_metal_probe
+#endif
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
 
@@ -376,11 +382,15 @@ static void test_dit_row_conversions(void) {
 static void test_metal_probe(void) {
     h3_device_info info;
     char error[256];
-    CHECK(h3_metal_probe(&info, error, sizeof(error)));
+    CHECK(h3_device_probe(&info, error, sizeof(error)));
     CHECK(info.name[0] != '\0');
     CHECK(info.physical_memory >= UINT64_C(8) * 1024 * 1024 * 1024);
     CHECK(info.max_buffer_length > 0);
+#ifdef H3_BACKEND_CUDA
+    CHECK(info.architecture[0] != '\0');
+#else
     CHECK(info.apple_gpu_family > 0);
+#endif
 }
 
 static void test_terminal_zoom(void) {
