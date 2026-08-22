@@ -416,8 +416,13 @@ static int copy_file(const char *source, const char *destination) {
 
 static void open_video(const char *path) {
     pid_t process;
-    char *arguments[] = {"open", (char *)path, NULL};
-    int status = posix_spawnp(&process, "open", NULL, NULL, arguments, environ);
+#ifdef __APPLE__
+    const char *opener = "open";
+#else
+    const char *opener = "xdg-open";
+#endif
+    char *arguments[] = {(char *)opener, (char *)path, NULL};
+    int status = posix_spawnp(&process, opener, NULL, NULL, arguments, environ);
     if (status != 0)
         fprintf(stderr, "h3: cannot open %s: %s\n", path, strerror(status));
 }

@@ -132,8 +132,13 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
                              strlen(path), path);
     return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
                          path, (long long)status.st_size,
+#ifdef __APPLE__
                          (long long)status.st_mtimespec.tv_sec,
                          status.st_mtimespec.tv_nsec);
+#else
+                         (long long)status.st_mtim.tv_sec,
+                         status.st_mtim.tv_nsec);
+#endif
 }
 
 static char *h3_conditioning_key(const char *prompt, const h3_params *params,

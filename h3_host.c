@@ -1,6 +1,8 @@
 #include "h3_host.h"
 
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#endif
 
 #include <float.h>
 #include <limits.h>
@@ -551,6 +553,9 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         *output = pixels;
         return 1;
     }
+    size_t input_frame_bytes = input_area * 3;
+    size_t output_frame_bytes = output_area * 3;
+#ifdef __APPLE__
     if (input_area > SIZE_MAX / 4 || output_area > SIZE_MAX / 4) {
         free(pixels);
         return 0;
@@ -561,8 +566,6 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         free(source_argb); free(output_argb); free(pixels);
         return 0;
     }
-    size_t input_frame_bytes = input_area * 3;
-    size_t output_frame_bytes = output_area * 3;
     vImage_Buffer source_buffer = {
         source_argb, (vImagePixelCount)input_height,
         (vImagePixelCount)input_width, (size_t)input_width * 4
@@ -594,6 +597,53 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
         }
     }
     free(source_argb); free(output_argb);
+#else
+    /* Portable bilinear resampler (pixel-center mapping, edge clamp). */
+    double scale_x = (double)input_width / (double)output_width;
+    double scale_y = (double)input_height / (double)output_height;
+    for (int frame = 0; frame < frames; frame++) {
+        const uint8_t *source_frame = input + (size_t)frame * input_frame_bytes;
+        uint8_t *output_frame = pixels + (size_t)frame * output_frame_bytes;
+        for (int y = 0; y < output_height; y++) {
+            double source_y = ((double)y + 0.5) * scale_y - 0.5;
+            if (source_y < 0.0) source_y = 0.0;
+            if (source_y > (double)(input_height - 1))
+                source_y = (double)(input_height - 1);
+            int y0 = (int)source_y;
+            int y1 = y0 + 1 < input_height ? y0 + 1 : y0;
+            double fy = source_y - (double)y0;
+            for (int x = 0; x < output_width; x++) {
+                double source_x = ((double)x + 0.5) * scale_x - 0.5;
+                if (source_x < 0.0) source_x = 0.0;
+                if (source_x > (double)(input_width - 1))
+                    source_x = (double)(input_width - 1);
+                int x0 = (int)source_x;
+                int x1 = x0 + 1 < input_width ? x0 + 1 : x0;
+                double fx = source_x - (double)x0;
+                const uint8_t *p00 =
+                    source_frame + ((size_t)y0 * (size_t)input_width + (size_t)x0) * 3;
+                const uint8_t *p01 =
+                    source_frame + ((size_t)y0 * (size_t)input_width + (size_t)x1) * 3;
+                const uint8_t *p10 =
+                    source_frame + ((size_t)y1 * (size_t)input_width + (size_t)x0) * 3;
+                const uint8_t *p11 =
+                    source_frame + ((size_t)y1 * (size_t)input_width + (size_t)x1) * 3;
+                uint8_t *destination =
+                    output_frame + ((size_t)y * (size_t)output_width + (size_t)x) * 3;
+                for (int channel = 0; channel < 3; channel++) {
+                    double top = (double)p00[channel] +
+                        ((double)p01[channel] - (double)p00[channel]) * fx;
+                    double bottom = (double)p10[channel] +
+                        ((double)p11[channel] - (double)p10[channel]) * fx;
+                    double value = top + (bottom - top) * fy;
+                    int rounded = (int)nearbyint(value);
+                    destination[channel] = (uint8_t)(rounded < 0 ? 0 :
+                        rounded > 255 ? 255 : rounded);
+                }
+            }
+        }
+    }
+#endif
     *output = pixels;
     return 1;
 }
