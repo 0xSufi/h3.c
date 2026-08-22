@@ -72,8 +72,13 @@ static dim3 h3_cuda_gemm_grid_2d(uint32_t width, uint32_t height) {
  * dimensions and pointer alignments as actually handed to cuBLASLt after
  * staging), so staging choices stay consistent with what was timed. */
 #define H3_CUDA_GEMM_ALGO_CACHE_MAX 64
-#define H3_CUDA_GEMM_ALGO_CANDIDATES 16
+#define H3_CUDA_GEMM_ALGO_CANDIDATES 8
 #define H3_CUDA_GEMM_ALGO_REPS 3
+/* GEMMs whose single timed run takes at least this long are measured once;
+ * shorter ones get H3_CUDA_GEMM_ALGO_REPS runs to average out launch
+ * jitter. At 38k DiT rows every candidate is 30-150 ms, and the old
+ * 16 x (1 + 3) full-size probes per signature cost minutes per run. */
+#define H3_CUDA_GEMM_ALGO_LONG_MS 4.0f
 
 typedef struct {
     uint32_t rows, input_dim, output_dim;
@@ -139,6 +144,10 @@ static float h3_cuda_gemm_time_algo(struct h3_gpu *gpu,
     if (candidate->state != CUBLAS_STATUS_SUCCESS ||
         candidate->workspaceSize > gpu->lt_workspace_bytes)
         return -1.0f;
+    /* One warmup run, then one timed run; only when that run is short
+     * (launch jitter matters) are H3_CUDA_GEMM_ALGO_REPS - 1 more timed. */
+    float ms = 0.0f;
+    int timed = 0;
     for (int rep = 0; rep <= H3_CUDA_GEMM_ALGO_REPS; rep++) {
         if (rep == 1 && cudaEventRecord(start, 0) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -152,15 +161,25 @@ static float h3_cuda_gemm_time_algo(struct h3_gpu *gpu,
             (void)cudaGetLastError();
             return -1.0f;
         }
+        if (rep == 0) continue;
+        timed = rep;
+        if (rep == 1) {
+            if (cudaEventRecord(stop, 0) != cudaSuccess ||
+                cudaEventSynchronize(stop) != cudaSuccess ||
+                cudaEventElapsedTime(&ms, start, stop) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return -1.0f;
+            }
+            if (ms >= H3_CUDA_GEMM_ALGO_LONG_MS) return ms;
+        }
     }
-    float ms = 0.0f;
     if (cudaEventRecord(stop, 0) != cudaSuccess ||
         cudaEventSynchronize(stop) != cudaSuccess ||
         cudaEventElapsedTime(&ms, start, stop) != cudaSuccess) {
         (void)cudaGetLastError();
         return -1.0f;
     }
-    return ms / H3_CUDA_GEMM_ALGO_REPS;
+    return ms / (float)timed;
 }
 
 /* Largest power-of-two alignment of a device pointer, capped at 256, so the
@@ -239,6 +258,19 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
             preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
             &gpu->lt_workspace_bytes, sizeof(gpu->lt_workspace_bytes)) !=
         CUBLAS_STATUS_SUCCESS) goto done;
+    /* Split-K candidates may reduce their partial sums in the output type
+     * (bf16 for the DiT projections), adding rounding the F32-accumulate
+     * contract does not allow — seen as 2-ulp bf16 misses once the cheaper
+     * probing below started picking different winners. Allow only schemes
+     * that reduce in the compute type (or do not split at all). */
+    {
+        uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_INPLACE |
+                                  CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+        if (cublasLtMatmulPreferenceSetAttribute(
+                preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                &reduction_mask, sizeof(reduction_mask)) !=
+            CUBLAS_STATUS_SUCCESS) goto done;
+    }
     /* Alignment attributes describe the buffers actually handed to the
      * GEMM: staged slices are 256-byte aligned, so staged calls are
      * offered the vectorized kernels instead of the align1 fallback. */
@@ -272,7 +304,7 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
     } else {
         cublasLtMatmulHeuristicResult_t
             candidates[H3_CUDA_GEMM_ALGO_CANDIDATES];
-        float best_ms = -1.0f;
+        float best_ms = -1.0f, first_ms = -1.0f;
         int best = 0;
         cudaEvent_t start = NULL, stop = NULL;
         if (cublasLtMatmulAlgoGetHeuristic(
@@ -287,6 +319,7 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
                 float ms = h3_cuda_gemm_time_algo(
                     gpu, desc, weight, a_desc, x, b_desc, c, c_desc, &alpha,
                     &beta, &candidates[i], start, stop);
+                if (i == 0) first_ms = ms;
                 if (ms >= 0.0f && (best_ms < 0.0f || ms < best_ms)) {
                     best_ms = ms;
                     best = i;
@@ -297,6 +330,13 @@ static int h3_cuda_gemm_run(struct h3_gpu *gpu, const void *x,
         }
         if (start) cudaEventDestroy(start);
         if (stop) cudaEventDestroy(stop);
+        if (best_ms >= 0.0f && getenv("H3_CUDA_GEMM_TUNE_LOG"))
+            fprintf(stderr,
+                    "h3 gemm tune rows=%u k=%u n=%u ab=%d cd=%d: %d/%d "
+                    "candidates, best #%d %.3f ms (heuristic #0 %.3f ms)\n",
+                    rows, input_dim, output_dim, (int)ab_type, (int)cd_type,
+                    results, H3_CUDA_GEMM_ALGO_CANDIDATES, best, best_ms,
+                    first_ms);
         if (best_ms >= 0.0f) {
             entry = h3_cuda_gemm_algo_slot();
             *entry = (h3_cuda_gemm_algo_entry){
