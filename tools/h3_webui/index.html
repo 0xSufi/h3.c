@@ -62,6 +62,9 @@
   .clip video { width: 100%; border-radius: 7px; background: #000; display: block; }
   .clip .prompt { font-size: 12.5px; margin: 7px 0 3px; }
   .clip .meta a { color: var(--accent); text-decoration: none; }
+  .clip .meta .del { color: var(--dim); background: none; border: 0;
+                     font: inherit; padding: 0; cursor: pointer; }
+  .clip .meta .del:hover { color: var(--err); }
   h2 { font-size: 13px; color: var(--dim); text-transform: uppercase;
        letter-spacing: .6px; margin: 4px 0 10px; }
 </style>
@@ -215,7 +218,8 @@ async function refresh() {
       <video controls preload="metadata" src="/media/${j.file}"></video>
       <div class="prompt">${escapeHtml(j.prompt)}</div>
       <div class="meta">${settingsLine(j)} · ${fmtTime(j.elapsed || 0)}
-        · <a href="/media/${j.file}" download>download</a></div>
+        · <a href="/media/${j.file}" download>download</a>
+        · <button class="del" onclick="deleteJob('${j.id}')">delete</button></div>
     </div>`).join("");
   }
 }
@@ -240,6 +244,17 @@ function escapeHtml(t) {
   return (t || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 async function cancelJob(id) { await fetch(`/api/jobs/${id}/cancel`, {method: "POST"}); }
+
+async function deleteJob(id) {
+  if (!confirm("Delete this video and its files? This cannot be undone.")) return;
+  const reply = await fetch(`/api/jobs/${id}/delete`, {method: "POST"});
+  if (!reply.ok) {
+    const body = await reply.json().catch(() => ({}));
+    alert(body.error || "delete failed");
+  }
+  gallerySignature = "";
+  refresh();
+}
 
 $("seconds").addEventListener("change", () => {
   const total = parseInt($("seconds").value, 10);

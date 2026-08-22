@@ -58,22 +58,27 @@ PRESETS = {
 # Progress phases in engine order: (h3 progress label, ui label, start%, end%).
 PHASES = [
     ("tokenizer", "tokenizing", 0, 1),
-    ("text encoder", "encoding prompt", 1, 6),
-    ("refine text", "refining text", 6, 7),
-    ("video encoder", "encoding references", 7, 9),
-    ("audio encoder", "encoding reference audio", 9, 10),
-    ("precompute AdaLN", "preparing schedule", 10, 11),
-    ("load transformer core", "loading DiT weights", 11, 16),
-    ("denoise", "denoising", 16, 80),
-    ("audio VAE", "decoding audio", 80, 83),
-    ("video VAE load", "loading video decoder", 83, 87),
-    ("FFmpeg", "encoding MP4", 95, 100),
+    ("video VAE encoder", "encoding reference frames", 1, 55),
+    ("Qwen vision", "encoding reference images", 55, 57),
+    ("text encoder", "encoding prompt", 57, 62),
+    ("refine text", "refining text", 62, 63),
+    ("video encoder", "encoding references", 63, 64),
+    ("audio encoder", "encoding reference audio", 64, 65),
+    ("precompute AdaLN", "preparing schedule", 65, 66),
+    ("load transformer core", "loading DiT weights", 66, 70),
+    ("denoise", "denoising", 70, 88),
+    ("audio VAE", "decoding audio", 88, 90),
+    ("video VAE load", "loading video decoder", 90, 93),
+    ("FFmpeg", "encoding MP4", 96, 100),
 ]
 _PROGRESS = re.compile(rb"^(" + b"|".join(re.escape(name.encode()) for name, *_ in PHASES) +
-                       rb")\s+(\d+)/(\d+)\s*$")
+                       rb")\b[^0-9]*?(\d+)/(\d+)\s*$")
 
 jobs = {}          # id -> job dict (also mirrors finished jobs from disk)
 queue = asyncio.Queue()
+# Job ids are generated here (timestamp + hex) and also read back from disk
+# metadata; every filesystem path derived from one is checked against this.
+JOB_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 
 
 def now():
@@ -155,7 +160,8 @@ def load_history():
             job = json.loads(meta.read_text())
         except (OSError, ValueError):
             continue
-        if job.get("id") and (OUTPUTS / (job["id"] + ".mp4")).exists():
+        if JOB_ID.match(job.get("id") or "") and \
+                (OUTPUTS / (job["id"] + ".mp4")).exists():
             job["status"] = "done"
             jobs[job["id"]] = job
 
@@ -438,6 +444,30 @@ async def handle_cancel(request):
     return web.json_response({"ok": True})
 
 
+async def handle_delete(request):
+    """Remove a finished job: its video, metadata, and any files uploaded or
+    generated for it. A running job is cancelled instead of deleted."""
+    job_id = request.match_info["job_id"]
+    if not JOB_ID.match(job_id):
+        return web.json_response({"error": "bad job id"}, status=400)
+    job = jobs.get(job_id)
+    if job and job.get("status") in ("running", "queued"):
+        job["cancel"] = True
+        return web.json_response({"error": "job is still running; cancelled it"},
+                                 status=409)
+    removed = 0
+    for path in list(OUTPUTS.glob(job_id + ".*")) + \
+            list(OUTPUTS.glob(job_id + "_seg*.mp4")) + \
+            list(UPLOADS.glob(job_id + "_*")):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    jobs.pop(job_id, None)
+    return web.json_response({"ok": True, "removed": removed})
+
+
 async def handle_index(request):
     return web.FileResponse(STATIC / "index.html")
 
@@ -455,6 +485,8 @@ def main():
     app.router.add_post("/api/generate", handle_generate)
     app.router.add_get("/api/jobs", handle_jobs)
     app.router.add_post("/api/jobs/{job_id}/cancel", handle_cancel)
+    app.router.add_post("/api/jobs/{job_id}/delete", handle_delete)
+    app.router.add_delete("/api/jobs/{job_id}", handle_delete)
     app.router.add_static("/media/", OUTPUTS, show_index=False)
     app.on_startup.append(on_startup)
     print(f"h3 web UI on http://0.0.0.0:{PORT}  (engine {H3_BIN}, model {MODEL_DIR})")
