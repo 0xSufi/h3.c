@@ -451,6 +451,81 @@ FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 32 kHz stereo F32 PCM are fed through concurrent pipes; no intermediate
 uncompressed media file is created.
 
+#### Performance on DGX Spark (GB10)
+
+Measured on a DGX Spark (NVIDIA GB10, sm_121, CUDA 13.0, 128 GB unified
+memory) with the 15 s default-preset prompt (864x480, 24 fps, 20 steps). The
+DiT sequence is 44,558 rows (43,335 video tokens), so one forward is about
+2.8 PFLOP of attention plus 1.7 PFLOP of projections; cuBLASLt measures
+100-107 TFLOPS for BF16 and 215 TFLOPS for e4m3 at the DiT shapes, DRAM
+230 GB/s.
+
+| stage (15 s clip) | before | exact BF16 (default) | FP8 opt-in |
+|---|---|---|---|
+| DiT denoise, per step | 248 s | 58 s | 36 s |
+| video VAE decode | 208 s | 79 s | 79 s |
+| DiT weight load | 64 s | 10 s | 10 s |
+| one-time cuBLASLt probing | 274 s | 0 s | 0 s |
+| audio VAE decode | 18 s | 1.1 s | 1.1 s |
+| end to end, 20 steps | 1 h 27 m 45 s | 21 m 33 s | 13 m 43 s |
+| end to end, `--layers 45 --reuse 2` | — | — | 7 m 45 s |
+| end to end, `--layers 45 --reuse 2 --token-reduction` | — | — | 5 m 39 s |
+
+What changed, in order of effect:
+
+- **FA2-class SDPA** (`h3k_sdpa_fa2_bf16`): 128 query rows per block,
+  cp.async double-buffered K/V, Q fragments and the whole online softmax in
+  registers, P fed to the second mma straight from the score fragments.
+  80 TFLOPS at 38k rows against 14.5 for the previous tensor-core kernel;
+  the attention share of a step fell from 143 s to 38 s. Head-dim 64 and 128;
+  f32 SDPA at those head dims (the video VAE) takes the same kernel through a
+  bf16 round trip (`H3_CUDA_SDPA_F32_EXACT=1` restores the f32 kernels).
+  `H3_CUDA_SDPA_FA2=0` falls back to the old tensor-core kernel.
+- **bf16 fused MLP**: both GEMMs on the tensor cores with a bf16 activated
+  intermediate (fc2 used to run as an F32 CUDA-core GEMM): 28 s -> 10 s per
+  step.
+- **TF32 for F32 projections** with K >= 1024 (`H3_CUDA_TF32=0` disables):
+  the VAE decoder's share went from 107 s of SIMT sgemm to 44 s. tools/vae_ab
+  decodes one dumped latent (`H3_DUMP_LATENT=path`) under each setting: TF32
+  87 dB PSNR against the exact decode, the bf16 attention route 71.6 dB,
+  both 71.6 dB at 2.5x the speed. `H3_CUDA_F32_GEMM=bf16` (opt-in) runs those
+  projections as bf16 GEMMs with cached bf16 weights (67.8 dB; no measured
+  speed gain on the 15 s decode, so it stays off).
+- **cuBLASLt algorithm selection** takes the heuristic's first result and
+  caches it per shape; masked to compute-type split-K reductions so F32
+  accumulation holds. The old empirical probing (`H3_CUDA_GEMM_TUNE=1`,
+  `H3_CUDA_GEMM_TUNE_LOG=1` to print) cost 274 s of event syncs per run at
+  these shapes and made the winning kernel — and the bitwise output — vary
+  between runs; same-seed runs are now bit-identical.
+- **Pinned, O_DIRECT file loads**: a pageable buffer per tensor plus an extra
+  copy held the 38.5 GB DiT load at 0.6 GB/s; pinned staging with 16
+  unbuffered readers reads at 9.6 GB/s (`H3_CUDA_DIRECT_IO=0` for the
+  buffered path). `H3_PROFILE=1` prints read/upload/alloc seconds per phase.
+- **Warp-per-(row, head) QKV norm/RoPE**: 48 ms -> 13 ms per call.
+- **Conv1d through im2col + the cuBLASLt projection**: the audio VAE
+  decoder's 129 Conv1d calls took 16.5 s on the per-output kernel.
+- **FP8 (e4m3), opt-in**: `H3_CUDA_FP8=1` runs the DiT projections through
+  cublasLt's FP8 GEMM with per-tensor scales (weights quantized once into a
+  context cache, activations per call): qkv 0.082 -> 0.047 s, MLP 0.239 ->
+  0.122 s per block. `H3_CUDA_SDPA_FP8=1` runs attention on the e4m3 tensor
+  cores (`h3k_sdpa_fa2_fp8`: Q/K/V quantized in a pre-pass, V transposed and
+  key-permuted so P never leaves registers): 0.51 -> 0.32 s per block at
+  38k rows (1.6x over the bf16 kernel). Against the f32 reference the
+  tests measure 3.4% (linear), 6.4% (MLP) and 3.9% (attention) rel-L2; the
+  same-seed 512x512 clip is visually equivalent. This cublasLt reports
+  per-row/per-channel FP8 scaling as unsupported on sm_121, so scaling is per
+  tensor.
+
+The FP8 column is `H3_CUDA_FP8=1 H3_CUDA_SDPA_FP8=1`; the preset rows add
+the README's validated `--layers 45 --reuse 2` (and `--token-reduction`)
+controls on top. Run-to-run outputs are bit-identical for a given setting.
+
+Ceiling: at 44.5k rows the exact BF16 attention runs at ~77 TFLOPS sustained,
+which is the practical limit of an mma.sync flash kernel on this part (75% of
+the measured GEMM peak), so an exact step cannot go much below ~55 s; the
+remaining factor of two on GB10 is FP8, and beyond that only fewer steps,
+fewer active blocks, or token reduction — the README presets above.
+
 ## Implementation and performance notes
 
 The remainder documents the implementation behind the tutorial presets and the
