@@ -1625,6 +1625,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    /* Debug hook: H3_DUMP_LATENT=path writes the normalized video latent
+     * handed to the decoder (int32 header: magic 'H3LT', channels, time,
+     * height, width; then f32 data) so tools/vae_ab.c can decode the same
+     * latent under different backend precision settings. */
+    const char *dump_latent = getenv("H3_DUMP_LATENT");
+    if (dump_latent && *dump_latent) {
+        FILE *dump = fopen(dump_latent, "wb");
+        if (dump) {
+            int32_t header[5] = {0x544c3348, 24, temporal.video_t,
+                                 latent_h, latent_w};
+            size_t count = (size_t)24 * (size_t)temporal.video_t *
+                           (size_t)latent_h * (size_t)latent_w;
+            if (fwrite(header, sizeof(header), 1, dump) != 1 ||
+                fwrite(video, sizeof(float), count, dump) != count)
+                fprintf(stderr, "h3: cannot write %s\n", dump_latent);
+            fclose(dump);
+        } else {
+            fprintf(stderr, "h3: cannot open %s for writing\n", dump_latent);
+        }
+    }
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
