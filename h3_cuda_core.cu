@@ -405,8 +405,9 @@ __global__ void h3k_linear_f32_bf16_map(const float *input,
 /* MLP (h3_gpu_mlp_bf16): fused = input @ fc1^T is [rows, 2*hidden]; the
  * first hidden columns are the gate, the second hidden the up projection;
  * activated = silu(gate) * up; output = bf16(activated @ fc2^T). No biases.
- * The intermediate stays F32, matching MPSGraph (which only casts the final
- * result to BF16). */
+ * The hand path keeps the intermediate F32, matching MPSGraph (which only
+ * casts the final result to BF16); the cuBLAS path in h3_gpu_mlp_bf16 rounds
+ * it to bf16 once, see the note there. */
 __global__ void h3k_mlp_fc1_swiglu_bf16(const uint16_t *input,
                                         const uint16_t *fc1_weight,
                                         float *activated, uint32_t rows,
@@ -1052,55 +1053,42 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
         !h3_cuda_require_bf16(gpu, output, (size_t)rows * output_dim,
                               "MLP output") ||
         !h3_cuda_require_command(gpu)) return 0;
-    /* cuBLAS path: fc1 GEMM (BF16 x BF16 -> F32, [rows, 2*hidden]) into the
-     * workspace, F32 SwiGLU, fc2 weight cast to F32, F32 fc2 GEMM, then the
-     * single BF16 rounding at the output. This keeps the exact rounding
-     * boundaries of the hand path (the activated intermediate stays F32,
-     * matching MPSGraph). */
+    /* cuBLAS path: fc1 bf16 GEMM (F32 accumulate, bf16 out) into the
+     * workspace as fused [rows, 2*hidden], SwiGLU in f32 math with a bf16
+     * result, fc2 bf16 GEMM straight into the bf16 output — both GEMMs on
+     * the tensor cores. The activated intermediate is rounded to bf16 once
+     * (the hand path below and MPSGraph keep it f32): that single extra
+     * rounding boundary, the same class the int8/NAX MLP paths accept, is
+     * what lets fc2 run as a bf16 GEMM instead of the F32 (CUDA-core rate)
+     * GEMM the earlier path used; at 38k rows on GB10 that was the
+     * difference between 31 and ~100 TFLOPS for the whole MLP. */
     if (rows && hidden_dim && output_dim && gpu->lt && !gpu->no_cublas) {
         size_t fused_count = (size_t)rows * 2 * hidden_dim;
         size_t activated_count = (size_t)rows * hidden_dim;
-        size_t fc2_f32_count = (size_t)output_dim * hidden_dim;
-        size_t sums_count = (size_t)rows * output_dim;
-        size_t activated_off = (fused_count * sizeof(float) + 255) & ~(size_t)255;
-        size_t fc2_f32_off = activated_off +
-            ((activated_count * sizeof(float) + 255) & ~(size_t)255);
-        size_t sums_off = fc2_f32_off +
-            ((fc2_f32_count * sizeof(float) + 255) & ~(size_t)255);
-        size_t total = sums_off + sums_count * sizeof(float);
-        float *workspace = (float *)h3_cuda_workspace(gpu, total);
+        size_t activated_off =
+            (fused_count * sizeof(uint16_t) + 255) & ~(size_t)255;
+        size_t total = activated_off + activated_count * sizeof(uint16_t);
+        uint16_t *workspace = (uint16_t *)h3_cuda_workspace(gpu, total);
         int served = 0;
         if (workspace) {
-            float *fused = workspace;
-            float *activated_f32 = (float *)((char *)workspace + activated_off);
-            float *fc2_f32 = (float *)((char *)workspace + fc2_f32_off);
-            float *sums = (float *)((char *)workspace + sums_off);
+            uint16_t *fused = workspace;
+            uint16_t *activated_bf16 =
+                (uint16_t *)((char *)workspace + activated_off);
             served = h3_cuda_gemm_xwt(gpu, input->data, fc1_weight->data,
-                                      NULL, fused, CUDA_R_16BF, CUDA_R_32F,
+                                      NULL, fused, CUDA_R_16BF, CUDA_R_16BF,
                                       rows, input_dim, 2 * hidden_dim);
             if (served) {
-                h3k_swiglu_f32<<<h3_cuda_grid_2d(hidden_dim, rows),
-                                 dim3(16, 16)>>>(fused, activated_f32, rows,
-                                                 hidden_dim);
-                served = cudaGetLastError() == cudaSuccess;
-            }
-            if (served) {
-                h3k_cast_bf16_to_f32<<<h3_cuda_cast_grid(fc2_f32_count),
-                                       256>>>(
-                    (const uint16_t *)fc2_weight->data, fc2_f32,
-                    fc2_f32_count);
+                h3k_swiglu_bf16<<<h3_cuda_grid_2d(hidden_dim, rows),
+                                  dim3(16, 16)>>>(fused, activated_bf16, rows,
+                                                  hidden_dim);
                 served = cudaGetLastError() == cudaSuccess;
             }
             if (served)
-                served = h3_cuda_gemm_xwt(gpu, activated_f32, fc2_f32, NULL,
-                                          sums, CUDA_R_32F, CUDA_R_32F, rows,
-                                          hidden_dim, output_dim);
-            if (served) {
-                h3k_cast_f32_to_bf16<<<h3_cuda_cast_grid(sums_count),
-                                       256>>>(
-                    sums, (uint16_t *)output->data, sums_count);
-                served = cudaGetLastError() == cudaSuccess;
-            }
+                served = h3_cuda_gemm_xwt(gpu, activated_bf16,
+                                          fc2_weight->data, NULL,
+                                          output->data, CUDA_R_16BF,
+                                          CUDA_R_16BF, rows, hidden_dim,
+                                          output_dim);
         }
         if (served) {
             if (!h3_cuda_launch_check_kind(gpu, "h3_mlp_bf16 fc1", 1))
