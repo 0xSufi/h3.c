@@ -215,7 +215,9 @@ static unsigned command_block_interval(const h3_dit *dit) {
     }
     if (h3_gpu_is_m5(dit->gpu))
         return dit->active_block_count * 3 / 5;
-    return dit->active_block_count == H3_DIT_BLOCKS ? 30u : 0u;
+    /* CUDA: the same 60%-depth split for every active-block count, so
+     * --layers 45/40 keep the encode/execute overlap that 50 blocks get. */
+    return dit->active_block_count * 3 / 5;
 }
 
 static int gpu_op(h3_dit *dit, int ok, char *error, size_t error_size,
